@@ -183,6 +183,37 @@ type AgentMemory {
   updatedAt: ISO8601DateTime!
 }
 
+type AgentMemorySearchHit {
+  memory: AgentMemory!
+  similarityScore: Float!
+  reason: AgentMemoryHitReason!
+}
+
+enum AgentMemoryKind {
+  PROCEDURAL
+  SEMANTIC
+  EPISODIC
+  GUARDRAIL
+}
+
+enum AgentMemorySensitivity {
+  PUBLIC_BOARD
+  PRIVATE_BOARD
+  RESTRICTED
+}
+
+enum AgentMemoryHitReason {
+  VECTOR_MATCH
+  METADATA_FILTER
+  PROCEDURAL_PIN
+}
+
+enum AgentGuardrailDecision {
+  ALLOW
+  ALLOW_WITH_LIMITS
+  DENY
+}
+
 input AgentMemorySearchInput {
   boardIds: [ID!]!
   queryText: String!
@@ -210,12 +241,12 @@ apply vector ranking inside that candidate set:
 
 ```sql
 WITH scoped_memory AS (
-  SELECT r.account_id, r.memory_id, r.board_id, r.memory_kind, r.metadata
+  SELECT r.account_id, r.memory_id, r.board_id, r.memory_kind
   FROM agent_memory_records r
   WHERE r.account_id = $1
     AND r.board_id = ANY($2)
     AND r.memory_kind = ANY($3)
-    AND (r.metadata->>'sensitivity') <> 'restricted'
+    AND r.sensitivity <> 'restricted'
 )
 SELECT r.*, e.embedding <=> $4 AS distance
 FROM scoped_memory s
