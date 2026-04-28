@@ -44,6 +44,10 @@ CREATE INDEX agentic_memory_hnsw_idx
 CREATE INDEX agentic_memory_tenant_lookup_idx
   ON agentic_memory_records (account_id, board_id, memory_type, updated_at DESC);
 
+-- In production, build the HNSW index inside account-scoped partitions or
+-- tenant hash shards. A global HNSW index with a post-filtered account_id can
+-- hurt recall and latency for large tenants.
+
 CREATE TABLE agentic_query_plans (
   account_id BIGINT NOT NULL,
   plan_id UUID NOT NULL,
@@ -60,6 +64,28 @@ CREATE TABLE agentic_query_plans (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, plan_id)
 );
+
+CREATE TABLE agentic_audit_events (
+  account_id BIGINT NOT NULL,
+  event_id UUID NOT NULL,
+  plan_id UUID NOT NULL,
+  actor_id BIGINT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'memory_created',
+    'memory_updated',
+    'plan_approved',
+    'plan_rejected',
+    'plan_degraded',
+    'query_executed'
+  )),
+  deterministic_hash TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, event_id)
+);
+
+CREATE INDEX agentic_audit_plan_idx
+  ON agentic_audit_events (account_id, plan_id, created_at);
 ```
 
 ### TypeScript contract
@@ -181,6 +207,7 @@ extend type Query {
 Do not run semantic search by filtering vectors after a broad board scan. For boards above 1M rows, these patterns must be rejected or degraded:
 
 - Missing `account_id` predicate.
+- Global HNSW search followed by tenant filtering instead of tenant-partitioned or tenant-sharded vector search.
 - `topK` above tenant budget.
 - JSONB metadata filters without a matching `(account_id, key)` index or generated column.
 - Unbounded recursion where retrieved memories trigger more retrieval calls.
