@@ -1,0 +1,21 @@
+{
+  "name": "mondaydb-agentic-contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic agentic database contracts and guardrails for mondayDB evolution.",
+  "scripts": {
+    "check": "node --check src/agentic-query-guardrails.js && node --test",
+    "test": "node --test"
+  },
+  "exports": {
+    ".": {
+      "import": "./src/agentic-query-guardrails.js",
+      "types": "./src/agentic-query-contracts.d.ts"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

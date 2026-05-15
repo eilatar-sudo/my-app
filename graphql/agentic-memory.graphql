@@ -1,0 +1,69 @@
+enum AgenticActorType {
+  agent
+  human
+  system
+}
+
+enum AgenticMemoryType {
+  procedural
+  semantic
+}
+
+input AgenticMemoryMetadataInput {
+  tags: [String!]!
+  purpose: String
+  toolName: String
+}
+
+input UpsertAgenticMemoryInput {
+  accountId: ID!
+  namespace: String!
+  memoryType: AgenticMemoryType!
+  instruction: String
+  content: String!
+  embedding: [Float!]
+  metadata: AgenticMemoryMetadataInput!
+  sourceActorId: ID!
+  sourceActorType: AgenticActorType!
+  sourceOperationId: ID!
+  idempotencyKey: String!
+}
+
+input SearchAgenticMemoryInput {
+  accountId: ID!
+  namespace: String!
+  queryEmbedding: [Float!]!
+  topK: Int!
+  metadataTags: [String!]
+  maxEstimatedRowsScanned: Int!
+}
+
+type AgenticMemory {
+  accountId: ID!
+  memoryId: ID!
+  namespace: String!
+  memoryType: AgenticMemoryType!
+  instruction: String
+  content: String!
+  metadataTags: [String!]!
+  version: Int!
+}
+
+type AgenticGuardrailDecision {
+  allowed: Boolean!
+  reasons: [String!]!
+  policyHash: String!
+}
+
+type AgenticMemorySearchResult {
+  decision: AgenticGuardrailDecision!
+  memories: [AgenticMemory!]!
+}
+
+extend type Query {
+  searchAgenticMemory(input: SearchAgenticMemoryInput!): AgenticMemorySearchResult!
+}
+
+extend type Mutation {
+  upsertAgenticMemory(input: UpsertAgenticMemoryInput!): AgenticMemory!
+}
