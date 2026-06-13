@@ -447,8 +447,8 @@ admission decision.
 
 ## Performance check for 1M+ row boards
 
-The following patterns are high risk and should be rejected or degraded before
-execution:
+The following patterns are high-risk full-scan triggers and should be rejected
+or degraded before execution:
 
 - Missing `account_id` or `board_id` predicates on row, columnar, vector, or
   telemetry reads.
@@ -464,7 +464,8 @@ execution:
   `agentic_slo_telemetry_windows` rollups.
 
 Safe execution requires composite indexes beginning with `account_id`, bounded
-board sets, and planner-visible limits before any storage engine scan starts.
+board sets, and planner-visible limits before any storage engine full-scan can
+start.
 
 ## Agentic guardrails
 
