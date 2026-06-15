@@ -399,7 +399,7 @@ admission.
 
 ### Vector storage
 
-- Require account-partitioned HNSW search.
+- Require account-partitioned pgvector/HNSW search.
 - Cap `topK`, `ef_search`, candidate expansion, and rerank set size.
 - Record embedding model, vector index watermark, and semantic tags.
 - Reject cross-account vector joins; they are product features, not database
