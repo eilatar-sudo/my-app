@@ -254,6 +254,10 @@ Every read request must satisfy these predicates before execution:
 - `maxExpansionDepth <= guardrails.maxExpansionDepth`
 - estimated row, columnar, vector, and tool expansion cost fits the reserved budget
 
+Planner invariant: no continuity lookup, hydration, replay, or embedding search may
+execute unless the compiled plan includes an `account_id` equality predicate derived
+from the authenticated account context.
+
 If an agent asks for recursive continuity expansion, the planner expands breadth
 first and stops at the lowest of:
 
