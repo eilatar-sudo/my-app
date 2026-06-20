@@ -140,8 +140,7 @@ CREATE INDEX apd_account_actor_created_idx
   ON agentic_purpose_declarations (account_id, actor_id, created_at DESC);
 
 CREATE INDEX apd_account_expires_idx
-  ON agentic_purpose_declarations (account_id, expires_at)
-  WHERE expires_at > now();
+  ON agentic_purpose_declarations (account_id, expires_at);
 
 CREATE TABLE agentic_purpose_envelopes (
   account_id BIGINT NOT NULL,
@@ -198,10 +197,11 @@ CREATE TABLE agentic_purpose_embeddings (
   metadata_json JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (account_id, purpose_id, embedding_model)
-);
+)
+PARTITION BY HASH (account_id);
 
--- Implementation note: use account-hash partitions before HNSW so approximate search never compares
--- vectors across tenants. If board affinity is high, subpartition by board_id for lower candidate fanout.
+-- Implementation note: create one HNSW index per account-hash partition so approximate search never
+-- compares vectors across tenants. If board affinity is high, subpartition by board_id for lower fanout.
 CREATE INDEX ape_hnsw_embedding_idx
   ON agentic_purpose_embeddings
   USING hnsw (embedding vector_cosine_ops);
@@ -213,9 +213,12 @@ CREATE INDEX ape_account_board_model_idx
 ## Open API GraphQL shape
 
 Every mutation and query requires `accountId`. Resolvers reject requests when the authenticated account
-context does not match the argument.
+context does not match the argument. Large planner estimates use `BigInt` because board-scale row and
+candidate counts can exceed GraphQL's signed 32-bit `Int` range.
 
 ```graphql
+scalar BigInt
+
 enum AgenticPurposeKind {
   customer_support_resolution
   sales_pipeline_insight
@@ -254,8 +257,8 @@ input DeclareAgenticPurposeInput {
   allowedAccessPaths: [AgenticAccessPath!]!
   scope: AgenticPurposeScopeInput!
   proceduralMemoryRefs: [ID!]!
-  maxEstimatedRows: Int!
-  maxEstimatedVectorCandidates: Int!
+  maxEstimatedRows: BigInt!
+  maxEstimatedVectorCandidates: BigInt!
   maxRecursiveExpansions: Int!
   expiresAt: DateTime!
   idempotencyKey: String!
@@ -269,7 +272,7 @@ type CompiledPurposeEnvelope {
   constraintHash: String!
   requiredPredicates: [String!]!
   deniedAccessPaths: [AgenticAccessPath!]!
-  maxRowsPerStep: Int!
+  maxRowsPerStep: BigInt!
   maxVectorTopK: Int!
   maxToolCalls: Int!
   maxDepth: Int!
@@ -284,8 +287,8 @@ type AgenticPurposeAuditEvent {
   stepId: String!
   accessPath: AgenticAccessPath!
   decision: String!
-  estimatedRows: Int!
-  estimatedVectorCandidates: Int!
+  estimatedRows: BigInt!
+  estimatedVectorCandidates: BigInt!
   rejectionCode: String
   eventHash: String!
   createdAt: DateTime!
