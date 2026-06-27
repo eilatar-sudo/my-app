@@ -330,8 +330,8 @@ type Query {
 
 ## Performance checks for boards with 1M+ rows
 
-The planner must reject or degrade any runtime contract that would cause a full
-table scan or uncontrolled neighbor impact.
+The planner must reject or degrade any runtime contract that would cause a
+full table scan or uncontrolled neighbor impact.
 
 - **Row path:** Require `account_id` plus board/view predicates before reading
   item rows. Reject unbounded JSON predicates unless backed by a compiled schema
