@@ -24,8 +24,8 @@ eventually consistent semantic context, or a bounded analytical snapshot.
   scoped by `account_id` before any board, workflow, or vector predicate.
 - **Agent-ready perception:** Agents receive compact, tagged context cards that
   describe entities, allowed actions, freshness, and procedural instructions.
-- **Guarded retrieval:** Vector and recursive expansion require explicit
-  budgets, depth limits, and planner estimates before execution.
+- **Guarded retrieval:** pgvector/HNSW lookup and recursive expansion require
+  explicit budgets, depth limits, and planner estimates before execution.
 - **Scale-aware access:** Queries on boards with 1M+ rows must use account-first
   partitioning, bounded `top_k`, indexed object references, and precomputed
   columnar summaries.
