@@ -330,7 +330,11 @@ CREATE TABLE agentic_vector_safe_projections (
   PRIMARY KEY (account_id, projection_id),
   FOREIGN KEY (account_id, envelope_id)
     REFERENCES agentic_redaction_envelopes (account_id, envelope_id)
-);
+) PARTITION BY HASH (account_id);
+
+CREATE TABLE agentic_vector_safe_projections_p0
+  PARTITION OF agentic_vector_safe_projections
+  FOR VALUES WITH (MODULUS 64, REMAINDER 0);
 
 CREATE INDEX agentic_vector_safe_projection_route_idx
   ON agentic_vector_safe_projections (
@@ -362,6 +366,19 @@ enum AgenticRedactionDecision {
   EMBEDDING_EXCLUDE
   SAFE_SUMMARY_ONLY
   REJECT
+}
+
+input AgenticRedactionRuleInput {
+  sourceKind: String!
+  boardId: ID
+  columnId: String
+  sensitivityTags: [String!]!
+  decision: AgenticRedactionDecision!
+  replacementLabel: String
+  allowEmbedding: Boolean!
+  allowPromptContext: Boolean!
+  allowToolArgument: Boolean!
+  reasonCode: String!
 }
 
 input AgenticRedactionPolicyInput {
