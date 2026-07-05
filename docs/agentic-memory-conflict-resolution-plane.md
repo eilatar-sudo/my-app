@@ -25,8 +25,7 @@ database engine.
 
 ## Scope and invariants
 
-Every stored row and API resolver is scoped by `account_id`. Cross-account
-conflict detection is invalid by construction, including vector-neighbor scans.
+Every stored row and API resolver is scoped by `account_id`. Cross-account conflict detection is invalid by construction, including vector-neighbor scans, async sweeps, GraphQL pagination, and audit replay.
 
 Required invariants:
 
