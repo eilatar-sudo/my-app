@@ -266,7 +266,8 @@ extend type Mutation {
 ## Performance checks for 1M+ row boards
 
 - Reject plans where `estimatedRows > budget_policy.max_estimated_rows` unless a
-  required indexed filter is present.
+  required indexed filter is present; on 1M+ row boards this is treated as a
+  full-scan risk, not a soft warning.
 - Never evaluate JSONB filters as the first predicate on large boards; the first
   predicate must be `account_id` plus an indexed `board_id`, item id, group id,
   date range, or status shard.
@@ -276,9 +277,10 @@ extend type Mutation {
   freshness and byte estimates.
 - Reject recursive planning where `requestedRecursiveDepth` exceeds the contract
   cap, and include prior step hashes in loop-containment checks.
-- Avoid contract discovery queries that scan all boards in an account. Discovery
-  should start from `(account_id, board_id, status)` or from a tenant-partitioned
-  semantic route with metadata filters.
+- Avoid contract discovery queries that scan all boards in an account because
+  they can become cross-board full-scan operations. Discovery should start from
+  `(account_id, board_id, status)` or from a tenant-partitioned semantic route
+  with metadata filters.
 
 ## Agent-ready perception
 
