@@ -544,4 +544,3 @@ visibility metadata must be frozen before embedding.
 3. Should procedure memory blocks be embedded together with facts, or kept in a
    separate HNSW namespace to prevent instruction/fact confusion?
 4. Which GraphQL limits should be tenant configurable versus platform fixed?
-
