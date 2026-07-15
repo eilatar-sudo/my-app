@@ -1,7 +1,7 @@
 # mondayDB Agentic Embedding Provenance Plane
 
-**Status:** Strategic design proposal  
-**Audience:** mondayDB Product, Storage, Search, Open API, Security, and SRE  
+**Status:** Strategic design proposal
+**Audience:** mondayDB Product, Storage, Search, Open API, Security, and SRE
 **Decision scope:** Deterministic production, migration, retrieval, and audit of semantic embeddings
 
 ## 1. Why this plane exists
