@@ -25,8 +25,9 @@ epoch, even if encrypted bytes remain in a compaction backlog.
   event is scoped by `account_id`.
 - **Deterministic denial:** the same principal, policy version, source watermark, and
   revocation epoch produce the same visibility decision.
-- **ACID safety boundary:** the request, fence, epoch increment, and first audit event
-  commit in one row-store transaction.
+- **ACID safety boundary:** the pending request and closing barrier commit together;
+  after lease drain, the immutable fence, epoch, revoked state, audit event, and first
+  receipt commit together.
 - **No resurrection:** delayed embedding or compaction jobs cannot publish artifacts
   built before the fence.
 - **Queryable proof:** the Open API returns a receipt containing target states,
@@ -116,6 +117,9 @@ interface ErasureTargetState {
   state: "DISCOVERED" | "LEASED" | "PURGED" | "COMPACTED" | "FAILED";
   attempts: number;
   targetWatermark?: string;
+  purgeCursorArtifactKeyHash?: string;
+  purgedArtifactCount: string;
+  purgedBytes: string;
   backupExpiresAt?: string;
   keyDestructionState?: "NOT_APPLICABLE" | "PENDING" | "DESTROYED";
   restoreSuppressionPolicyVersion?: string;
@@ -299,7 +303,53 @@ CREATE TABLE agentic_visibility_lease (
 
 CREATE INDEX agentic_visibility_lease_drain_idx
   ON agentic_visibility_lease
-  (account_id, source_identity_id, released_at, expires_at, lease_id);
+  (
+    account_id,
+    source_identity_id,
+    barrier_generation,
+    released_at,
+    expires_at,
+    lease_id
+  );
+
+CREATE TABLE agentic_visibility_drain_snapshot (
+  account_id            BIGINT NOT NULL,
+  request_id            UUID NOT NULL,
+  source_identity_id    UUID NOT NULL,
+  drained_generation    BIGINT NOT NULL,
+  closing_generation    BIGINT NOT NULL,
+  active_lease_count    INTEGER NOT NULL,
+  ordered_lease_root    BYTEA NOT NULL,
+  completed_at           TIMESTAMPTZ,
+  final_attestation_root BYTEA,
+  created_at            TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, request_id),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_erasure_request (account_id, request_id),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_source_identity (account_id, source_identity_id),
+  CHECK (active_lease_count BETWEEN 0 AND 256),
+  CHECK (closing_generation = drained_generation + 1)
+);
+
+CREATE TABLE agentic_visibility_drain_member (
+  account_id            BIGINT NOT NULL,
+  request_id            UUID NOT NULL,
+  ordinal               SMALLINT NOT NULL,
+  source_identity_id    UUID NOT NULL,
+  lease_id              UUID NOT NULL,
+  barrier_generation    BIGINT NOT NULL,
+  capability_hash       BYTEA NOT NULL,
+  expires_at             TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, request_id, ordinal),
+  UNIQUE (account_id, request_id, lease_id),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_visibility_drain_snapshot (account_id, request_id),
+  FOREIGN KEY (account_id, source_identity_id, lease_id)
+    REFERENCES agentic_visibility_lease
+      (account_id, source_identity_id, lease_id),
+  CHECK (ordinal BETWEEN 0 AND 255)
+);
 
 CREATE TABLE agentic_revocation_fence (
   account_id            BIGINT NOT NULL,
@@ -407,6 +457,9 @@ CREATE TABLE agentic_erasure_target (
   lease_expires_at      TIMESTAMPTZ,
   attempts              INTEGER NOT NULL DEFAULT 0,
   target_watermark      BIGINT,
+  purge_cursor_artifact_key_hash BYTEA,
+  purged_artifact_count BIGINT NOT NULL DEFAULT 0,
+  purged_bytes          BIGINT NOT NULL DEFAULT 0,
   backup_expires_at     TIMESTAMPTZ,
   key_destruction_state TEXT,
   restore_policy_version TEXT,
@@ -420,6 +473,8 @@ CREATE TABLE agentic_erasure_target (
       (account_id, tenant_partition_id, target_kind),
   CHECK (artifact_count >= 0),
   CHECK (estimated_bytes >= 0),
+  CHECK (purged_artifact_count BETWEEN 0 AND artifact_count),
+  CHECK (purged_bytes >= 0),
   CHECK (attempts >= 0)
 );
 
@@ -561,9 +616,12 @@ The **prepare transaction**:
 2. resolves the exact object row and its stable `source_identity_id`;
 3. verifies the immutable policy artifact and idempotency key;
 4. creates a `PENDING` request;
-5. locks `agentic_visibility_barrier`; and
-6. changes it from `OPEN` to `CLOSING`, increments its generation, and records
-   `closing_request_id`.
+5. locks `agentic_visibility_barrier`;
+6. reads at most 256 unexpired active leases for the open generation through the
+   generation-leading drain index and persists each member plus their ordered root
+   and count; and
+7. changes the barrier from `OPEN` to `CLOSING`, increments its generation, and
+   records `closing_request_id`.
 
 If the locked barrier is already `REVOKED`, the transaction instead creates a
 `REVOKED` request, links the existing immutable fence and epoch, emits its audit event
@@ -573,11 +631,14 @@ and receipt, and commits without changing the barrier or account epoch. If it is
 Visibility gateways grant leases with a linearizable read/write transaction against
 this same barrier table. They do not grant from cached barrier state. Once `CLOSING`
 commits, no new lease can be issued; if the authority is unavailable, lease issuance
-fails closed. Existing leases have a policy-bounded expiry and are visible through
-the lease drain index.
+fails closed. Admission caps unexpired leases at 256 per source (tenants may configure
+a lower limit), and each lease has a policy-bounded expiry. The closing transaction
+holds the barrier lock while snapshotting, so the persisted set is complete.
 
 After all older leases are released or expired, the **final transaction** locks the
-barrier and verifies its generation, request ID, and empty active-lease range. It then:
+barrier and verifies its generation, request ID, and every member in the bounded drain
+snapshot by direct lease key. It stores the signed final attestation root and
+completion time, then:
 
 1. increments `account_revocation_epoch.current_epoch`;
 2. inserts the immutable source fence;
@@ -630,6 +691,26 @@ Workers acquire leases with compare-and-swap updates, then purge at most the com
 limits for artifacts, bytes, wall time, and partitions. A target is `PURGED` after
 logical deletion and `COMPACTED` after physical reclamation where the storage layer
 distinguishes them.
+
+Each target has an independent artifact cursor. A purge batch reads the retained
+locator index with exact account, source, target kind, and tenant partition predicates:
+
+```sql
+WHERE account_id = $1
+  AND source_identity_id = $2
+  AND target_kind = $3
+  AND tenant_partition_id = $4
+  AND artifact_key_hash > $5
+ORDER BY artifact_key_hash
+LIMIT $6
+```
+
+After idempotent cross-store deletes succeed, one transaction advances
+`purge_cursor_artifact_key_hash`, `purged_artifact_count`, and `purged_bytes`. A crash
+before that transaction may repeat a bounded idempotent delete; it never skips an
+artifact. Locators remain until the target is terminal and its receipt is durable, so
+retries neither rescan the prefix nor depend on deleted target contents. One source
+or partition with 1M artifacts is therefore handled as envelope-capped pages.
 
 Backups are not rewritten in place. Backup targets persist `backup_expires_at`,
 `key_destruction_state`, and `restore_policy_version`. Any restore must replay the
@@ -853,7 +934,9 @@ type AgenticErasureTarget {
   kind: AgenticErasureTargetKind!
   state: AgenticErasureTargetState!
   artifactCount: DecimalLong!
+  purgedArtifactCount: DecimalLong!
   estimatedBytes: DecimalLong!
+  purgedBytes: DecimalLong!
   targetWatermark: DecimalLong
   backupExpiresAt: DateTime
   keyDestructionState: AgenticKeyDestructionState
@@ -965,6 +1048,8 @@ cannot bypass read-path isolation or global reliability floors.
   with durable progress.
 - Worker scheduling: indexed state/deadline access with request, target kind, and
   partition tie-breakers for unique keyset pagination.
+- Purge execution: per-target artifact-key cursor with an envelope-capped limit and
+  idempotent deletes.
 - Vector suppression: bounded ANN candidate filtering plus a tenant deny sidecar.
 - Receipt lookup: point query by `(account_id, request_id)`.
 
@@ -1010,8 +1095,9 @@ are:
 | Event | Required canonical fields |
 | --- | --- |
 | `REQUEST_PREPARED` | request hash, source identity, object type, policy artifact hash, barrier generation |
-| `BARRIER_DRAINED` | generation, lease count, ordered lease-attestation root, drain watermark |
+| `BARRIER_DRAINED` | drained/closing generations, bounded lease count, ordered snapshot root, final attestation root, drain watermark |
 | `FENCE_COMMITTED` | fence ID, immutable revocation epoch, source watermark, decision hash |
+| `FENCE_REUSED` | request ID, existing fence ID, source identity, original immutable epoch, original decision hash |
 | `TARGET_TRANSITIONED` | target kind, tenant partition ID, prior/new state, counts, bytes, watermark |
 | `PUBLISH_DECIDED` | visibility attestation ID, capability hash, placement binding hash, decision code |
 | `RECEIPT_EMITTED` | receipt schema/version/hash, audit chain head, target-summary hash |
