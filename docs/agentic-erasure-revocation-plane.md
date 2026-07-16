@@ -156,10 +156,14 @@ with tenant-specific keys, not unhashed user identifiers. A stable random
 `source_identity_id` survives HMAC rotation; rotation adds an alias instead of
 changing the identity carried by fences and artifacts.
 
-First-party source rows store `source_identity_id` directly. Versioned aliases resolve
-external object selectors through an account-leading point lookup. Key rotation must
-create the new alias against the existing identity before retiring the old key;
-resolution never creates a second identity when a source row already exists.
+First-party source rows store `source_identity_id` directly. The normal
+`(account_id, object_type, object_id)` point lookup is the authority that resolves an
+API selector; aliases are secondary pseudonymous lookup keys. During key rotation,
+the resolver computes the new HMAC from the raw selector presented to the source
+service and inserts it against the row's existing identity. It never attempts to
+derive a new HMAC from an old HMAC. Integrations that cannot provide either an
+authoritative source lookup or the raw selector are not eligible for alias rotation
+and cannot publish agentic derivatives.
 
 ```sql
 CREATE TYPE agentic_erasure_state AS ENUM
@@ -171,6 +175,20 @@ CREATE TABLE account_revocation_epoch (
   updated_at            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id),
   CHECK (current_epoch >= 0)
+);
+
+CREATE TABLE agentic_erasure_policy_artifact (
+  account_id            BIGINT NOT NULL,
+  policy_version        TEXT NOT NULL,
+  policy_schema_version SMALLINT NOT NULL,
+  canonical_policy      JSONB NOT NULL,
+  policy_artifact_hash  BYTEA NOT NULL,
+  hash_algorithm        TEXT NOT NULL,
+  signer_key_id         TEXT NOT NULL,
+  signature             BYTEA NOT NULL,
+  valid_from             TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, policy_version),
+  CHECK (jsonb_typeof(canonical_policy) = 'object')
 );
 
 CREATE TABLE agentic_source_identity (
@@ -228,6 +246,8 @@ CREATE TABLE agentic_erasure_request (
   UNIQUE (account_id, idempotency_key),
   FOREIGN KEY (account_id, source_identity_id)
     REFERENCES agentic_source_identity (account_id, source_identity_id),
+  FOREIGN KEY (account_id, policy_version)
+    REFERENCES agentic_erasure_policy_artifact (account_id, policy_version),
   CHECK (
     (state = 'PENDING' AND revocation_epoch IS NULL) OR
     (state <> 'PENDING' AND revocation_epoch IS NOT NULL)
@@ -237,6 +257,49 @@ CREATE TABLE agentic_erasure_request (
 CREATE INDEX agentic_erasure_request_status_idx
   ON agentic_erasure_request
   (account_id, state, purge_deadline_at, request_id);
+
+CREATE TABLE agentic_visibility_barrier (
+  account_id            BIGINT NOT NULL,
+  source_identity_id    UUID NOT NULL,
+  state                 TEXT NOT NULL,
+  generation            BIGINT NOT NULL,
+  closing_request_id    UUID,
+  revoked_at_epoch      BIGINT,
+  updated_at            TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, source_identity_id),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_source_identity (account_id, source_identity_id),
+  FOREIGN KEY (account_id, closing_request_id)
+    REFERENCES agentic_erasure_request (account_id, request_id),
+  CHECK (state IN ('OPEN', 'CLOSING', 'REVOKED')),
+  CHECK (
+    (state = 'OPEN' AND closing_request_id IS NULL AND revoked_at_epoch IS NULL) OR
+    (state = 'CLOSING' AND closing_request_id IS NOT NULL
+      AND revoked_at_epoch IS NULL) OR
+    (state = 'REVOKED' AND closing_request_id IS NOT NULL
+      AND revoked_at_epoch IS NOT NULL)
+  )
+);
+
+CREATE TABLE agentic_visibility_lease (
+  account_id            BIGINT NOT NULL,
+  source_identity_id    UUID NOT NULL,
+  lease_id              UUID NOT NULL,
+  barrier_generation    BIGINT NOT NULL,
+  operation_class       TEXT NOT NULL,
+  capability_hash       BYTEA NOT NULL,
+  issued_at              TIMESTAMPTZ NOT NULL,
+  expires_at             TIMESTAMPTZ NOT NULL,
+  released_at            TIMESTAMPTZ,
+  PRIMARY KEY (account_id, source_identity_id, lease_id),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_visibility_barrier (account_id, source_identity_id),
+  CHECK (expires_at > issued_at)
+);
+
+CREATE INDEX agentic_visibility_lease_drain_idx
+  ON agentic_visibility_lease
+  (account_id, source_identity_id, released_at, expires_at, lease_id);
 
 CREATE TABLE agentic_revocation_fence (
   account_id            BIGINT NOT NULL,
@@ -249,8 +312,16 @@ CREATE TABLE agentic_revocation_fence (
   created_at            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, source_identity_id),
   UNIQUE (account_id, fence_id),
+  UNIQUE (
+    account_id,
+    fence_id,
+    source_identity_id,
+    revoked_at_epoch
+  ),
   FOREIGN KEY (account_id, source_identity_id)
-    REFERENCES agentic_source_identity (account_id, source_identity_id)
+    REFERENCES agentic_source_identity (account_id, source_identity_id),
+  FOREIGN KEY (account_id, policy_version)
+    REFERENCES agentic_erasure_policy_artifact (account_id, policy_version)
 );
 
 CREATE INDEX agentic_revocation_fence_epoch_idx
@@ -260,13 +331,24 @@ CREATE INDEX agentic_revocation_fence_epoch_idx
 CREATE TABLE agentic_erasure_request_fence (
   account_id            BIGINT NOT NULL,
   request_id            UUID NOT NULL,
+  fence_id              UUID NOT NULL,
   source_identity_id    UUID NOT NULL,
+  revoked_at_epoch      BIGINT NOT NULL,
   linked_at              TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (account_id, request_id, source_identity_id),
+  PRIMARY KEY (account_id, request_id),
   FOREIGN KEY (account_id, request_id)
     REFERENCES agentic_erasure_request (account_id, request_id),
-  FOREIGN KEY (account_id, source_identity_id)
-    REFERENCES agentic_revocation_fence (account_id, source_identity_id)
+  FOREIGN KEY (
+    account_id,
+    fence_id,
+    source_identity_id,
+    revoked_at_epoch
+  ) REFERENCES agentic_revocation_fence (
+    account_id,
+    fence_id,
+    source_identity_id,
+    revoked_at_epoch
+  )
 );
 
 CREATE TABLE agentic_derivation_locator (
@@ -295,6 +377,23 @@ CREATE TABLE agentic_derivation_locator (
 CREATE INDEX agentic_derivation_locator_artifact_idx
   ON agentic_derivation_locator
   (account_id, target_kind, tenant_partition_id, artifact_key_hash);
+
+CREATE TABLE agentic_erasure_discovery_progress (
+  account_id            BIGINT NOT NULL,
+  request_id            UUID NOT NULL,
+  last_target_kind      TEXT,
+  last_tenant_partition_id UUID,
+  last_artifact_key_hash BYTEA,
+  discovered_artifacts  BIGINT NOT NULL,
+  discovered_bytes      BIGINT NOT NULL,
+  state                 TEXT NOT NULL,
+  updated_at            TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, request_id),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_erasure_request (account_id, request_id),
+  CHECK (discovered_artifacts >= 0),
+  CHECK (discovered_bytes >= 0)
+);
 
 CREATE TABLE agentic_erasure_target (
   account_id            BIGINT NOT NULL,
@@ -326,7 +425,46 @@ CREATE TABLE agentic_erasure_target (
 
 CREATE INDEX agentic_erasure_target_worker_idx
   ON agentic_erasure_target
-  (account_id, state, lease_expires_at, updated_at, request_id);
+  (
+    account_id,
+    state,
+    lease_expires_at,
+    updated_at,
+    request_id,
+    target_kind,
+    tenant_partition_id
+  );
+
+CREATE TABLE agentic_visibility_attestation (
+  account_id            BIGINT NOT NULL,
+  attestation_id        UUID NOT NULL,
+  source_identity_id    UUID NOT NULL,
+  request_id            UUID,
+  operation_class       TEXT NOT NULL,
+  decision_code         TEXT NOT NULL,
+  barrier_generation    BIGINT NOT NULL,
+  policy_version        TEXT NOT NULL,
+  policy_artifact_hash  BYTEA NOT NULL,
+  capability_hash       BYTEA,
+  payload_schema_version SMALLINT NOT NULL,
+  canonical_payload     JSONB NOT NULL,
+  canonical_payload_hash BYTEA NOT NULL,
+  signer_key_id         TEXT NOT NULL,
+  signature             BYTEA NOT NULL,
+  occurred_at            TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, attestation_id),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_source_identity (account_id, source_identity_id),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_erasure_request (account_id, request_id),
+  FOREIGN KEY (account_id, policy_version)
+    REFERENCES agentic_erasure_policy_artifact (account_id, policy_version),
+  CHECK (jsonb_typeof(canonical_payload) = 'object')
+);
+
+CREATE INDEX agentic_visibility_attestation_source_idx
+  ON agentic_visibility_attestation
+  (account_id, source_identity_id, occurred_at, attestation_id);
 
 CREATE TABLE agentic_erasure_audit_head (
   account_id            BIGINT NOT NULL,
@@ -350,6 +488,7 @@ CREATE TABLE agentic_erasure_audit_event (
   payload_schema_version SMALLINT NOT NULL,
   canonical_payload     JSONB NOT NULL,
   canonical_payload_hash BYTEA NOT NULL,
+  hash_algorithm        TEXT NOT NULL,
   previous_event_hash   BYTEA,
   event_hash            BYTEA NOT NULL,
   occurred_at            TIMESTAMPTZ NOT NULL,
@@ -368,8 +507,10 @@ CREATE TABLE agentic_erasure_receipt (
   account_id            BIGINT NOT NULL,
   request_id            UUID NOT NULL,
   receipt_version       BIGINT NOT NULL,
+  receipt_schema_version SMALLINT NOT NULL,
   canonical_receipt     JSONB NOT NULL,
   receipt_hash          BYTEA NOT NULL,
+  hash_algorithm        TEXT NOT NULL,
   audit_chain_head_hash BYTEA NOT NULL,
   created_at            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, request_id, receipt_version),
@@ -411,41 +552,77 @@ partition name.
 
 ### 1. Admit and revoke
 
-Within one serializable row-store transaction:
+Revocation uses a durable two-transaction barrier. It never commits a `REVOKED`
+request that still depends on best-effort gateway publication.
 
-1. authenticate the principal and resolve `account_id` server-side;
-2. canonicalize the exact object selector, resolve its stable `source_identity_id`
-   through the current HMAC alias, and lock that identity's visibility barrier;
-3. enforce the account's erasure policy and idempotency key;
-4. wait for bounded older visibility leases on that source to drain;
-5. increment `account_revocation_epoch.current_epoch`;
-6. write or reuse the source fence, link it to this request, append the audit event,
-   and commit; and
-7. publish the new epoch at the visibility gateway, then release the source barrier
-   and acknowledge success.
+The **prepare transaction**:
+
+1. authenticates the principal and resolves `account_id` server-side;
+2. resolves the exact object row and its stable `source_identity_id`;
+3. verifies the immutable policy artifact and idempotency key;
+4. creates a `PENDING` request;
+5. locks `agentic_visibility_barrier`; and
+6. changes it from `OPEN` to `CLOSING`, increments its generation, and records
+   `closing_request_id`.
+
+If the locked barrier is already `REVOKED`, the transaction instead creates a
+`REVOKED` request, links the existing immutable fence and epoch, emits its audit event
+and receipt, and commits without changing the barrier or account epoch. If it is
+`CLOSING` for another request, no new request is committed.
+
+Visibility gateways grant leases with a linearizable read/write transaction against
+this same barrier table. They do not grant from cached barrier state. Once `CLOSING`
+commits, no new lease can be issued; if the authority is unavailable, lease issuance
+fails closed. Existing leases have a policy-bounded expiry and are visible through
+the lease drain index.
+
+After all older leases are released or expired, the **final transaction** locks the
+barrier and verifies its generation, request ID, and empty active-lease range. It then:
+
+1. increments `account_revocation_epoch.current_epoch`;
+2. inserts the immutable source fence;
+3. links the request to the exact fence ID and original fence epoch;
+4. appends canonical audit and visibility attestations;
+5. writes the first versioned receipt;
+6. sets both request and barrier to `REVOKED`; and
+7. commits.
+
+That final commit is the revocation linearization point and requires no follow-up
+publication. The mutation acknowledges success only after it can read that committed
+state from the same quorum-backed visibility authority.
 
 If the same idempotency key has the same canonical request hash, return the original
-receipt. If the hash differs, return `IDEMPOTENCY_CONFLICT`. Concurrent requests for
-the same source converge on the existing fence and the highest committed epoch. Each
-request retains its own `agentic_erasure_request_fence` link, so a later request does
-not overwrite the first request's provenance.
+receipt only when the request is already `REVOKED`; a `PENDING` retry resumes drain
+and finalization. If the hash differs, return `IDEMPOTENCY_CONFLICT`. A request for an
+already-revoked source links to the existing immutable fence and reuses its original
+epoch without advancing the account epoch. Thus repeated requests retain independent
+request/audit provenance without mutating fence history. A competing request that
+finds `CLOSING` receives `SOURCE_REVOCATION_IN_PROGRESS` and may retry after the first
+request reaches a terminal state.
 
-The mutation returns only after the epoch gateway can no longer issue an older lease.
-If epoch publication cannot reach quorum, it fails closed and does not claim
-revocation. Physical target discovery is not part of this availability-critical
-transaction.
+Physical target discovery is not part of either availability-critical transaction.
+An abandoned `CLOSING` request remains fail-closed and is safely resumable by its
+idempotency key or a policy-authorized recovery worker.
 
 ### 2. Discover exact derivatives
 
 A worker performs an indexed lookup on:
 
 ```sql
-WHERE account_id = $1 AND source_identity_id = $2
+WHERE account_id = $1
+  AND source_identity_id = $2
+  AND (target_kind, tenant_partition_id, artifact_key_hash) > ($3, $4, $5)
+ORDER BY target_kind, tenant_partition_id, artifact_key_hash
+LIMIT $6
 ```
 
-It groups locator rows into bounded target partitions and writes target records.
-Object locators must be emitted transactionally when each derivative is published;
-purge time is too late to rediscover lineage reliably.
+`$6` is clamped by the execution envelope. The worker groups only that page into
+target records and atomically advances `agentic_erasure_discovery_progress` with the
+last composite key, counts, and bytes. An initial cursor uses typed minimum sentinels;
+retries repeat the upsert and cursor transaction idempotently. A source with millions
+of derivatives therefore creates many admitted pages, never one unbounded range
+scan. Object locators must be emitted transactionally when each derivative is
+published; purge time is too late to rediscover lineage reliably.
 
 ### 3. Purge and compact
 
@@ -483,8 +660,9 @@ the gateway acquires a short-lived **visibility lease** over the packet's source
 identities. The lease service and fence writer share the same linearizable per-source
 barrier:
 
-- a lease is granted only after checking the latest source fence;
-- a fence commit blocks new older leases and waits for existing bounded leases;
+- a lease is granted and recorded only while the locked barrier state is `OPEN`;
+- a committed `CLOSING` or `REVOKED` barrier denies every new lease;
+- final fence commit occurs only after bounded older leases drain;
 - the gateway holds the lease through response release or the tool's authorization
   linearization point; and
 - queued or retried tool work must reacquire a lease rather than reuse context.
@@ -635,6 +813,20 @@ enum AgenticKeyDestructionState {
   DESTROYED
 }
 
+enum AgenticErasureOmissionReason {
+  TARGET_DISCOVERY_PENDING
+  PHYSICAL_PURGE_DELAYED
+  BACKUP_RETENTION_ACTIVE
+  REVOKED_CANDIDATES_FILTERED
+}
+
+enum AgenticErasureForbiddenAction {
+  RETRIEVE_CONTENT
+  RECONSTRUCT_FROM_DERIVATIVES
+  REEMBED
+  RETRY_TOOL_WITH_REVOKED_CONTEXT
+}
+
 input AgenticErasureScopeInput {
   objectType: AgenticErasureObjectType!
   objectId: ID!
@@ -688,8 +880,8 @@ type AgenticErasureReceipt {
   visibility: AgenticErasureVisibility!
   purgeDeadlineAt: DateTime!
   targetSummaries: [AgenticErasureTargetSummary!]!
-  omissionReasons: [String!]!
-  forbiddenActions: [String!]!
+  omissionReasons: [AgenticErasureOmissionReason!]!
+  forbiddenActions: [AgenticErasureForbiddenAction!]!
   nextStatusCheckAfter: DateTime!
   receiptHash: String!
 }
@@ -719,7 +911,11 @@ The scope input is structurally exact: its enum and required ID cannot express m
 or incomplete selector variants. GraphQL resolvers cap `first` at 100 and use an
 HMAC-signed keyset cursor over `(target_kind, tenant_partition_id)`. The receipt's
 summary list has at most one entry per closed target kind; partition details and
-backup proof fields are paginated. Neither path joins against deleted source data.
+backup proof fields are paginated. `first` must be between 1 and 100, cursors are at
+most 512 bytes, IDs and policy versions are at most 256 bytes, and idempotency keys
+are at most 128 bytes. Omission and forbidden-action lists are deduplicated subsets of
+closed enums, so their cardinality is schema-bounded. Neither path joins against
+deleted source data.
 
 ## Agentic guardrails and admission
 
@@ -764,8 +960,11 @@ cannot bypass read-path isolation or global reliability floors.
 ### Safe paths
 
 - Exact object revocation: point writes and lookups on account-leading composite keys.
-- Derivative discovery: locator lookup by `(account_id, source_identity_id)`.
-- Worker scheduling: indexed state/deadline/lease access with keyset pagination.
+- Derivative discovery: envelope-capped locator pages keyed by
+  `(account_id, source_identity_id, target_kind, tenant_partition_id, artifact_key_hash)`
+  with durable progress.
+- Worker scheduling: indexed state/deadline access with request, target kind, and
+  partition tie-breakers for unique keyset pagination.
 - Vector suppression: bounded ANN candidate filtering plus a tenant deny sidecar.
 - Receipt lookup: point query by `(account_id, request_id)`.
 
@@ -791,7 +990,7 @@ Audit payloads use canonical serialization with explicit field ordering and vers
 hash algorithms:
 
 ```text
-event_hash = SHA-256(
+event_hash = HASH(hash_algorithm,
   account_id ||
   request_id ||
   sequence_no ||
@@ -804,6 +1003,19 @@ event_hash = SHA-256(
 )
 ```
 
+Version 1 permits only `SHA-256`; adding an algorithm requires a new payload schema
+version and dual verification during migration. The closed version-1 event schemas
+are:
+
+| Event | Required canonical fields |
+| --- | --- |
+| `REQUEST_PREPARED` | request hash, source identity, object type, policy artifact hash, barrier generation |
+| `BARRIER_DRAINED` | generation, lease count, ordered lease-attestation root, drain watermark |
+| `FENCE_COMMITTED` | fence ID, immutable revocation epoch, source watermark, decision hash |
+| `TARGET_TRANSITIONED` | target kind, tenant partition ID, prior/new state, counts, bytes, watermark |
+| `PUBLISH_DECIDED` | visibility attestation ID, capability hash, placement binding hash, decision code |
+| `RECEIPT_EMITTED` | receipt schema/version/hash, audit chain head, target-summary hash |
+
 The immutable `canonical_payload` stores only source identity IDs, hashes, counts,
 target states, decision codes, watermarks, and transition timestamps—not erased
 values. Its schema is versioned, and its calculated hash must match
@@ -814,13 +1026,26 @@ are revoked and blocked by an append-only trigger. Periodic chain heads are sign
 anchored in a separate audit account so a database operator cannot silently rewrite
 and rehash history.
 
+Policy authorization is replayable against the signed, immutable
+`agentic_erasure_policy_artifact`, not a version label alone. The visibility authority
+emits a signed `agentic_visibility_attestation` for every context release, tool
+authorization, artifact manifest swap, and denial. It binds the policy artifact hash,
+barrier generation, capability hash, decision, and sanitized payload. Active lease
+rows may be compacted only after the signed attestation is durable; attestations move
+to tenant-partitioned columnar storage under the audit retention policy.
+
 `agentic_erasure_receipt.canonical_receipt` is a sanitized materialized replay result,
 not merely a digest. A verifier can regenerate every receipt version from the
 canonical events, compare it with the stored JSON, verify `receipt_hash`, and bind it
-to `audit_chain_head_hash`. Replay verifies:
+to `audit_chain_head_hash`. The receipt schema fixes the exact fields shown by
+GraphQL: request/state/scope, immutable epoch, purge deadline, bounded target
+summaries, omission codes, forbidden-action codes, next-check time, and audit head.
+Its schema version and hash algorithm prevent ambiguous replay. With the policy
+artifact, authority public keys, canonical events, and attestations, replay verifies:
 
 1. the request was authorized under the recorded policy;
-2. the epoch advanced exactly once for the canonical request;
+2. the epoch advanced exactly once when the source's fence was first created, while
+   repeated requests linked to that immutable epoch;
 3. every recorded context release, tool authorization, or artifact publication
    referenced a valid visibility lease;
 4. each target transitioned through allowed states;
@@ -845,7 +1070,7 @@ Recommended product SLOs:
 If vector, columnar, or object storage is unavailable, revocation still commits. The
 request reports delayed physical targets while all serving gateways deny matching
 sources; a recovering store cannot serve without a current visibility capability. If
-the row control plane or epoch gateway quorum is unavailable, the mutation fails
+the row control plane or visibility-authority quorum is unavailable, the mutation fails
 closed and does not claim success. This deliberately prefers an explicit failed
 request over a false erasure receipt.
 
