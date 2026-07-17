@@ -527,6 +527,25 @@ CREATE TABLE agentic_temporal_partition_apply_ledger (
   )
 );
 
+CREATE TABLE agentic_temporal_allocator_gap (
+  account_id              BIGINT NOT NULL,
+  tenant_partition_id     UUID NOT NULL,
+  allocator_term          BIGINT NOT NULL CHECK (allocator_term > 0),
+  first_unused_sequence   BIGINT NOT NULL CHECK (first_unused_sequence > 0),
+  last_unused_sequence    BIGINT NOT NULL,
+  reason_code             TEXT NOT NULL,
+  gap_hash                BYTEA NOT NULL CHECK (octet_length(gap_hash) = 32),
+  signing_key_version     INTEGER NOT NULL,
+  signature               BYTEA NOT NULL,
+  created_at              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (
+    account_id, tenant_partition_id, allocator_term, first_unused_sequence
+  ),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
+  CHECK (last_unused_sequence >= first_unused_sequence)
+);
+
 CREATE TABLE agentic_temporal_authority_checkpoint (
   account_id              BIGINT NOT NULL,
   checkpoint_id           UUID NOT NULL,
@@ -604,6 +623,7 @@ CREATE TABLE agentic_temporal_mutation_batch (
   account_id              BIGINT NOT NULL,
   source_event_id         UUID NOT NULL,
   batch_sequence         INTEGER NOT NULL CHECK (batch_sequence > 0),
+  lease_generation        BIGINT NOT NULL CHECK (lease_generation > 0),
   tenant_partition_id     UUID NOT NULL,
   commit_sequence         BIGINT NOT NULL CHECK (commit_sequence > 0),
   transaction_id          UUID NOT NULL,
@@ -1404,6 +1424,21 @@ CREATE POLICY temporal_fact_tenant_policy
   ON agentic_temporal_fact_version
   USING (account_id = current_setting('monday.account_id')::BIGINT)
   WITH CHECK (account_id = current_setting('monday.account_id')::BIGINT);
+
+REVOKE INSERT, UPDATE, DELETE
+  ON agentic_temporal_embedding,
+     agentic_temporal_procedure_artifact,
+     agentic_temporal_procedure_binding,
+     agentic_temporal_mutation_batch
+  FROM agentic_vector_serving_role, agentic_procedure_serving_role,
+       agentic_correction_worker_role;
+
+GRANT EXECUTE ON FUNCTION publish_agentic_temporal_embedding(JSONB)
+  TO agentic_vector_publisher_role;
+GRANT EXECUTE ON FUNCTION publish_agentic_temporal_procedure(JSONB)
+  TO agentic_procedure_publisher_role;
+GRANT EXECUTE ON FUNCTION commit_agentic_temporal_mutation_batch(JSONB)
+  TO agentic_correction_worker_role;
 ```
 
 The migration generator enumerates every catalog relation containing `account_id`,
@@ -1414,6 +1449,11 @@ against the catalog rather than relying on this one representative statement.
 Serving, vector, columnar, compaction, and audit roles receive separate capabilities.
 Table owners never serve requests; `BYPASSRLS` is prohibited. Migration and break-glass
 roles are unavailable to serving processes and emit independently anchored events.
+The three named security-definer functions reject unknown JSON keys, canonicalize their
+typed payloads, set `search_path` explicitly, derive `account_id` from session policy,
+and perform the source/lease checks described below. An append-only trigger blocks
+procedure-artifact update/delete after signing. These are mandatory migration objects,
+not optional application conventions.
 
 ## Deterministic write and correction lifecycle
 
@@ -1472,7 +1512,11 @@ durable abort decision.
 
 The coordinator and participant sequence allocators are quorum-replicated and fenced
 by term. Failover may leave unused sequence gaps but cannot reuse a sequence or expose
-an undecided transaction. Timeline locks have an envelope-bounded hold time; a
+an undecided transaction. Each unused range has a signed
+`agentic_temporal_allocator_gap` in the new allocator term; a frontier may skip it only
+after verifying that record against the authority checkpoint. Transactional `GAP`
+apply-ledger rows remain reserved for allocated participants with missing effects and
+block advancement until repaired. Timeline locks have an envelope-bounded hold time; a
 coordinator or audit-partition outage aborts the write before acknowledgement. This
 keeps the audit/outbox work in the row transaction's existing failure domain instead
 of adding vector or columnar availability to the write path.
@@ -1486,6 +1530,12 @@ Workers acquire jobs with compare-and-swap on `(lease_generation, lease_expires_
 takeover increments the generation and stale workers cannot advance cursors. Encrypted
 canonical mutation and compiled-plan payloads, policy/contract/envelope versions,
 review ticket, attempts, and typed error codes make restart independent of caller state.
+Every batch records the lease generation. The only batch-commit stored procedure locks
+the mutation-job row and, in the same participant transaction, verifies that generation
+is still current, the owner matches, and the lease has not expired before it prepares
+fact changes and the batch row. Direct batch/fact writes by correction workers are
+revoked. A stale worker therefore fails before the coordinator can decide commit, not
+merely when it later tries to advance a cursor.
 
 ### 3. Publish derived layers by watermark
 
@@ -1522,6 +1572,12 @@ derivative inserts are revoked after signing. The composite embedding foreign ke
 binds immutable copied source fields, so bypassing the publication function still
 cannot attach a different range, identity, sequence, or value hash.
 
+`embedding.system_to_sequence` is deliberately not in that immutable-source FK because
+supersession reaches the asynchronous derivative later. The publisher sets it from the
+source, but eligibility comes from the manifest's gap-free prefix plus authoritative
+fact/system interval and revocation checks; a lagging copied end sequence can only
+cause `VECTOR_LAG`, never make a superseded candidate releasable.
+
 ## Deterministic read lifecycle
 
 ### 1. Parse typed intent
@@ -1545,7 +1601,8 @@ partitions.
 Each snapshot member carries a proof against the signed authority checkpoint.
 Transaction-participant rows bind each local sequence to a coordinator decision and
 effects root; the apply ledger proves the contiguous frontier and exposes durable gaps.
-Snapshot replay verifies these leaves before trusting `appliedDecisionPrefix`.
+Signed allocator-gap leaves prove unused ranges. Snapshot replay verifies both kinds of
+leaves before trusting `appliedDecisionPrefix`.
 
 With a token, mondayDB verifies the signature, account, principal delegation, purpose,
 policy, expiry, decision root, visibility epoch, and requested partition set. Adding a
@@ -2123,7 +2180,7 @@ Grounding status accepts separate packet and aggregate cursors; each cursor carr
 signed stream discriminator, so advancing one result cannot alter the other.
 
 Fact mutations are ordinary typed Open API writes. Small corrections compile and
-commit synchronously; large corrections enter `ADMITTED` for reviewed, budgeted
+commit synchronously; large corrections enter `ADMITTED_FOR_REVIEW` for reviewed, budgeted
 execution. Status exposes progress, completion, cancellation, typed aggregate output,
 and a nullable packet. Cancelling stops future admitted batches but never rolls back
 already committed fact versions. Exact procedure reads return the hash, range,
