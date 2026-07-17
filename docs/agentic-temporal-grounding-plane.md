@@ -33,8 +33,10 @@ never infers validity from prose.
 
 - **No tenant leakage:** `account_id` leads every logical key, foreign key, index,
   vector partition, snapshot member, worker lease, and audit chain.
-- **Deterministic as-of reads:** the same typed selectors, valid time, snapshot token,
-  policy artifact, and execution envelope produce the same fact-version set.
+- **Deterministic relational as-of reads:** the same typed selectors, valid time,
+  dependency-closed snapshot, policy artifact, and execution envelope produce the same
+  fact-version set. ANN discovery is a signed, replay-verifiable decision, not a claim
+  that a mutable HNSW graph will reproduce an identical traversal forever.
 - **ACID current state:** a timeline correction, supersession metadata, outbox event,
   and audit event commit in one row-store transaction.
 - **Replayable historical state:** an earlier snapshot continues to see the versions
@@ -54,10 +56,13 @@ a procedure's instruction body. A **fact version** is a value attached to a half
 valid-time interval `[valid_from, valid_to)`. A **system interval** is the local commit
 sequence range during which a partition considered that fact version visible.
 
-A **temporal snapshot** is an immutable manifest of the row-store commit sequence for
-each tenant partition touched by a request. It is represented externally by a signed,
-opaque token. It is not a wall-clock timestamp. This matters because decoupled compute
-and storage cannot safely reconstruct a distributed ACID snapshot from client time.
+A **temporal snapshot** is an immutable, dependency-closed manifest issued by mondayDB's
+ACID snapshot authority. It binds one global read epoch to a row-store applied prefix
+for each tenant partition touched by a request and to the durable coordinator decision
+root that proves multi-partition transactions are all-visible or all-absent. It is
+represented externally by a signed, opaque token. It is not a wall-clock timestamp.
+This matters because decoupled compute and storage cannot safely reconstruct a
+distributed ACID snapshot by independently sampling partitions or from client time.
 
 A **grounding packet** is the bounded, policy-filtered set of facts, procedures, source
 references, semantic matches, watermarks, and omission codes released to an agent. It
@@ -79,8 +84,11 @@ envelope allows.
 ## TypeScript contracts
 
 IDs and signed tokens are opaque strings at the API boundary. Sequences, row counts,
-and byte counts are decimal strings because JavaScript and GraphQL cannot safely carry
-all 64-bit integers.
+byte counts, and exact decimal facts are canonical decimal strings because JavaScript
+and GraphQL cannot safely carry all 64-bit integers or arbitrary decimal values.
+`DateTime` values normalize to UTC RFC 3339 with exactly six fractional digits; hashes
+never depend on a client's timezone spelling. JSON numbers are forbidden inside
+canonical fact values: contracts encode integral and decimal values as typed strings.
 
 ```ts
 type TemporalObjectType =
@@ -131,9 +139,12 @@ interface TemporalFactVersion {
 interface TemporalSnapshotPartition {
   tenantPartitionId: string;
   visibleCommitSequence: string;
+  appliedDecisionPrefix: string;
   rowWatermark: string;
   columnarWatermark?: string;
-  vectorWatermark?: string;
+  vectorManifestId?: string;
+  vectorManifestHash?: string;
+  vectorAppliedPrefix?: string;
   procedureWatermark?: string;
 }
 
@@ -142,6 +153,10 @@ interface TemporalSnapshot {
   snapshotId: string;
   snapshotToken: string;
   consistency: "LATEST_COMMITTED" | "PINNED";
+  authorityReadEpoch: string;
+  coordinatorDecisionRoot: string;
+  evaluationTime: string;
+  selectionVisibilityEpoch: string;
   partitions: TemporalSnapshotPartition[];
   policyVersion: string;
   expiresAt: string;
@@ -174,14 +189,22 @@ interface DeterministicTemporalFilter {
   children?: DeterministicTemporalFilter[];
 }
 
-interface TemporalSemanticRoute {
+interface CompiledTemporalSemanticRoute {
   indexId: string;
   embeddingModelVersion: string;
   queryEmbeddingHash: string;
+  graphArtifacts: Array<{
+    graphArtifactId: string;
+    graphArtifactHash: string;
+    validTimeBucketId: string;
+  }>;
+  distanceMetric: "COSINE";
+  efSearch: number;
   topK: number;
   maxCandidates: number;
   validTimeBucketIds: string[];
   metadataFilterHash: string;
+  orderedCandidateAttestationHash: string;
 }
 
 interface TemporalGroundingRequest {
@@ -192,17 +215,18 @@ interface TemporalGroundingRequest {
   validAt: string;
   snapshotToken?: string;
   selectors: TemporalSelector[];
-  semanticRoute?: TemporalSemanticRoute;
+  semanticRoute?: CompiledTemporalSemanticRoute;
   procedureScopes: string[];
+  completeness: "REQUIRE_COMPLETE" | "ALLOW_PARTIAL";
   policyVersion: string;
   idempotencyKey: string;
+  canonicalRequestHash: string;
 }
 
 type TemporalRelation =
-  | "CURRENT_AT_VALID_TIME"
-  | "HISTORICAL_AT_VALID_TIME"
-  | "SCHEDULED_AFTER_VALID_TIME"
-  | "CORRECTED_AFTER_SNAPSHOT";
+  | "CURRENT_AT_SNAPSHOT"
+  | "HISTORICAL_AT_SNAPSHOT"
+  | "SCHEDULED_AT_SNAPSHOT";
 
 interface TemporalPerceptionFact {
   factVersionId: string;
@@ -234,7 +258,7 @@ interface TemporalGroundingPacket {
   validAt: string;
   observedAtSnapshotToken: string;
   facts: TemporalPerceptionFact[];
-  procedureVersionIds: string[];
+  procedures: TemporalProcedureRef[];
   sourceCitationHashes: string[];
   omissions: Array<{
     code: TemporalOmissionCode;
@@ -245,7 +269,43 @@ interface TemporalGroundingPacket {
   nextCursor?: string;
   executionEnvelopeHash: string;
   policyVersion: string;
+  releaseVisibilityEpoch: string;
   packetHash: string;
+  releaseAuditEventHash: string;
+}
+
+interface TemporalProcedureRef {
+  procedureId: string;
+  procedureVersionId: string;
+  instructionHash: string;
+  validTime: ValidTimeRange;
+  preconditionHash: string;
+  requiredContractId: string;
+}
+
+interface TemporalMutationRequest {
+  accountId: string;
+  sourceEventId: string;
+  idempotencyKey: string;
+  object: TemporalObjectRef;
+  attributeKey: string;
+  valueType: TemporalFactVersion["valueType"];
+  canonicalValue: unknown;
+  validTime: ValidTimeRange;
+  correctionReasonCode?: string;
+  canonicalMutationHash: string;
+}
+
+interface TemporalPageCursor {
+  version: 1;
+  accountId: string;
+  principalId: string;
+  scopeHash: string;
+  snapshotId: string;
+  validTimeHash: string;
+  lastSortTuple: string[];
+  envelopeHash: string;
+  expiresAt: string;
 }
 
 interface TemporalExecutionEnvelope {
@@ -274,10 +334,11 @@ interface TemporalExecutionEnvelope {
 it is not arbitrary agent-generated JSON. A contract fixes allowed attribute keys,
 value types, canonicalization rules, temporal behavior, and indexed filter operators.
 
-The perception packet labels time explicitly. Agents should receive phrases such as
-“historical at requested valid time” as structured metadata, not infer them from date
-strings. `CORRECTED_AFTER_SNAPSHOT` can be emitted only when the caller explicitly
-requests a comparison with latest state; a pinned packet itself never mixes snapshots.
+The perception packet labels time explicitly. The relation is computed from a fact's
+valid range against the snapshot's pinned `evaluationTime`: a range containing that
+instant is current, one ending before it is historical, and one beginning after it is
+scheduled. `validAt` chooses the fact; `evaluationTime` labels it. Neither uses the
+gateway's later wall clock, and a pinned packet never compares against latest state.
 
 ## SQL control-plane schema
 
@@ -290,6 +351,9 @@ constraint in its timeline transaction coordinator.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS vector;
 
+CREATE TYPE temporal_object_type AS ENUM
+  ('BOARD', 'BOARD_ITEM', 'UPDATE', 'WORKFLOW', 'MEMORY', 'PROCEDURE');
+
 CREATE TYPE temporal_value_type AS ENUM
   ('BOOLEAN', 'NUMBER', 'STRING', 'DATE_TIME', 'OBJECT_REF', 'JSON');
 
@@ -297,13 +361,64 @@ CREATE TYPE temporal_snapshot_consistency AS ENUM
   ('LATEST_COMMITTED', 'PINNED');
 
 CREATE TYPE temporal_grounding_state AS ENUM
-  ('ADMITTED', 'RUNNING', 'COMPLETE', 'PARTIAL', 'REJECTED', 'FAILED');
+  ('ADMITTED', 'RUNNING', 'COMPLETE', 'PARTIAL', 'CANCELLED', 'REJECTED', 'FAILED');
+
+CREATE TABLE agentic_tenant_partition (
+  account_id              BIGINT NOT NULL,
+  tenant_partition_id     UUID NOT NULL,
+  placement_binding_hash  BYTEA NOT NULL CHECK (octet_length(placement_binding_hash) = 32),
+  state                   TEXT NOT NULL CHECK (state IN ('ACTIVE', 'DRAINING', 'RETIRED')),
+  created_at              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, tenant_partition_id)
+);
+
+CREATE TABLE agentic_temporal_transaction_decision (
+  account_id              BIGINT NOT NULL,
+  transaction_id          UUID NOT NULL,
+  authority_commit_epoch  BIGINT NOT NULL CHECK (authority_commit_epoch > 0),
+  participant_root        BYTEA NOT NULL CHECK (octet_length(participant_root) = 32),
+  decision                TEXT NOT NULL CHECK (decision IN ('COMMITTED', 'ABORTED')),
+  decided_at              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, transaction_id),
+  UNIQUE (account_id, authority_commit_epoch)
+);
+
+CREATE TABLE agentic_temporal_source_event_receipt (
+  account_id                BIGINT NOT NULL,
+  source_event_id           UUID NOT NULL,
+  canonical_mutation_hash   BYTEA NOT NULL CHECK (octet_length(canonical_mutation_hash) = 32),
+  transaction_id            UUID NOT NULL,
+  result_root               BYTEA NOT NULL CHECK (octet_length(result_root) = 32),
+  created_at                TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, source_event_id),
+  FOREIGN KEY (account_id, transaction_id)
+    REFERENCES agentic_temporal_transaction_decision (account_id, transaction_id)
+);
+
+CREATE TABLE agentic_temporal_enrichment_outbox (
+  account_id              BIGINT NOT NULL,
+  tenant_partition_id     UUID NOT NULL,
+  commit_sequence         BIGINT NOT NULL CHECK (commit_sequence > 0),
+  outbox_ordinal          INTEGER NOT NULL CHECK (outbox_ordinal >= 0),
+  transaction_id          UUID NOT NULL,
+  event_type              TEXT NOT NULL,
+  canonical_payload       JSONB NOT NULL,
+  payload_hash            BYTEA NOT NULL CHECK (octet_length(payload_hash) = 32),
+  created_at              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (
+    account_id, tenant_partition_id, commit_sequence, outbox_ordinal
+  ),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
+  FOREIGN KEY (account_id, transaction_id)
+    REFERENCES agentic_temporal_transaction_decision (account_id, transaction_id)
+);
 
 CREATE TABLE agentic_temporal_timeline (
   account_id              BIGINT NOT NULL,
   timeline_id             UUID NOT NULL,
   tenant_partition_id     UUID NOT NULL,
-  object_type             TEXT NOT NULL,
+  object_type             temporal_object_type NOT NULL,
   object_id               TEXT NOT NULL,
   board_id                BIGINT,
   attribute_key           TEXT NOT NULL,
@@ -317,6 +432,8 @@ CREATE TABLE agentic_temporal_timeline (
   PRIMARY KEY (account_id, timeline_id),
   UNIQUE (account_id, object_type, object_id, attribute_key),
   UNIQUE (account_id, timeline_id, tenant_partition_id),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
   CHECK (octet_length(object_id) BETWEEN 1 AND 512),
   CHECK (octet_length(attribute_key) BETWEEN 1 AND 256)
 );
@@ -335,6 +452,8 @@ CREATE TABLE agentic_temporal_fact_version (
   valid_range             TSTZRANGE NOT NULL,
   system_from_sequence    BIGINT NOT NULL CHECK (system_from_sequence > 0),
   system_to_sequence      BIGINT,
+  system_range            INT8RANGE GENERATED ALWAYS AS
+    (int8range(system_from_sequence, system_to_sequence, '[)')) STORED,
   canonical_value         JSONB NOT NULL,
   value_hash              BYTEA NOT NULL CHECK (octet_length(value_hash) = 32),
   source_event_id         UUID NOT NULL,
@@ -343,7 +462,9 @@ CREATE TABLE agentic_temporal_fact_version (
   created_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, fact_version_id),
   UNIQUE (account_id, timeline_id, timeline_sequence),
-  UNIQUE (account_id, source_event_id, timeline_id, valid_range),
+  UNIQUE (
+    account_id, fact_version_id, timeline_id, tenant_partition_id
+  ),
   FOREIGN KEY (account_id, timeline_id, tenant_partition_id)
     REFERENCES agentic_temporal_timeline
       (account_id, timeline_id, tenant_partition_id),
@@ -356,13 +477,13 @@ CREATE TABLE agentic_temporal_fact_version (
 );
 
 ALTER TABLE agentic_temporal_fact_version
-  ADD CONSTRAINT no_overlapping_current_valid_intervals
+  ADD CONSTRAINT no_overlapping_bitemporal_fact_intervals
   EXCLUDE USING GIST (
     account_id WITH =,
     timeline_id WITH =,
-    valid_range WITH &&
+    valid_range WITH &&,
+    system_range WITH &&
   )
-  WHERE (system_to_sequence IS NULL)
   DEFERRABLE INITIALLY DEFERRED;
 
 CREATE INDEX temporal_fact_current_point
@@ -370,10 +491,11 @@ CREATE INDEX temporal_fact_current_point
   USING GIST (account_id, timeline_id, valid_range)
   WHERE system_to_sequence IS NULL;
 
-CREATE INDEX temporal_fact_snapshot_lookup
+CREATE INDEX temporal_fact_bitemporal_point
   ON agentic_temporal_fact_version
-  (account_id, tenant_partition_id, timeline_id,
-   system_from_sequence, system_to_sequence, timeline_sequence);
+  USING GIST (
+    account_id, tenant_partition_id, timeline_id, valid_range, system_range
+  );
 
 CREATE INDEX temporal_fact_history_page
   ON agentic_temporal_fact_version
@@ -383,6 +505,12 @@ CREATE TABLE agentic_temporal_snapshot (
   account_id              BIGINT NOT NULL,
   snapshot_id             UUID NOT NULL,
   consistency             temporal_snapshot_consistency NOT NULL,
+  authority_read_epoch    BIGINT NOT NULL CHECK (authority_read_epoch > 0),
+  coordinator_decision_root BYTEA NOT NULL
+    CHECK (octet_length(coordinator_decision_root) = 32),
+  evaluation_time         TIMESTAMPTZ NOT NULL,
+  selection_visibility_epoch BIGINT NOT NULL
+    CHECK (selection_visibility_epoch > 0),
   principal_id            UUID NOT NULL,
   purpose_id              UUID NOT NULL,
   policy_version          TEXT NOT NULL,
@@ -398,14 +526,23 @@ CREATE TABLE agentic_temporal_snapshot_partition (
   snapshot_id               UUID NOT NULL,
   tenant_partition_id       UUID NOT NULL,
   visible_commit_sequence   BIGINT NOT NULL CHECK (visible_commit_sequence > 0),
+  applied_decision_prefix   BIGINT NOT NULL CHECK (applied_decision_prefix > 0),
   row_watermark             TEXT NOT NULL,
   columnar_watermark        TEXT,
-  vector_watermark          TEXT,
+  vector_manifest_id        UUID,
+  vector_manifest_hash      BYTEA,
+  vector_applied_prefix     BIGINT,
   procedure_watermark       TEXT,
   member_hash               BYTEA NOT NULL CHECK (octet_length(member_hash) = 32),
   PRIMARY KEY (account_id, snapshot_id, tenant_partition_id),
   FOREIGN KEY (account_id, snapshot_id)
-    REFERENCES agentic_temporal_snapshot (account_id, snapshot_id)
+    REFERENCES agentic_temporal_snapshot (account_id, snapshot_id),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
+  CHECK (
+    vector_manifest_hash IS NULL
+    OR octet_length(vector_manifest_hash) = 32
+  )
 );
 
 CREATE TABLE agentic_temporal_grounding_request (
@@ -417,7 +554,10 @@ CREATE TABLE agentic_temporal_grounding_request (
   valid_at                TIMESTAMPTZ NOT NULL,
   canonical_selector_ast  JSONB NOT NULL,
   selector_hash           BYTEA NOT NULL CHECK (octet_length(selector_hash) = 32),
+  canonical_request_hash  BYTEA NOT NULL CHECK (octet_length(canonical_request_hash) = 32),
   envelope_hash           BYTEA NOT NULL CHECK (octet_length(envelope_hash) = 32),
+  completeness            TEXT NOT NULL
+    CHECK (completeness IN ('REQUIRE_COMPLETE', 'ALLOW_PARTIAL')),
   policy_version          TEXT NOT NULL,
   idempotency_key_hash    BYTEA NOT NULL CHECK (octet_length(idempotency_key_hash) = 32),
   state                   temporal_grounding_state NOT NULL,
@@ -446,7 +586,9 @@ CREATE TABLE agentic_temporal_grounding_packet (
   next_cursor_ciphertext  BYTEA,
   canonical_packet        JSONB NOT NULL,
   packet_hash             BYTEA NOT NULL CHECK (octet_length(packet_hash) = 32),
-  audit_chain_head_hash   BYTEA NOT NULL CHECK (octet_length(audit_chain_head_hash) = 32),
+  release_visibility_epoch BIGINT NOT NULL CHECK (release_visibility_epoch > 0),
+  release_audit_event_hash BYTEA NOT NULL
+    CHECK (octet_length(release_audit_event_hash) = 32),
   created_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, packet_id),
   UNIQUE (account_id, request_id, packet_sequence),
@@ -472,26 +614,81 @@ CREATE TABLE agentic_temporal_embedding (
   visibility_scope_hash     BYTEA NOT NULL CHECK (octet_length(visibility_scope_hash) = 32),
   published_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, embedding_id),
-  UNIQUE (account_id, fact_version_id, embedding_model_version),
-  FOREIGN KEY (account_id, fact_version_id)
-    REFERENCES agentic_temporal_fact_version (account_id, fact_version_id),
+  UNIQUE (
+    account_id, fact_version_id, embedding_model_version, valid_time_bucket_id
+  ),
+  FOREIGN KEY (
+    account_id, fact_version_id, timeline_id, tenant_partition_id
+  ) REFERENCES agentic_temporal_fact_version (
+    account_id, fact_version_id, timeline_id, tenant_partition_id
+  ),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
+  CHECK (system_from_sequence > 0),
+  CHECK (NOT isempty(valid_range)),
+  CHECK (lower_inc(valid_range) AND NOT upper_inc(valid_range)),
   CHECK (
     system_to_sequence IS NULL
     OR system_to_sequence > system_from_sequence
   ),
   CHECK (embedding_dimensions = 1536)
-);
+) PARTITION BY LIST (account_id);
 
 CREATE INDEX temporal_embedding_metadata
   ON agentic_temporal_embedding
   (account_id, tenant_partition_id, valid_time_bucket_id,
    embedding_model_version, system_from_sequence, system_to_sequence);
 
--- Build one HNSW graph per account-hash placement and model version. This logical
--- index is illustrative; a shared unpartitioned global graph is forbidden.
-CREATE INDEX temporal_embedding_hnsw
-  ON agentic_temporal_embedding
-  USING hnsw (embedding vector_cosine_ops);
+-- Trusted placement automation creates an account leaf and one partial HNSW graph per
+-- model/time bucket. There is deliberately no DEFAULT partition and no parent HNSW
+-- index. The literal values below illustrate the generated leaf migration.
+CREATE TABLE agentic_temporal_embedding_account_42
+  PARTITION OF agentic_temporal_embedding FOR VALUES IN (42);
+
+CREATE INDEX temporal_embedding_a42_model_v7_2026q3_hnsw
+  ON agentic_temporal_embedding_account_42
+  USING hnsw (embedding vector_cosine_ops)
+  WHERE embedding_model_version = 'model-v7'
+    AND valid_time_bucket_id = '2026-Q3';
+
+CREATE TABLE agentic_temporal_vector_graph_artifact (
+  account_id                BIGINT NOT NULL,
+  graph_artifact_id         UUID NOT NULL,
+  tenant_partition_id       UUID NOT NULL,
+  embedding_model_version   TEXT NOT NULL,
+  valid_time_bucket_id      TEXT NOT NULL,
+  implementation_version    TEXT NOT NULL,
+  distance_metric           TEXT NOT NULL CHECK (distance_metric = 'COSINE'),
+  applied_decision_prefix   BIGINT NOT NULL CHECK (applied_decision_prefix > 0),
+  artifact_hash             BYTEA NOT NULL CHECK (octet_length(artifact_hash) = 32),
+  state                     TEXT NOT NULL CHECK (state IN ('BUILDING', 'ACTIVE', 'RETAINED', 'RETIRED')),
+  created_at                TIMESTAMPTZ NOT NULL,
+  retain_until              TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, graph_artifact_id),
+  UNIQUE (
+    account_id, tenant_partition_id, embedding_model_version,
+    valid_time_bucket_id, artifact_hash
+  ),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id)
+);
+
+CREATE TABLE agentic_temporal_vector_attestation (
+  account_id                BIGINT NOT NULL,
+  request_id                UUID NOT NULL,
+  graph_artifact_id         UUID NOT NULL,
+  query_embedding_hash      BYTEA NOT NULL CHECK (octet_length(query_embedding_hash) = 32),
+  canonical_parameter_set   JSONB NOT NULL,
+  metadata_filter_hash      BYTEA NOT NULL CHECK (octet_length(metadata_filter_hash) = 32),
+  ordered_candidates        JSONB NOT NULL,
+  candidate_root            BYTEA NOT NULL CHECK (octet_length(candidate_root) = 32),
+  attestation_hash          BYTEA NOT NULL CHECK (octet_length(attestation_hash) = 32),
+  created_at                TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, request_id, graph_artifact_id),
+  FOREIGN KEY (account_id, graph_artifact_id)
+    REFERENCES agentic_temporal_vector_graph_artifact
+      (account_id, graph_artifact_id)
+);
 
 CREATE TABLE agentic_temporal_procedure_binding (
   account_id                BIGINT NOT NULL,
@@ -502,7 +699,10 @@ CREATE TABLE agentic_temporal_procedure_binding (
   valid_range               TSTZRANGE NOT NULL,
   system_from_sequence      BIGINT NOT NULL,
   system_to_sequence        BIGINT,
+  system_range              INT8RANGE GENERATED ALWAYS AS
+    (int8range(system_from_sequence, system_to_sequence, '[)')) STORED,
   instruction_hash          BYTEA NOT NULL CHECK (octet_length(instruction_hash) = 32),
+  precondition_hash         BYTEA NOT NULL CHECK (octet_length(precondition_hash) = 32),
   required_contract_id      UUID NOT NULL,
   policy_version            TEXT NOT NULL,
   created_at                TIMESTAMPTZ NOT NULL,
@@ -510,15 +710,33 @@ CREATE TABLE agentic_temporal_procedure_binding (
   UNIQUE (
     account_id, procedure_id, scope_key, valid_range, system_from_sequence
   ),
+  FOREIGN KEY (account_id, tenant_partition_id)
+    REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
+  CHECK (system_from_sequence > 0),
+  CHECK (NOT isempty(valid_range)),
+  CHECK (lower_inc(valid_range) AND NOT upper_inc(valid_range)),
   CHECK (
     system_to_sequence IS NULL
     OR system_to_sequence > system_from_sequence
   )
 );
 
+ALTER TABLE agentic_temporal_procedure_binding
+  ADD CONSTRAINT no_overlapping_bitemporal_procedure_intervals
+  EXCLUDE USING GIST (
+    account_id WITH =,
+    procedure_id WITH =,
+    scope_key WITH =,
+    valid_range WITH &&,
+    system_range WITH &&
+  )
+  DEFERRABLE INITIALLY DEFERRED;
+
 CREATE INDEX temporal_procedure_asof
   ON agentic_temporal_procedure_binding
-  USING GIST (account_id, scope_key, valid_range);
+  USING GIST (
+    account_id, tenant_partition_id, scope_key, valid_range, system_range
+  );
 
 CREATE TABLE agentic_temporal_audit_head (
   account_id              BIGINT NOT NULL,
@@ -537,6 +755,7 @@ CREATE TABLE agentic_temporal_audit_event (
   timeline_id             UUID,
   event_type              TEXT NOT NULL,
   payload_schema_version  INTEGER NOT NULL,
+  hash_algorithm          TEXT NOT NULL CHECK (hash_algorithm = 'SHA-256'),
   canonical_payload       JSONB NOT NULL,
   canonical_payload_hash  BYTEA NOT NULL CHECK (octet_length(canonical_payload_hash) = 32),
   previous_event_hash     BYTEA NOT NULL CHECK (octet_length(previous_event_hash) = 32),
@@ -545,12 +764,28 @@ CREATE TABLE agentic_temporal_audit_event (
   PRIMARY KEY (account_id, chain_partition, sequence_no),
   UNIQUE (account_id, chain_partition, event_hash)
 );
+
+CREATE TABLE agentic_temporal_audit_checkpoint (
+  account_id              BIGINT NOT NULL,
+  checkpoint_id           UUID NOT NULL,
+  checkpoint_sequence     BIGINT NOT NULL CHECK (checkpoint_sequence > 0),
+  canonical_ordered_heads JSONB NOT NULL,
+  covered_event_count     BIGINT NOT NULL CHECK (covered_event_count >= 0),
+  checkpoint_hash         BYTEA NOT NULL CHECK (octet_length(checkpoint_hash) = 32),
+  signing_key_version     INTEGER NOT NULL,
+  signature               BYTEA NOT NULL,
+  anchored_at             TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, checkpoint_id),
+  UNIQUE (account_id, checkpoint_sequence)
+);
 ```
 
-Every table is physically partitioned by an account-derived placement key. The
-placement service returns a short-lived capability bound to `account_id`,
-`tenant_partition_id`, storage class, expiry, and policy version. A caller cannot turn
-a text partition ID into cross-tenant storage access.
+Production migrations physically place every table by an account-derived placement
+key. The embedding DDL makes the strongest requirement concrete: HNSW has no parent or
+default graph, so traversal cannot begin until trusted automation resolves one account
+leaf. The placement service returns a short-lived capability bound to `account_id`,
+`tenant_partition_id`, storage class, graph artifact, expiry, and policy version. A
+caller cannot turn a text partition ID into cross-tenant storage access.
 
 ### Mandatory tenant access pattern
 
@@ -568,10 +803,13 @@ CREATE POLICY temporal_fact_tenant_policy
   WITH CHECK (account_id = current_setting('monday.account_id')::BIGINT);
 ```
 
-Equivalent `ENABLE`, `FORCE`, and tenant policy statements are required on every
-table. Serving, vector, columnar, compaction, and audit roles receive separate
-capabilities. Migration and break-glass roles are unavailable to serving processes
-and emit independently anchored audit events.
+The migration generator enumerates every `agentic_temporal_*` table and account leaf,
+emits equivalent `ENABLE`, `FORCE`, `USING`, and `WITH CHECK` statements, and fails the
+migration if any table with `account_id` lacks a forced policy. CI verifies that list
+against the catalog rather than relying on this one representative statement.
+Serving, vector, columnar, compaction, and audit roles receive separate capabilities.
+Table owners never serve requests; `BYPASSRLS` is prohibited. Migration and break-glass
+roles are unavailable to serving processes and emit independently anchored events.
 
 ## Deterministic write and correction lifecycle
 
@@ -583,34 +821,50 @@ validates the half-open valid range. If the producer omits `valid_from`, the ser
 uses the transaction's recorded effective time and persists that choice in the
 canonical event. It never asks a model to fill a missing date.
 
-The request must carry a unique source event ID. Replaying the same event with the same
-canonical hash is idempotent. Reusing it with a different hash returns
-`SOURCE_EVENT_CONFLICT`.
+The request must carry a unique source event ID. The service first inserts
+`agentic_temporal_source_event_receipt` by `(account_id, source_event_id)` with the
+canonical mutation hash. Replaying the same event and hash returns the original result
+root. Reusing it with any different object, range, value, or hash returns
+`SOURCE_EVENT_CONFLICT`; changing timeline or valid range cannot bypass idempotency.
 
 ### 2. Commit one timeline atomically
 
 The row transaction:
 
 1. locks `(account_id, timeline_id)` through `agentic_temporal_timeline`;
-2. allocates a partition commit sequence from the same ACID snapshot authority;
+2. allocates a fenced local partition sequence and coordinator transaction ID;
 3. reads only current fact versions whose indexed valid ranges overlap the correction;
 4. rejects or queues the mutation if overlap would exceed `maxCorrectionSplits`;
 5. sets each replaced row's `system_to_sequence` exactly once;
 6. inserts the replacement and any left/right carry-forward intervals needed to keep
    the current valid-time timeline non-overlapping;
 7. advances `next_timeline_sequence` and `latest_value_hash`;
-8. appends the canonical audit event and transactional enrichment outbox record; and
+8. appends the source receipt, canonical audit event, and one or more transactional
+   enrichment outbox records; and
 9. commits.
 
-Only system-interval closure metadata is mutable. Canonical values, valid ranges,
-source events, and hashes on an existing fact version never change. A correction
-creates new fact versions. The deferred exclusion constraint proves that the latest
-system view has no overlapping valid intervals for a timeline.
+Only system-interval closure metadata is mutable, once, through a stored procedure that
+checks `OLD.system_to_sequence IS NULL`; serving roles have no direct `UPDATE` grant.
+Canonical values, valid ranges, source events, and hashes on an existing fact version
+never change. A correction creates new fact versions. The deferred two-dimensional
+exclusion constraint proves that no versions overlap in both valid and system time,
+including historical versions.
 
-Transactions changing multiple attributes use mondayDB's existing coordinator and
-commit one participant sequence per touched tenant partition. A snapshot manifest
-captures all participant watermarks. There is no claim of cross-partition atomicity
-based on wall-clock coincidence.
+Transactions changing multiple attributes use mondayDB's coordinator. The durable
+decision record binds a global authority commit epoch to the ordered participant root.
+Each participant exposes a **gap-free applied decision prefix**: it cannot advance past
+an undecided transaction, a missing outbox ordinal, or a committed transaction whose
+local effects and tombstones are not durable. A committed multi-partition transaction
+becomes snapshot-visible only when every participant named by its decision is included
+in a dependency-closed frontier. An aborted transaction is skipped only after its
+durable abort decision.
+
+The coordinator and participant sequence allocators are quorum-replicated and fenced
+by term. Failover may leave unused sequence gaps but cannot reuse a sequence or expose
+an undecided transaction. Timeline locks have an envelope-bounded hold time; a
+coordinator or audit-partition outage aborts the write before acknowledgement. This
+keeps the audit/outbox work in the row transaction's existing failure domain instead
+of adding vector or columnar availability to the write path.
 
 ### 3. Publish derived layers by watermark
 
@@ -625,9 +879,12 @@ procedure bindings asynchronously. Every derivative carries:
 - policy and visibility-scope hashes.
 
 A worker can publish only if the source fact is visible at the declared watermark and
-the source value hash matches. Delayed work for a superseded fact may publish a
-historical derivative, but cannot mark it current. Manifest swaps are atomic. A
-partially built HNSW graph or columnar segment is never queryable.
+the source value hash matches. A derived-layer applied prefix is contiguous: sequence
+`N` is advertised only after every applicable outbox ordinal at or below `N`, including
+supersession tombstones, is durable. Durable gap records block advancement and trigger
+repair. Delayed work for a superseded fact may publish a historical derivative, but
+cannot mark it current. Manifest swaps atomically bind the gap-free prefix and artifact
+hash. A partially built HNSW graph or columnar segment is never queryable.
 
 ## Deterministic read lifecycle
 
@@ -640,16 +897,26 @@ attribute types, indexed operators, purpose, principal policy, and all envelope 
 
 ### 2. Acquire or verify a snapshot
 
-Without a token, mondayDB acquires a `LATEST_COMMITTED` ACID snapshot and stores an
-immutable member for each touched tenant partition. With a token, it verifies the
-signature, account, principal delegation, purpose, policy, expiry, and requested
-partition set. Adding a partition creates a new snapshot; it never mutates an existing
+Without a token, mondayDB asks the quorum-backed snapshot authority for a global read
+epoch. The authority reads durable coordinator decisions at or below that epoch and
+selects a dependency-closed participant frontier. It atomically persists the snapshot
+header, ordered participant members, coordinator decision root, evaluation time, and
+selection visibility epoch before signing the token. If a participant is unavailable
+or has not reached a frontier that preserves all-or-none visibility, acquisition fails
+or uses an explicitly requested older frontier; it never independently samples
+partitions.
+
+With a token, mondayDB verifies the signature, account, principal delegation, purpose,
+policy, expiry, decision root, visibility epoch, and requested partition set. Adding a
+partition creates a new authority-issued snapshot; it never mutates an existing
 manifest.
 
 Snapshot creation is bounded by `maxTemporalPartitions`. A request that would fan out
-further is split into independently identified jobs or rejected. Snapshot tokens
-contain only an opaque snapshot ID, key version, expiry, and signature—not raw storage
-watermarks.
+further is split into independently identified jobs or rejected; split jobs do not
+pretend to share one snapshot. Snapshot tokens contain only an opaque snapshot ID, key
+version, expiry, and signature—not raw storage watermarks. An admitted asynchronous
+job acquires a server-side snapshot lease before client-token expiry; the lease can be
+renewed only within policy retention and cannot change the manifest.
 
 ### 3. Select row facts
 
@@ -663,15 +930,12 @@ WHERE f.account_id = $1
   AND f.tenant_partition_id = $2
   AND f.timeline_id = $3
   AND f.valid_range @> $4::TIMESTAMPTZ
-  AND f.system_from_sequence <= $5
-  AND (
-    f.system_to_sequence IS NULL
-    OR f.system_to_sequence > $5
-  )
+  AND f.system_range @> $5::BIGINT
 LIMIT 2;
 ```
 
-`$5` is read from the verified snapshot member, never supplied by the agent. The
+`$5` is read from the verified, dependency-closed snapshot member, never supplied by
+the agent. The all-version bitemporal GiST index supports both range predicates; the
 timeline invariant means this returns zero or one row. Two rows indicate corruption;
 the gateway fails closed, emits an integrity event, and releases neither value.
 
@@ -698,10 +962,17 @@ It never silently answer from a stale aggregate or scan the entire row store.
 
 ### 5. Build and release the packet
 
-Before release, the gateway revalidates snapshot expiry, policy, source visibility,
-and revocation state. It canonicalizes facts in selector/object/attribute/version order,
-appends omission codes, computes citation and packet hashes, commits the audit event,
-and returns the packet. Cursor pages retain the same snapshot and valid time.
+Before release, the gateway revalidates snapshot lease, policy, and current source
+revocation. Historical **selection** is fixed by the snapshot; content **release**
+authorization is evaluated at a separately recorded `releaseVisibilityEpoch`. Thus an
+erasure can withhold content selected by an old snapshot without rewriting history.
+Replay can verify sealed fact and packet hashes while returning `NOT_AUTHORIZED` or
+`OUTSIDE_RETENTION` instead of the erased value.
+
+The gateway canonicalizes facts in selector/object/attribute/version order, appends
+omission codes, computes citation and packet hashes, commits the release audit event,
+and returns the packet with that event hash. Cursor pages retain the same snapshot,
+valid time, release policy, and original budget reservation.
 
 The packet never substitutes latest data for missing historical data. “Not recorded”
 is different from “not authorized” and “outside retention,” although policy may map
@@ -714,8 +985,9 @@ similar escalation at that time.” It is not a temporal truth oracle. Vector si
 discovers candidate fact or procedure versions; bitemporal predicates and policy
 determine eligibility.
 
-Each HNSW graph is physically placed by account hash (or a dedicated large-tenant
-partition), embedding model version, and coarse valid-time bucket. Every query:
+Each HNSW graph is a physical account leaf plus one model/time-bucket partial index,
+exactly as in the DDL. There is no global or default graph and no post-traversal tenant
+filter standing in for isolation. Every query:
 
 1. resolves `account_id` and placement through an account-bound capability;
 2. allows only model versions declared by the data contract;
@@ -723,19 +995,31 @@ partition), embedding model version, and coarse valid-time bucket. Every query:
 4. clamps `topK`, candidate count, `ef_search`, and wall time;
 5. filters candidates by valid range, snapshot partition watermark, visibility scope,
    source revocation, and policy;
-6. deduplicates split intervals by fact-version ID; and
-7. returns an underfilled result with `ANN_UNDERFILLED` rather than exact-scan fallback.
+6. records graph artifact ID/hash, implementation version, distance metric,
+   `ef_search`, ordered candidate IDs and canonical distance strings, eligibility
+   filter hash, and deterministic `(distance, embedding_id)` tie-break order;
+7. deduplicates split intervals by fact-version ID; and
+8. returns an underfilled result with `ANN_UNDERFILLED` rather than exact-scan fallback.
 
-Future and historical versions must not share an unfiltered global graph. Smaller
-tenants may share an account-hash placement only when every graph access and metadata
-sidecar enforces `account_id`; enterprise isolation can assign a graph per account.
-The raw embedding is never returned through GraphQL.
+Physical infrastructure may co-locate account leaves, but their graph files, access
+capabilities, caches, and workload quotas remain account-bound. Future and historical
+versions never share an unfiltered global graph. The raw query or stored embedding is
+never returned through GraphQL.
 
-Time buckets are routing hints, not truth. A long-lived fact may appear in several
-bucket posting lists, but validity is checked against the authoritative range.
+Time buckets are routing hints, not truth. A long-lived fact is represented by one
+embedding graph-member row per eligible bucket, enforced by the fact/model/bucket
+unique key; validity is still checked against the authoritative range.
 Embedding publication and supersession update a tenant-scoped eligibility sidecar
 atomically with manifest publication. If the sidecar watermark is behind the requested
 snapshot, the route returns `VECTOR_LAG`; it does not broaden the search.
+
+HNSW traversal itself is not promised to be reproducible after a graph rebuild. Packet
+pages pin an immutable retained graph generation. Long-term replay verifies the signed
+candidate attestation, graph hash, parameters, scores, tie-break order, and selected
+fact eligibility. It does not need raw query text or claim to rerun a retired graph.
+The snapshot member's vector manifest is the ordered set of eligible graph artifact
+IDs/hashes for that partition and applied prefix; a route may pin several bucket
+artifacts without overloading one generation field.
 
 Procedural memory follows the same rule. Semantic search returns a versioned procedure
 reference with an instruction hash and valid range. It never invokes the procedure.
@@ -750,18 +1034,79 @@ counts, and estimates use opaque strings or a decimal-string scalar.
 
 ```graphql
 scalar DateTime
-scalar JSON
+scalar CanonicalJSON
 scalar BigIntString
+scalar DecimalString
+
+directive @oneOf on INPUT_OBJECT
+
+enum TemporalObjectType {
+  BOARD
+  BOARD_ITEM
+  UPDATE
+  WORKFLOW
+  MEMORY
+  PROCEDURE
+}
 
 enum TemporalSnapshotConsistency {
   LATEST_COMMITTED
   PINNED
 }
 
-enum TemporalSelectorKind {
-  EXACT
-  EXACT_SET
-  CONTRACT_FILTER
+enum TemporalRelation {
+  CURRENT_AT_SNAPSHOT
+  HISTORICAL_AT_SNAPSHOT
+  SCHEDULED_AT_SNAPSHOT
+}
+
+enum TemporalGroundingState {
+  ADMITTED
+  RUNNING
+  COMPLETE
+  PARTIAL
+  CANCELLED
+  REJECTED
+  FAILED
+}
+
+enum TemporalMutationState {
+  COMMITTED
+  ADMITTED_FOR_REVIEW
+  RUNNING
+  CANCELLED
+  REJECTED
+  FAILED
+}
+
+enum TemporalCompleteness {
+  REQUIRE_COMPLETE
+  ALLOW_PARTIAL
+}
+
+enum TemporalFilterOperator {
+  AND
+  OR
+  EQ
+  IN
+  RANGE
+}
+
+enum TemporalValueType {
+  BOOLEAN
+  NUMBER
+  STRING
+  DATE_TIME
+  OBJECT_REF
+  JSON
+}
+
+enum TemporalAggregateOperator {
+  COUNT
+  SUM
+  MIN
+  MAX
+  AVG
 }
 
 enum TemporalOmissionCode {
@@ -777,26 +1122,46 @@ enum TemporalOmissionCode {
 }
 
 input TemporalObjectRefInput {
-  objectType: String!
+  objectType: TemporalObjectType!
   objectId: ID!
   boardId: ID
 }
 
 input TemporalExactSelectorInput {
+  object: TemporalObjectRefInput!
+  attributeKeys: [String!]!
+}
+
+input TemporalExactSetSelectorInput {
   objects: [TemporalObjectRefInput!]!
   attributeKeys: [String!]!
+}
+
+input TemporalTypedValueInput @oneOf {
+  booleanValue: Boolean
+  decimalValue: DecimalString
+  stringValue: String
+  dateTimeValue: DateTime
+  objectIdValue: ID
+}
+
+input DeterministicTemporalFilterInput {
+  operator: TemporalFilterOperator!
+  attributeKey: String
+  typedValues: [TemporalTypedValueInput!]
+  children: [DeterministicTemporalFilterInput!]
 }
 
 input TemporalContractFilterInput {
   boardId: ID!
   contractId: ID!
-  canonicalFilterAst: JSON!
+  filter: DeterministicTemporalFilterInput!
   projectedAttributeKeys: [String!]!
 }
 
-input TemporalSelectorInput {
-  kind: TemporalSelectorKind!
+input TemporalSelectorInput @oneOf {
   exact: TemporalExactSelectorInput
+  exactSet: TemporalExactSetSelectorInput
   contractFilter: TemporalContractFilterInput
 }
 
@@ -808,6 +1173,15 @@ input TemporalSemanticSearchInput {
   maxCandidates: Int!
 }
 
+input TemporalAggregateInput {
+  boardId: ID!
+  contractId: ID!
+  filter: DeterministicTemporalFilterInput!
+  operator: TemporalAggregateOperator!
+  attributeKey: String
+  groupByAttributeKeys: [String!]!
+}
+
 input CompileTemporalGroundingInput {
   idempotencyKey: String!
   purposeId: ID!
@@ -815,15 +1189,45 @@ input CompileTemporalGroundingInput {
   snapshotToken: String
   selectors: [TemporalSelectorInput!]!
   semantic: TemporalSemanticSearchInput
+  aggregate: TemporalAggregateInput
   procedureScopes: [String!]!
+  completeness: TemporalCompleteness!
+}
+
+input RecordTemporalFactInput {
+  idempotencyKey: String!
+  sourceEventId: ID!
+  object: TemporalObjectRefInput!
+  attributeKey: String!
+  valueType: TemporalValueType!
+  canonicalValue: CanonicalJSON!
+  validFrom: DateTime!
+  validTo: DateTime
+  expectedCurrentValueHash: String
+}
+
+input RequestTemporalCorrectionInput {
+  idempotencyKey: String!
+  sourceEventId: ID!
+  object: TemporalObjectRefInput!
+  attributeKey: String!
+  valueType: TemporalValueType!
+  canonicalValue: CanonicalJSON!
+  validFrom: DateTime!
+  validTo: DateTime
+  correctionReasonCode: String!
+  reviewTicketId: ID
 }
 
 type TemporalSnapshotPartition {
   tenantPartitionId: ID!
   visibleCommitSequence: BigIntString!
+  appliedDecisionPrefix: BigIntString!
   rowWatermark: String!
   columnarWatermark: String
-  vectorWatermark: String
+  vectorManifestId: ID
+  vectorManifestHash: String
+  vectorAppliedPrefix: BigIntString
   procedureWatermark: String
 }
 
@@ -832,6 +1236,10 @@ type TemporalSnapshot {
   snapshotId: ID!
   token: String!
   consistency: TemporalSnapshotConsistency!
+  authorityReadEpoch: BigIntString!
+  coordinatorDecisionRoot: String!
+  evaluationTime: DateTime!
+  selectionVisibilityEpoch: BigIntString!
   partitions: [TemporalSnapshotPartition!]!
   policyVersion: String!
   expiresAt: DateTime!
@@ -840,13 +1248,13 @@ type TemporalSnapshot {
 
 type TemporalFact {
   factVersionId: ID!
-  objectType: String!
+  objectType: TemporalObjectType!
   objectId: ID!
   attributeKey: String!
-  canonicalValue: JSON!
+  canonicalValue: CanonicalJSON!
   validFrom: DateTime!
   validTo: DateTime
-  temporalRelation: String!
+  temporalRelation: TemporalRelation!
   sourceWatermark: String!
   citationHash: String!
 }
@@ -857,6 +1265,16 @@ type TemporalOmission {
   detailCode: String
 }
 
+type TemporalProcedureRef {
+  procedureId: ID!
+  procedureVersionId: ID!
+  instructionHash: String!
+  validFrom: DateTime!
+  validTo: DateTime
+  preconditionHash: String!
+  requiredContractId: ID!
+}
+
 type TemporalGroundingPacket {
   accountId: ID!
   packetId: ID!
@@ -864,22 +1282,54 @@ type TemporalGroundingPacket {
   validAt: DateTime!
   observedAtSnapshotToken: String!
   facts: [TemporalFact!]!
-  procedureVersionIds: [ID!]!
+  procedures: [TemporalProcedureRef!]!
   sourceCitationHashes: [String!]!
   omissions: [TemporalOmission!]!
   hasMore: Boolean!
   nextCursor: String
   executionEnvelopeHash: String!
   policyVersion: String!
+  releaseVisibilityEpoch: BigIntString!
   packetHash: String!
+  releaseAuditEventHash: String!
 }
 
-type TemporalGroundingAdmission {
+type TemporalAggregateCell {
+  groupKey: CanonicalJSON!
+  value: DecimalString!
+}
+
+type TemporalAggregateResult {
+  operator: TemporalAggregateOperator!
+  cells: [TemporalAggregateCell!]!
+  scannedRows: BigIntString!
+  scannedBytes: BigIntString!
+  resultHash: String!
+}
+
+type TemporalGroundingStatus {
+  accountId: ID!
   requestId: ID!
-  state: String!
+  state: TemporalGroundingState!
+  progressPermille: Int!
   snapshot: TemporalSnapshot
   packet: TemporalGroundingPacket
+  aggregate: TemporalAggregateResult
   rejectionCode: String
+  failureCode: String
+  cancellable: Boolean!
+}
+
+type TemporalMutationReceipt {
+  accountId: ID!
+  sourceEventId: ID!
+  state: TemporalMutationState!
+  transactionId: ID
+  resultRoot: String
+  progressPermille: Int!
+  rejectionCode: String
+  failureCode: String
+  cancellable: Boolean!
 }
 
 type TemporalTimelinePage {
@@ -892,15 +1342,15 @@ type TemporalTimelinePage {
 }
 
 type TemporalFactObject {
-  objectType: String!
+  objectType: TemporalObjectType!
   objectId: ID!
 }
 
 type Query {
-  agenticTemporalGroundingPacket(
+  agenticTemporalGroundingStatus(
     requestId: ID!
     packetCursor: String
-  ): TemporalGroundingPacket!
+  ): TemporalGroundingStatus!
 
   agenticTemporalTimeline(
     object: TemporalObjectRefInput!
@@ -911,22 +1361,53 @@ type Query {
     first: Int!
     after: String
   ): TemporalTimelinePage!
+
+  agenticTemporalProcedureVersion(
+    procedureVersionId: ID!
+    snapshotToken: String!
+  ): TemporalProcedureRef
 }
 
 type Mutation {
   compileAgenticTemporalGrounding(
     input: CompileTemporalGroundingInput!
-  ): TemporalGroundingAdmission!
+  ): TemporalGroundingStatus!
+
+  recordAgenticTemporalFact(
+    input: RecordTemporalFactInput!
+  ): TemporalMutationReceipt!
+
+  requestAgenticTemporalCorrection(
+    input: RequestTemporalCorrectionInput!
+  ): TemporalMutationReceipt!
+
+  cancelAgenticTemporalGrounding(requestId: ID!): TemporalGroundingStatus!
+  cancelAgenticTemporalCorrection(sourceEventId: ID!): TemporalMutationReceipt!
 }
 ```
 
-`queryText` is embedded only by a model version fixed in the contract and execution
-envelope. The audit event stores its tenant-keyed HMAC and resulting embedding hash,
-not raw sensitive prompt text. Introspection and error messages never expose physical
-partition names or another tenant's existence.
+The `@oneOf` selector and typed recursive filter are validated before planning; leaf
+operators and child operators have closed arity rules. `CanonicalJSON` rejects
+uncontracted keys and numeric JSON tokens. `queryText` is normalized by a versioned
+server compiler and embedded only by the model fixed in the contract and envelope. The
+compiler derives bucket IDs and metadata filters, pins the immutable graph artifact,
+and produces `CompiledTemporalSemanticRoute`. Audit stores a tenant-keyed query HMAC,
+embedding hash, signed candidate attestation, and route—not raw sensitive prompt text.
+Introspection and errors never expose physical placement or another tenant's existence.
 
 `agenticTemporalTimeline.first` is clamped to the policy maximum and uses keyset
-pagination. A missing or invalid cursor fails; it never falls back to `OFFSET`.
+pagination. The authenticated encrypted cursor contains the version, account and
+principal, request/scope hash, snapshot ID, valid-time hash, last complete sort tuple,
+envelope hash, and expiry. A missing, expired, or mismatched cursor fails; it never
+falls back to `OFFSET` or widens scope.
+
+Fact mutations are ordinary typed Open API writes. Small corrections compile and
+commit synchronously; large corrections enter `ADMITTED` for reviewed, budgeted
+execution. Status exposes progress, completion, cancellation, typed aggregate output,
+and a nullable packet. Cancelling stops future admitted batches but never rolls back
+already committed fact versions. Exact procedure reads return the hash, range,
+precondition, and contract needed for independent plan verification; retrieval never
+executes the procedure.
 
 ## Agentic guardrails and admission
 
@@ -939,6 +1420,7 @@ rejects:
 - unindexed JSON-path, regex, substring, or natural-language filters;
 - a valid-time range without a finite bounded history page;
 - a snapshot spanning more tenant partitions than the envelope allows;
+- `ALLOW_PARTIAL` where the signed purpose policy requires complete evidence;
 - `topK`, HNSW candidates, `ef_search`, or time buckets above policy;
 - vector fallback to another account or to an exact distance scan;
 - recursive expansion from a fact to arbitrary related objects;
@@ -962,6 +1444,13 @@ Loop containment fingerprints the tuple:
 Repeated requests charge the same budget ledger, even if prompt wording changes.
 Cursors cannot increase scope. Each page spends from the original reservation and
 retains the original snapshot, purpose, valid time, and envelope.
+
+The idempotency record binds `(account_id, principal_id, idempotency_key_hash)` to the
+canonical request hash and original snapshot. The same hash returns the original
+status or packet and does not reacquire a newer snapshot. A different hash returns
+`IDEMPOTENCY_CONFLICT`. Records live at least as long as packet and retry retention.
+`REQUIRE_COMPLETE` releases no packet if any required selector, procedure, or derived
+layer is omitted; `ALLOW_PARTIAL` releases typed omissions and sets state `PARTIAL`.
 
 ## Performance check for boards with 1M+ rows
 
@@ -1005,11 +1494,17 @@ which ordinarily queues or rejects the plan.
 
 ## Auditability and replay
 
-Audit events use canonical serialization with explicit field order, payload schema
-version, and hash algorithm:
+Audit payloads use RFC 8785 JSON Canonicalization Scheme after contract-level
+normalization of timestamps and decimals. Stored `JSONB` is a query representation,
+not the bytes hashed; verifiers regenerate canonical UTF-8 bytes. Packet hashing
+excludes `packetHash` and `releaseAuditEventHash`. The release event binds the packet
+hash and pre-event head; the packet then carries the resulting event hash, avoiding a
+cycle.
 
 ```text
 event_hash = HASH(hash_algorithm,
+  "mondaydb.agentic-temporal-audit/v1" ||
+  hash_algorithm ||
   account_id ||
   chain_partition ||
   sequence_no ||
@@ -1020,9 +1515,17 @@ event_hash = HASH(hash_algorithm,
 )
 ```
 
-Version 1 permits SHA-256. Tenant audit-chain partitions avoid one global account
-hotspot; a signed checkpoint periodically commits the ordered set of partition heads
-to an external audit account.
+Version 1 permits SHA-256. Algorithm, domain, and schema versions are part of the
+preimage. Tenant audit-chain partitions are selected by a stable hash of
+`timeline_id` for mutations or `request_id` for reads, avoiding one global account
+hotspot while preserving deterministic ordering. Serving roles append only through a
+stored procedure that locks one head, inserts exactly `next_sequence_no`, and advances
+it; direct `UPDATE`/`DELETE` is revoked and blocked by an append-only trigger.
+
+A signed checkpoint periodically stores the complete ordered chain-partition/head set,
+coverage count, checkpoint hash, signing-key version, and signature in an external
+audit account. Public verification keys remain available for the longest audit
+retention. A new key creates a new checkpoint version; it never rewrites history.
 
 Closed event types include:
 
@@ -1030,10 +1533,10 @@ Closed event types include:
 | --- | --- |
 | `FACT_VERSION_COMMITTED` | timeline, fact version, valid range, system-from sequence, value hash, source event, contract and policy hashes |
 | `FACT_VERSION_SUPERSEDED` | old/new fact-version IDs, system-to sequence, correction reason code, source event |
-| `SNAPSHOT_ACQUIRED` | snapshot ID, ordered partition-member root, purpose, policy, expiry, manifest hash |
-| `GROUNDING_ADMITTED` | request, selector hash, valid time, snapshot, envelope and reservation hashes |
-| `VECTOR_ROUTE_DECIDED` | model, tenant placement hash, bucket IDs, candidate caps, eligibility watermark, decision code |
-| `GROUNDING_RELEASED` | ordered citation root, omission root, procedure refs, packet and audit-head hashes |
+| `SNAPSHOT_ACQUIRED` | snapshot ID, authority read epoch, coordinator decision root, ordered dependency-closed member root, evaluation time, selection visibility epoch, purpose, policy, expiry, manifest hash |
+| `GROUNDING_ADMITTED` | canonical request hash, selector hash, valid time, snapshot, completeness, envelope and reservation hashes |
+| `VECTOR_ROUTE_DECIDED` | graph artifact/build hashes, implementation, model, metric, buckets, `ef_search`, candidate caps, ordered candidate/score root, eligibility filter and decision code |
+| `GROUNDING_RELEASED` | ordered citation root, omission root, procedure refs, release visibility epoch, packet hash, previous event hash |
 | `GROUNDING_REJECTED` | request hash, estimate summary, deterministic rejection code |
 | `CORRUPTION_DETECTED` | timeline, snapshot member hash, invariant code, sanitized evidence hash |
 
@@ -1041,16 +1544,18 @@ The audit payload never stores raw embeddings, secrets, or unrestricted prompt t
 Canonical values may remain in the source fact under its normal access and retention
 policy; audit uses hashes and typed reason codes.
 
-Replay loads the signed policy and contract artifacts, snapshot manifest, immutable
-fact versions, procedure bindings, vector route decision, envelope, and hash chain. It
-can verify:
+Replay loads the signed policy and contract artifacts, dependency-closed snapshot
+manifest, immutable fact versions, procedure bindings, signed vector attestation,
+envelope, and hash chain. It can verify:
 
 1. the request was authorized and tenant-scoped;
 2. each selected fact was valid at `validAt` and visible at its partition watermark;
 3. later corrections did not alter the historical packet;
-4. columnar, vector, and procedure layers met the declared watermarks;
+4. columnar and procedure layers met gap-free applied prefixes and the recorded vector
+   candidates came from the pinned graph artifact and eligibility filter;
 5. every omission and pagination boundary followed policy;
-6. the citation order and packet hash are deterministic; and
+6. relational citation order and packet hash are deterministic, while the recorded ANN
+   decision is verifiable without promising to reproduce a retired graph traversal;
 7. no budget or recursive expansion limit was increased by the agent.
 
 Audit retention must be at least as long as packet replay retention. If source values
@@ -1070,10 +1575,25 @@ Recommended service objectives:
 - overlapping current intervals tolerate zero events; and
 - packet replay mismatch tolerates zero events.
 
+These are release requirements, not a claim that the document alone proves 99.99%.
+The snapshot authority, coordinator-decision store, participant sequence allocator,
+timeline row store, and local audit shard must each fit the existing transactional
+error budget, run with quorum replication across failure domains, and support
+term-fenced failover. Vector, columnar, and procedure publishers remain outside the
+write acknowledgement path. Lock duration, participant count, outbox bytes, and audit
+payload bytes are envelope-capped; saturation rejects before opening a transaction.
+
 If vector or columnar storage is unavailable, row transactions continue. Grounding
 returns typed lag/unavailability omissions when policy permits partial packets, or a
 deterministic failure when completeness is required. It never weakens the requested
 consistency silently.
+
+If the snapshot authority or any required row participant is unavailable, a new
+cross-partition snapshot fails closed; a still-valid pinned snapshot may continue only
+when every referenced participant and current release-visibility authority can be
+verified. If a local audit shard or transaction coordinator loses quorum, affected
+writes fail before acknowledgement. Retries use source-event and request idempotency
+records, so failover cannot duplicate corrections or silently select a newer snapshot.
 
 Snapshot tokens have finite lifetimes. Expiry prevents indefinite pinning of storage
 and policy state, but does not delete the audit evidence. Enterprise retention policies
@@ -1102,7 +1622,11 @@ Release gates include cross-tenant property tests, concurrent correction/snapsho
 races, DST and timezone boundary tests, half-open interval tests, idempotent source
 event replay, columnar/vector lag tests, HNSW underfill tests, snapshot expiry tests,
 erasure-over-historical-snapshot tests, and 1M+ row load tests. General availability
-requires deterministic packet replay from a pinned manifest.
+requires deterministic packet replay from a pinned manifest. High-churn timeline tests
+must capture `EXPLAIN (ANALYZE, BUFFERS)` evidence that bitemporal point lookups use the
+all-version GiST path rather than scanning version history. Failure-injection tests
+must cover undecided multi-partition transactions, missing outbox ordinals, fenced
+coordinator failover, and audit-shard quorum loss.
 
 ## Decision
 
