@@ -314,15 +314,25 @@ interface TemporalProcedureArtifact {
   signature: string;
 }
 
-interface TemporalSemanticMatch {
-  rank: number;
-  canonicalScore: string;
-  factVersionId?: string;
-  procedureVersionId?: string;
-  graphArtifactId: string;
-  graphArtifactHash: string;
-  candidateAttestationHash: string;
-}
+type TemporalSemanticMatch =
+  | {
+      kind: "FACT";
+      rank: number;
+      canonicalScore: string;
+      factVersionId: string;
+      graphArtifactId: string;
+      graphArtifactHash: string;
+      candidateAttestationHash: string;
+    }
+  | {
+      kind: "PROCEDURE";
+      rank: number;
+      canonicalScore: string;
+      procedureVersionId: string;
+      graphArtifactId: string;
+      graphArtifactHash: string;
+      candidateAttestationHash: string;
+    };
 
 interface TemporalMutationRequest {
   accountId: string;
@@ -469,7 +479,8 @@ CREATE TABLE agentic_temporal_transaction_decision (
   decision                TEXT NOT NULL CHECK (decision IN ('COMMITTED', 'ABORTED')),
   decided_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, transaction_id),
-  UNIQUE (account_id, authority_commit_epoch)
+  UNIQUE (account_id, authority_commit_epoch),
+  UNIQUE (account_id, transaction_id, decision)
 );
 
 CREATE TABLE agentic_temporal_transaction_participant (
@@ -478,13 +489,16 @@ CREATE TABLE agentic_temporal_transaction_participant (
   tenant_partition_id     UUID NOT NULL,
   local_commit_sequence   BIGINT NOT NULL CHECK (local_commit_sequence > 0),
   effects_root            BYTEA NOT NULL CHECK (octet_length(effects_root) = 32),
+  decision                TEXT NOT NULL CHECK (decision IN ('COMMITTED', 'ABORTED')),
   last_outbox_ordinal     INTEGER NOT NULL CHECK (last_outbox_ordinal >= 0),
   PRIMARY KEY (account_id, transaction_id, tenant_partition_id),
   UNIQUE (
-    account_id, tenant_partition_id, local_commit_sequence, transaction_id
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
   ),
-  FOREIGN KEY (account_id, transaction_id)
-    REFERENCES agentic_temporal_transaction_decision (account_id, transaction_id),
+  FOREIGN KEY (account_id, transaction_id, decision)
+    REFERENCES agentic_temporal_transaction_decision
+      (account_id, transaction_id, decision),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id)
 );
@@ -495,17 +509,21 @@ CREATE TABLE agentic_temporal_partition_apply_ledger (
   local_commit_sequence   BIGINT NOT NULL CHECK (local_commit_sequence > 0),
   transaction_id          UUID NOT NULL,
   effects_root            BYTEA NOT NULL CHECK (octet_length(effects_root) = 32),
+  decision                TEXT NOT NULL CHECK (decision IN ('COMMITTED', 'ABORTED')),
   apply_state             TEXT NOT NULL
     CHECK (apply_state IN ('PENDING', 'APPLIED', 'ABORT_SKIPPED', 'GAP')),
   applied_at              TIMESTAMPTZ,
   PRIMARY KEY (account_id, tenant_partition_id, local_commit_sequence),
-  UNIQUE (
-    account_id, tenant_partition_id, local_commit_sequence, transaction_id
-  ),
   FOREIGN KEY (
-    account_id, tenant_partition_id, local_commit_sequence, transaction_id
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
   ) REFERENCES agentic_temporal_transaction_participant (
-    account_id, tenant_partition_id, local_commit_sequence, transaction_id
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
+  ),
+  CHECK (
+    (decision = 'COMMITTED' AND apply_state IN ('PENDING', 'APPLIED', 'GAP'))
+    OR (decision = 'ABORTED' AND apply_state IN ('PENDING', 'ABORT_SKIPPED', 'GAP'))
   )
 );
 
@@ -519,7 +537,9 @@ CREATE TABLE agentic_temporal_authority_checkpoint (
   created_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, checkpoint_id),
   UNIQUE (account_id, authority_read_epoch, ordered_decision_root),
-  UNIQUE (account_id, checkpoint_id, ordered_decision_root)
+  UNIQUE (
+    account_id, checkpoint_id, authority_read_epoch, ordered_decision_root
+  )
 );
 
 CREATE TABLE agentic_temporal_source_event_receipt (
@@ -527,7 +547,15 @@ CREATE TABLE agentic_temporal_source_event_receipt (
   source_event_id           UUID NOT NULL,
   idempotency_key_hash      BYTEA NOT NULL CHECK (octet_length(idempotency_key_hash) = 32),
   canonical_mutation_hash   BYTEA NOT NULL CHECK (octet_length(canonical_mutation_hash) = 32),
+  mutation_ciphertext       BYTEA NOT NULL,
+  mutation_content_key_id   UUID NOT NULL,
+  contract_version          TEXT NOT NULL,
+  policy_version            TEXT NOT NULL,
   state                     TEXT NOT NULL CHECK (state IN ('CLAIMED', 'FINALIZED', 'FAILED')),
+  claim_generation          BIGINT NOT NULL DEFAULT 0 CHECK (claim_generation >= 0),
+  claim_owner_id            UUID,
+  claim_expires_at          TIMESTAMPTZ,
+  attempt_count             INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   transaction_id            UUID,
   result_root               BYTEA,
   created_at                TIMESTAMPTZ NOT NULL,
@@ -550,8 +578,20 @@ CREATE TABLE agentic_temporal_mutation_job (
   state                     TEXT NOT NULL
     CHECK (state IN ('ADMITTED_FOR_REVIEW', 'RUNNING', 'COMMITTED', 'CANCELLED', 'REJECTED', 'FAILED')),
   progress_permille         INTEGER NOT NULL CHECK (progress_permille BETWEEN 0 AND 1000),
+  compiled_plan_ciphertext  BYTEA NOT NULL,
+  compiled_plan_hash        BYTEA NOT NULL CHECK (octet_length(compiled_plan_hash) = 32),
+  envelope_hash             BYTEA NOT NULL CHECK (octet_length(envelope_hash) = 32),
+  policy_version            TEXT NOT NULL,
+  contract_version          TEXT NOT NULL,
+  review_ticket_id          TEXT,
   next_interval_cursor      BYTEA,
+  lease_generation          BIGINT NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+  lease_owner_id            UUID,
+  lease_expires_at          TIMESTAMPTZ,
+  attempt_count             INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   cancellation_requested_at TIMESTAMPTZ,
+  rejection_code            TEXT,
+  failure_code              TEXT,
   result_root               BYTEA,
   updated_at                TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, source_event_id),
@@ -564,15 +604,25 @@ CREATE TABLE agentic_temporal_mutation_batch (
   account_id              BIGINT NOT NULL,
   source_event_id         UUID NOT NULL,
   batch_sequence         INTEGER NOT NULL CHECK (batch_sequence > 0),
+  tenant_partition_id     UUID NOT NULL,
+  commit_sequence         BIGINT NOT NULL CHECK (commit_sequence > 0),
   transaction_id          UUID NOT NULL,
+  effects_root            BYTEA NOT NULL CHECK (octet_length(effects_root) = 32),
+  decision                TEXT NOT NULL DEFAULT 'COMMITTED'
+    CHECK (decision = 'COMMITTED'),
   interval_cursor_hash    BYTEA NOT NULL CHECK (octet_length(interval_cursor_hash) = 32),
   result_hash             BYTEA NOT NULL CHECK (octet_length(result_hash) = 32),
   committed_at            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, source_event_id, batch_sequence),
   FOREIGN KEY (account_id, source_event_id)
     REFERENCES agentic_temporal_mutation_job (account_id, source_event_id),
-  FOREIGN KEY (account_id, transaction_id)
-    REFERENCES agentic_temporal_transaction_decision (account_id, transaction_id)
+  FOREIGN KEY (
+    account_id, tenant_partition_id, commit_sequence,
+    transaction_id, effects_root, decision
+  ) REFERENCES agentic_temporal_transaction_participant (
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
+  )
 );
 
 CREATE TABLE agentic_temporal_enrichment_outbox (
@@ -581,6 +631,9 @@ CREATE TABLE agentic_temporal_enrichment_outbox (
   commit_sequence         BIGINT NOT NULL CHECK (commit_sequence > 0),
   outbox_ordinal          INTEGER NOT NULL CHECK (outbox_ordinal >= 0),
   transaction_id          UUID NOT NULL,
+  effects_root            BYTEA NOT NULL CHECK (octet_length(effects_root) = 32),
+  decision                TEXT NOT NULL DEFAULT 'COMMITTED'
+    CHECK (decision = 'COMMITTED'),
   event_type              TEXT NOT NULL,
   canonical_payload       JSONB NOT NULL,
   payload_hash            BYTEA NOT NULL CHECK (octet_length(payload_hash) = 32),
@@ -590,8 +643,13 @@ CREATE TABLE agentic_temporal_enrichment_outbox (
   ),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
-  FOREIGN KEY (account_id, transaction_id)
-    REFERENCES agentic_temporal_transaction_decision (account_id, transaction_id)
+  FOREIGN KEY (
+    account_id, tenant_partition_id, commit_sequence,
+    transaction_id, effects_root, decision
+  ) REFERENCES agentic_temporal_transaction_participant (
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
+  )
 );
 
 CREATE TABLE agentic_temporal_timeline (
@@ -635,6 +693,13 @@ CREATE TABLE agentic_temporal_fact_version (
   system_to_sequence      BIGINT,
   system_from_transaction_id UUID NOT NULL,
   system_to_transaction_id UUID,
+  system_from_effects_root  BYTEA NOT NULL
+    CHECK (octet_length(system_from_effects_root) = 32),
+  system_to_effects_root    BYTEA,
+  system_from_decision      TEXT NOT NULL DEFAULT 'COMMITTED'
+    CHECK (system_from_decision = 'COMMITTED'),
+  system_to_decision        TEXT
+    CHECK (system_to_decision IS NULL OR system_to_decision = 'COMMITTED'),
   system_range            INT8RANGE GENERATED ALWAYS AS
     (int8range(system_from_sequence, system_to_sequence, '[)')) STORED,
   canonical_value         JSONB NOT NULL,
@@ -648,6 +713,10 @@ CREATE TABLE agentic_temporal_fact_version (
   UNIQUE (
     account_id, fact_version_id, timeline_id, tenant_partition_id
   ),
+  UNIQUE (
+    account_id, fact_version_id, timeline_id, tenant_partition_id,
+    source_identity_id, valid_range, system_from_sequence, value_hash
+  ),
   FOREIGN KEY (account_id, timeline_id, tenant_partition_id)
     REFERENCES agentic_temporal_timeline
       (account_id, timeline_id, tenant_partition_id),
@@ -656,13 +725,19 @@ CREATE TABLE agentic_temporal_fact_version (
       (account_id, source_identity_id),
   FOREIGN KEY (
     account_id, tenant_partition_id, system_from_sequence,
-    system_from_transaction_id
+    system_from_transaction_id, system_from_effects_root,
+    system_from_decision
   ) REFERENCES agentic_temporal_transaction_participant (
-    account_id, tenant_partition_id, local_commit_sequence, transaction_id
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
   ),
-  FOREIGN KEY (account_id, system_to_transaction_id)
-    REFERENCES agentic_temporal_transaction_decision
-      (account_id, transaction_id),
+  FOREIGN KEY (
+    account_id, tenant_partition_id, system_to_sequence,
+    system_to_transaction_id, system_to_effects_root, system_to_decision
+  ) REFERENCES agentic_temporal_transaction_participant (
+    account_id, tenant_partition_id, local_commit_sequence,
+    transaction_id, effects_root, decision
+  ),
   CHECK (NOT isempty(valid_range)),
   CHECK (lower_inc(valid_range) AND NOT upper_inc(valid_range)),
   CHECK (
@@ -670,8 +745,14 @@ CREATE TABLE agentic_temporal_fact_version (
     OR system_to_sequence > system_from_sequence
   ),
   CHECK (
-    (system_to_sequence IS NULL AND system_to_transaction_id IS NULL)
-    OR (system_to_sequence IS NOT NULL AND system_to_transaction_id IS NOT NULL)
+    system_to_effects_root IS NULL
+    OR octet_length(system_to_effects_root) = 32
+  ),
+  CHECK (
+    (system_to_sequence IS NULL AND system_to_transaction_id IS NULL
+      AND system_to_effects_root IS NULL AND system_to_decision IS NULL)
+    OR (system_to_sequence IS NOT NULL AND system_to_transaction_id IS NOT NULL
+      AND system_to_effects_root IS NOT NULL AND system_to_decision = 'COMMITTED')
   )
 );
 
@@ -710,7 +791,10 @@ CREATE TABLE agentic_temporal_columnar_manifest (
   state                   TEXT NOT NULL CHECK (state IN ('ACTIVE', 'RETAINED', 'RETIRED')),
   retain_until            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, manifest_id),
-  UNIQUE (account_id, manifest_id, tenant_partition_id, manifest_hash),
+  UNIQUE (
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
+  ),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id)
 );
@@ -728,6 +812,33 @@ CREATE TABLE agentic_temporal_columnar_manifest_member (
     REFERENCES agentic_temporal_columnar_manifest (account_id, manifest_id)
 );
 
+CREATE TABLE agentic_temporal_columnar_source_eligibility (
+  account_id                  BIGINT NOT NULL,
+  manifest_id                 UUID NOT NULL,
+  source_identity_id          UUID NOT NULL,
+  artifact_id                 UUID NOT NULL,
+  contribution_locator_hash   BYTEA NOT NULL
+    CHECK (octet_length(contribution_locator_hash) = 32),
+  visibility_epoch_at_publish BIGINT NOT NULL
+    CHECK (visibility_epoch_at_publish > 0),
+  PRIMARY KEY (
+    account_id, manifest_id, source_identity_id, artifact_id
+  ),
+  FOREIGN KEY (account_id, manifest_id, artifact_id)
+    REFERENCES agentic_temporal_columnar_manifest_member
+      (account_id, manifest_id, artifact_id),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_temporal_source_identity
+      (account_id, source_identity_id),
+  FOREIGN KEY (account_id, visibility_epoch_at_publish)
+    REFERENCES agentic_temporal_visibility_epoch_event
+      (account_id, visibility_epoch)
+);
+
+CREATE INDEX temporal_columnar_revocation_lookup
+  ON agentic_temporal_columnar_source_eligibility
+  (account_id, source_identity_id, manifest_id, artifact_id);
+
 CREATE TABLE agentic_temporal_vector_manifest (
   account_id              BIGINT NOT NULL,
   manifest_id             UUID NOT NULL,
@@ -738,7 +849,10 @@ CREATE TABLE agentic_temporal_vector_manifest (
   state                   TEXT NOT NULL CHECK (state IN ('ACTIVE', 'RETAINED', 'RETIRED')),
   retain_until            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, manifest_id),
-  UNIQUE (account_id, manifest_id, tenant_partition_id, manifest_hash),
+  UNIQUE (
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
+  ),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id)
 );
@@ -753,7 +867,10 @@ CREATE TABLE agentic_temporal_procedure_manifest (
   state                   TEXT NOT NULL CHECK (state IN ('ACTIVE', 'RETAINED', 'RETIRED')),
   retain_until            TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, manifest_id),
-  UNIQUE (account_id, manifest_id, tenant_partition_id, manifest_hash),
+  UNIQUE (
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
+  ),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id)
 );
@@ -794,10 +911,11 @@ CREATE TABLE agentic_temporal_snapshot (
   created_at              TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, snapshot_id),
   FOREIGN KEY (
-    account_id, authority_checkpoint_id, coordinator_decision_root
+    account_id, authority_checkpoint_id, authority_read_epoch,
+    coordinator_decision_root
   )
     REFERENCES agentic_temporal_authority_checkpoint
-      (account_id, checkpoint_id, ordered_decision_root),
+      (account_id, checkpoint_id, authority_read_epoch, ordered_decision_root),
   FOREIGN KEY (account_id, selection_visibility_epoch)
     REFERENCES agentic_temporal_visibility_epoch_event
       (account_id, visibility_epoch)
@@ -830,21 +948,24 @@ CREATE TABLE agentic_temporal_snapshot_partition (
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
   FOREIGN KEY (
     account_id, columnar_manifest_id, tenant_partition_id,
-    columnar_manifest_hash
+    columnar_manifest_hash, columnar_applied_prefix
   ) REFERENCES agentic_temporal_columnar_manifest (
-    account_id, manifest_id, tenant_partition_id, manifest_hash
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
   ),
   FOREIGN KEY (
     account_id, vector_manifest_id, tenant_partition_id,
-    vector_manifest_hash
+    vector_manifest_hash, vector_applied_prefix
   ) REFERENCES agentic_temporal_vector_manifest (
-    account_id, manifest_id, tenant_partition_id, manifest_hash
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
   ),
   FOREIGN KEY (
     account_id, procedure_manifest_id, tenant_partition_id,
-    procedure_manifest_hash
+    procedure_manifest_hash, procedure_applied_prefix
   ) REFERENCES agentic_temporal_procedure_manifest (
-    account_id, manifest_id, tenant_partition_id, manifest_hash
+    account_id, manifest_id, tenant_partition_id,
+    manifest_hash, applied_decision_prefix
   ),
   CHECK (
     (columnar_manifest_id IS NULL AND columnar_manifest_hash IS NULL
@@ -949,6 +1070,41 @@ CREATE TABLE agentic_temporal_packet_source (
       (account_id, source_identity_id)
 );
 
+CREATE TABLE agentic_temporal_aggregate_result_page (
+  account_id                BIGINT NOT NULL,
+  request_id                UUID NOT NULL,
+  page_sequence             INTEGER NOT NULL CHECK (page_sequence > 0),
+  result_ciphertext         BYTEA NOT NULL,
+  content_key_id            UUID NOT NULL,
+  result_hash               BYTEA NOT NULL CHECK (octet_length(result_hash) = 32),
+  release_visibility_epoch  BIGINT NOT NULL CHECK (release_visibility_epoch > 0),
+  next_cursor_ciphertext    BYTEA,
+  created_at                TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, request_id, page_sequence),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_temporal_grounding_request (account_id, request_id),
+  FOREIGN KEY (account_id, release_visibility_epoch)
+    REFERENCES agentic_temporal_visibility_epoch_event
+      (account_id, visibility_epoch)
+);
+
+CREATE TABLE agentic_temporal_aggregate_result_source (
+  account_id              BIGINT NOT NULL,
+  request_id              UUID NOT NULL,
+  page_sequence           INTEGER NOT NULL,
+  source_identity_id      UUID NOT NULL,
+  contribution_hash       BYTEA NOT NULL CHECK (octet_length(contribution_hash) = 32),
+  PRIMARY KEY (
+    account_id, request_id, page_sequence, source_identity_id
+  ),
+  FOREIGN KEY (account_id, request_id, page_sequence)
+    REFERENCES agentic_temporal_aggregate_result_page
+      (account_id, request_id, page_sequence),
+  FOREIGN KEY (account_id, source_identity_id)
+    REFERENCES agentic_temporal_source_identity
+      (account_id, source_identity_id)
+);
+
 CREATE TABLE agentic_temporal_embedding (
   account_id                BIGINT NOT NULL,
   embedding_id              UUID NOT NULL,
@@ -974,9 +1130,11 @@ CREATE TABLE agentic_temporal_embedding (
     account_id, fact_version_id, embedding_model_version, valid_time_bucket_id
   ),
   FOREIGN KEY (
-    account_id, fact_version_id, timeline_id, tenant_partition_id
+    account_id, fact_version_id, timeline_id, tenant_partition_id,
+    source_identity_id, valid_range, system_from_sequence, source_value_hash
   ) REFERENCES agentic_temporal_fact_version (
-    account_id, fact_version_id, timeline_id, tenant_partition_id
+    account_id, fact_version_id, timeline_id, tenant_partition_id,
+    source_identity_id, valid_range, system_from_sequence, value_hash
   ),
   FOREIGN KEY (account_id, tenant_partition_id)
     REFERENCES agentic_tenant_partition (account_id, tenant_partition_id),
@@ -1086,6 +1244,8 @@ CREATE TABLE agentic_temporal_vector_attestation (
   signature                 BYTEA NOT NULL,
   created_at                TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, request_id, graph_artifact_id),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agentic_temporal_grounding_request (account_id, request_id),
   FOREIGN KEY (account_id, graph_artifact_id)
     REFERENCES agentic_temporal_vector_graph_artifact
       (account_id, graph_artifact_id)
@@ -1107,6 +1267,7 @@ CREATE TABLE agentic_temporal_procedure_artifact (
   signature                 BYTEA NOT NULL,
   created_at                TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, procedure_version_id),
+  UNIQUE (account_id, procedure_version_id, artifact_hash),
   UNIQUE (
     account_id, procedure_version_id, instruction_hash, precondition_hash
   )
@@ -1114,9 +1275,9 @@ CREATE TABLE agentic_temporal_procedure_artifact (
 
 ALTER TABLE agentic_temporal_procedure_manifest_member
   ADD CONSTRAINT procedure_manifest_member_artifact_fk
-  FOREIGN KEY (account_id, procedure_version_id)
+  FOREIGN KEY (account_id, procedure_version_id, artifact_hash)
   REFERENCES agentic_temporal_procedure_artifact
-    (account_id, procedure_version_id);
+    (account_id, procedure_version_id, artifact_hash);
 
 CREATE TABLE agentic_temporal_procedure_binding (
   account_id                BIGINT NOT NULL,
@@ -1267,7 +1428,12 @@ canonical event. It never asks a model to fill a missing date.
 The request must carry a unique source event ID and idempotency key. The service first
 claims `agentic_temporal_source_event_receipt` by both account-scoped keys with state
 `CLAIMED` and the canonical mutation hash; transaction/result fields remain null.
-After commit, finalization binds the durable coordinator decision and result root.
+That claim is a small recoverable transaction. The write participant finalizes it only
+after the coordinator decision is durable and before the API acknowledges success.
+If a worker dies between decision and local apply, a fenced recovery worker reads the
+encrypted mutation/plan, verifies the decision, and idempotently completes finalization.
+Receipt takeover uses compare-and-swap on `(claim_generation, claim_expires_at)` and
+increments the generation, so the original worker cannot later finalize.
 Replaying either key with the same hash returns the claim, job, or final result.
 Reusing either key with any different object, range, value, or hash returns
 `SOURCE_EVENT_CONFLICT`; changing timeline or valid range cannot bypass idempotency.
@@ -1284,9 +1450,9 @@ The row transaction:
 6. inserts the replacement and any left/right carry-forward intervals needed to keep
    the current valid-time timeline non-overlapping;
 7. advances `next_timeline_sequence` and `latest_value_hash`;
-8. finalizes the claimed source receipt and appends the canonical audit event and one
-   or more transactional enrichment outbox records; and
-9. commits.
+8. after the coordinator has durably decided commit, atomically applies the participant:
+   finalizes the claimed receipt and appends the audit and enrichment outbox records;
+9. acknowledges only after that participant commit is readable.
 
 Only system-interval closure metadata is mutable, once, through a stored procedure that
 checks `OLD.system_to_sequence IS NULL`; serving roles have no direct `UPDATE` grant.
@@ -1316,6 +1482,10 @@ A correction exceeding the synchronous split cap creates
 append `agentic_temporal_mutation_batch` rows. Status and cancellation are available by
 source event through GraphQL. Cancellation prevents the next batch but does not undo
 committed child transactions; the final result root covers their ordered hashes.
+Workers acquire jobs with compare-and-swap on `(lease_generation, lease_expires_at)`;
+takeover increments the generation and stale workers cannot advance cursors. Encrypted
+canonical mutation and compiled-plan payloads, policy/contract/envelope versions,
+review ticket, attempts, and typed error codes make restart independent of caller state.
 
 ### 3. Publish derived layers by watermark
 
@@ -1347,7 +1517,10 @@ Embedding publication is available only through a security-definer procedure tha
 joins the authoritative fact by `(account_id, fact_version_id)` and copies—not trusts—
 its timeline, partition, source identity, valid range, system interval, and value hash.
 It rejects any caller-provided mismatch. Procedure publication follows the same rule
-against the signed procedure artifact. Direct derivative inserts are revoked.
+against the signed procedure artifact. Procedure artifact updates/deletes and direct
+derivative inserts are revoked after signing. The composite embedding foreign key also
+binds immutable copied source fields, so bypassing the publication function still
+cannot attach a different range, identity, sequence, or value hash.
 
 ## Deterministic read lifecycle
 
@@ -1419,6 +1592,15 @@ Segment metadata includes min/max valid time, system watermark, typed value syno
 row count, and bytes. The planner prunes segments before admission and verifies that
 their published watermark satisfies the snapshot.
 
+Every segment member has an exact source-eligibility sidecar behind the
+`source_identity_root`. Before scanning or releasing cached aggregate pages, the
+columnar gateway intersects those source IDs with current revocation fences at the
+release visibility epoch. Pre-aggregated blocks retain per-source contribution
+locators so a revoked contribution can be excluded deterministically. An artifact that
+cannot prove this mapping is ineligible for agentic aggregation; a mixed aggregate is
+never served on the strength of a Merkle root alone. Result pages persist encrypted
+source links and use the same key revocation as grounding packets.
+
 If the requested snapshot is newer than the columnar watermark, policy chooses one of
 three explicit outcomes:
 
@@ -1462,9 +1644,9 @@ similar escalation at that time.” It is not a temporal truth oracle. Vector si
 discovers candidate fact or procedure versions; bitemporal predicates and policy
 determine eligibility.
 
-Each HNSW graph is a physical account leaf plus one model/time-bucket partial index,
-exactly as in the DDL. There is no global or default graph and no post-traversal tenant
-filter standing in for isolation. Every query:
+Each HNSW graph is a sealed account/model/time-bucket/generation relation with its own
+local pgvector HNSW index, exactly as in the DDL. There is no global or default graph
+and no post-traversal tenant filter standing in for isolation. Every query:
 
 1. resolves `account_id` and placement through an account-bound capability;
 2. allows only model versions declared by the data contract;
@@ -1764,20 +1946,43 @@ type TemporalProcedureArtifact {
   canonicalInstructions: CanonicalJSON!
   canonicalPreconditions: CanonicalJSON!
   allowedToolScopes: [String!]!
-  canonicalBudget: CanonicalJSON!
+  budget: TemporalProcedureBudget!
   artifactHash: String!
   signingKeyVersion: Int!
   signature: String!
 }
 
-type TemporalSemanticMatch {
+type TemporalProcedureBudget {
+  maxSteps: Int!
+  maxToolCalls: Int!
+  maxRows: BigIntString!
+  maxWallTimeMs: Int!
+}
+
+interface TemporalSemanticMatch {
   rank: Int!
   canonicalScore: DecimalString!
-  factVersionId: ID
-  procedureVersionId: ID
   graphArtifactId: ID!
   graphArtifactHash: String!
   candidateAttestationHash: String!
+}
+
+type TemporalFactSemanticMatch implements TemporalSemanticMatch {
+  rank: Int!
+  canonicalScore: DecimalString!
+  graphArtifactId: ID!
+  graphArtifactHash: String!
+  candidateAttestationHash: String!
+  factVersionId: ID!
+}
+
+type TemporalProcedureSemanticMatch implements TemporalSemanticMatch {
+  rank: Int!
+  canonicalScore: DecimalString!
+  graphArtifactId: ID!
+  graphArtifactHash: String!
+  candidateAttestationHash: String!
+  procedureVersionId: ID!
 }
 
 type TemporalGroundingPacket {
@@ -1858,7 +2063,8 @@ type TemporalFactObject {
 type Query {
   agenticTemporalGroundingStatus(
     requestId: ID!
-    resultCursor: String
+    packetCursor: String
+    aggregateCursor: String
   ): TemporalGroundingStatus!
 
   agenticTemporalMutationStatus(
@@ -1913,6 +2119,8 @@ pagination. The authenticated encrypted cursor contains the version, account and
 principal, request/scope hash, snapshot ID, valid-time hash, last complete sort tuple,
 envelope hash, and expiry. A missing, expired, or mismatched cursor fails; it never
 falls back to `OFFSET` or widens scope.
+Grounding status accepts separate packet and aggregate cursors; each cursor carries a
+signed stream discriminator, so advancing one result cannot alter the other.
 
 Fact mutations are ordinary typed Open API writes. Small corrections compile and
 commit synchronously; large corrections enter `ADMITTED` for reviewed, budgeted
@@ -1921,6 +2129,12 @@ and a nullable packet. Cancelling stops future admitted batches but never rolls 
 already committed fact versions. Exact procedure reads return the hash, range,
 precondition, and contract needed for independent plan verification; retrieval never
 executes the procedure.
+
+Procedure budgets have a closed typed projection: step/tool/time limits are bounded
+GraphQL `Int` values and row limits are `BigIntString`. The signed SQL JSON artifact
+uses those same canonical encodings; unrestricted JSON numeric tokens are invalid.
+Semantic matches are an exclusive GraphQL union: `__typename` identifies a fact or
+procedure target, so neither “no target” nor “both targets” is representable.
 
 ## Agentic guardrails and admission
 
