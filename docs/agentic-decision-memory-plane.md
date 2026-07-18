@@ -304,7 +304,44 @@ interface DecisionTemplate {
   outputSchemaId: string;
   status: "DRAFT" | "ACTIVE" | "RETIRED" | "REVOKED";
   artifactHash: string;
+  supersedesTemplateVersion?: string;
   createdAt: string;
+}
+
+interface DecisionTemplateApplicabilityRequest {
+  accountId: string;
+  requestId: string;
+  principalId: string;
+  purposeId: string;
+  templateId: string;
+  templateVersion: string;
+  contextSnapshotToken: string;
+  targetObjectRefs: AgenticDecisionIntent["targetObjectRefs"];
+  budget: DecisionReuseBudget;
+  idempotencyKey: string;
+  canonicalRequestHash: string;
+}
+
+interface DecisionTemplateApplicabilityEvaluation {
+  accountId: string;
+  evaluationId: string;
+  templateId: string;
+  templateVersion: string;
+  applicable: boolean;
+  reasonCodes: string[];
+  visibilityCheckpointId: string;
+  authorizationAttestationHash: string;
+  preconditionEvaluationHash: string;
+  capabilityEvaluationHash: string;
+  budgetEvaluationHash: string;
+  auditEventId: string;
+}
+
+interface DecisionTemplateEvaluationRelease {
+  accountId: string;
+  evaluation: DecisionTemplateApplicabilityEvaluation;
+  instructionReleaseCapability?: string;
+  releaseCapabilityExpiresAt?: string;
 }
 
 interface DecisionPerceptionCard {
@@ -340,7 +377,6 @@ interface DecisionSearchRequest {
     embeddingId: string;
     embeddingHash: string;
   };
-  queryEmbeddingHash: string;
   topK: number;
   maxCandidates: number;
   efSearch: number;
@@ -440,6 +476,8 @@ CREATE TABLE agentic_decision_idempotency_records (
   canonical_request_hash bytea         NOT NULL,
   response_type          text          NOT NULL,
   response_id            uuid          NOT NULL,
+  response_version       text,
+  response_identity_hash bytea         NOT NULL,
   created_at             timestamptz   NOT NULL,
   PRIMARY KEY (account_id, operation, principal_id, idempotency_key),
   CHECK (
@@ -447,6 +485,7 @@ CREATE TABLE agentic_decision_idempotency_records (
       'RECORD_DECISION',
       'EVALUATE_REUSE',
       'REGISTER_TEMPLATE',
+      'EVALUATE_TEMPLATE',
       'REGISTER_OUTCOME'
     )
   )
@@ -562,9 +601,9 @@ CREATE TABLE agentic_decision_visibility_checkpoints (
   created_at                       timestamptz   NOT NULL,
   PRIMARY KEY (account_id, checkpoint_id),
   UNIQUE (account_id, checkpoint_sequence),
-  CHECK (checkpoint_sequence >= dependency_head_applied_sequence),
-  CHECK (checkpoint_sequence >= policy_applied_sequence),
-  CHECK (checkpoint_sequence >= authorization_applied_sequence),
+  CHECK (dependency_head_applied_sequence >= checkpoint_sequence),
+  CHECK (policy_applied_sequence >= checkpoint_sequence),
+  CHECK (authorization_applied_sequence >= checkpoint_sequence),
   CHECK (source_visibility_epoch >= 0),
   CHECK (revocation_fence_epoch >= 0)
 ) PARTITION BY HASH (account_id);
@@ -683,6 +722,40 @@ CREATE TABLE agentic_decision_templates (
   CHECK (status IN ('DRAFT', 'ACTIVE', 'RETIRED', 'REVOKED')),
   CHECK (cardinality(allowed_purpose_ids) BETWEEN 1 AND 32),
   CHECK (cardinality(required_capability_ids) <= 32)
+) PARTITION BY HASH (account_id);
+
+CREATE TABLE agentic_decision_template_evaluations (
+  account_id                       bigint        NOT NULL,
+  evaluation_id                    uuid          NOT NULL,
+  request_id                       uuid          NOT NULL,
+  principal_id                     bigint        NOT NULL,
+  purpose_id                       uuid          NOT NULL,
+  template_id                      uuid          NOT NULL,
+  template_version                 text          NOT NULL,
+  visibility_checkpoint_id         uuid          NOT NULL,
+  applicable                       boolean       NOT NULL,
+  reason_codes                     text[]        NOT NULL,
+  authorization_attestation_hash   bytea         NOT NULL,
+  precondition_evaluation_hash     bytea         NOT NULL,
+  capability_evaluation_hash       bytea         NOT NULL,
+  budget_evaluation_hash           bytea         NOT NULL,
+  audit_event_id                   uuid          NOT NULL,
+  evaluation_hash                  bytea         NOT NULL,
+  evaluated_at                     timestamptz   NOT NULL,
+  PRIMARY KEY (account_id, evaluation_id),
+  UNIQUE (account_id, request_id),
+  FOREIGN KEY (account_id, template_id, template_version)
+    REFERENCES agentic_decision_templates (
+      account_id,
+      template_id,
+      template_version
+    ),
+  FOREIGN KEY (account_id, visibility_checkpoint_id)
+    REFERENCES agentic_decision_visibility_checkpoints (
+      account_id,
+      checkpoint_id
+    ),
+  CHECK (cardinality(reason_codes) BETWEEN 1 AND 16)
 ) PARTITION BY HASH (account_id);
 
 CREATE TABLE agentic_decision_perception_cards (
@@ -919,6 +992,7 @@ ALTER TABLE agentic_dependency_heads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_reuse_evaluations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_reuse_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agentic_decision_template_evaluations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_perception_cards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_revalidation_jobs ENABLE ROW LEVEL SECURITY;
@@ -962,6 +1036,10 @@ CREATE POLICY tenant_isolation ON agentic_decision_templates
   USING (account_id = current_setting('monday.account_id')::bigint)
   WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
 
+CREATE POLICY tenant_isolation ON agentic_decision_template_evaluations
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
 CREATE POLICY tenant_isolation ON agentic_decision_perception_cards
   USING (account_id = current_setting('monday.account_id')::bigint)
   WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
@@ -996,10 +1074,11 @@ for tenant-leading plans. Production roles do not own these tables and do not ha
 
 The tenant control cell issues a signed visibility checkpoint only after its quorum has
 applied source commits, dependency heads, policy, authorization, and revocation
-prefixes through the checkpoint sequence. A reuse evaluation reads all of those
-authorities from one MVCC snapshot at that checkpoint. If a client supplies a minimum
-checkpoint token for read-your-writes, the service may advance it but never select an
-older checkpoint.
+prefixes through the checkpoint sequence. These applied-prefix fields use the same
+tenant-global commit-sequence domain and must each be greater than or equal to the
+issued checkpoint sequence. A reuse evaluation reads all of those authorities from one
+MVCC snapshot at that checkpoint. If a client supplies a minimum checkpoint token for
+read-your-writes, the service may advance it but never select an older checkpoint.
 
 The evaluation commit is the linearization point for ordinary source changes. A
 subsequent edit does not retroactively change a read that already linearized. Safety
@@ -1031,9 +1110,12 @@ old evaluation after the fence closes.
 9. Asynchronously create a redacted perception card from policy-approved fields.
 
 The idempotency tuple is `(account_id, operation, principal_id, idempotency_key,
-canonical_request_hash, response_id)`. A retry with the same key and hash returns the
-same response. The same key with a different hash is rejected; uniqueness alone is not
-treated as sufficient idempotency.
+canonical_request_hash, response_type, response_id, response_version,
+response_identity_hash)`. A retry with the same key and hash returns the same response.
+The same key with a different hash is rejected; uniqueness alone is not treated as
+sufficient idempotency. The server canonicalizes the typed input and recomputes the
+request hash; the client field is only an assertion. The versioned response identity
+lets a template be recovered without ambiguity.
 
 The LLM's chain-of-thought is not required and should not be stored. The receipt keeps
 structured evidence references, the disclosed explanation hash, and the final result
@@ -1085,7 +1167,23 @@ The engine does not recursively look for another reusable receipt when this eval
 returns `RECOMPUTE`. The caller may submit one new decision request; its control
 envelope carries a reuse depth of zero.
 
-### 3. React to dependency changes
+### 3. Evaluate a decision template
+
+An exact template lookup returns metadata, never instructions. Template evaluation
+acquires the same signed visibility checkpoint as receipt reuse, resolves the active
+immutable template version, and checks current authorization and purpose. It evaluates
+the versioned precondition contract against the supplied context snapshot and exact
+target refs, resolves current capability heads, and clamps the requested budget to the
+template, tenant, principal, and workload limits.
+
+The service persists the template evaluation, retained attestations, audit event/head,
+idempotency tuple, and outbox event before minting a short-lived instruction-release
+capability. The capability is account-, principal-, purpose-, template-version-,
+checkpoint-, and revocation-fence-bound. Fetching instructions cannot invoke tools,
+query another template, or extend the capability; the resulting plan still enters the
+ordinary plan-verification path.
+
+### 4. React to dependency changes
 
 For row-store facts, the authoritative source mutation, exact dependency-head advance,
 audit event, and outbox event commit in the same ACID transaction. For columnar,
@@ -1127,7 +1225,7 @@ Queue workers claim jobs with compare-and-swap on `lease_generation`. Completion
 accepted only from the current lease generation, making a delayed worker unable to
 overwrite a newer result.
 
-### 4. Attach outcomes without rewriting history
+### 5. Attach outcomes without rewriting history
 
 Observed outcomes are append-only facts. They can help an agent assess how similar
 templates performed, but they do not mutate the original decision or prove causality.
@@ -1344,6 +1442,20 @@ input RegisterAgenticDecisionTemplateInput {
   canonicalRequestHash: Hash!
 }
 
+input EvaluateAgenticDecisionTemplateInput {
+  accountId: AccountID!
+  requestId: ID!
+  principalId: ID!
+  purposeId: ID!
+  templateId: ID!
+  templateVersion: String!
+  contextSnapshotToken: String!
+  targetObjectRefs: [AgenticObjectRefInput!]!
+  budget: AgenticReuseBudgetInput!
+  idempotencyKey: String!
+  canonicalRequestHash: Hash!
+}
+
 type AgenticDecisionProcedureRef {
   accountId: AccountID!
   procedureId: ID!
@@ -1386,6 +1498,8 @@ type AgenticDecisionReuseEvaluation {
   evaluationId: ID!
   requestId: ID!
   decisionId: ID!
+  principalId: ID!
+  purposeId: ID!
   decision: AgenticReuseDecision!
   reasonCodes: [AgenticReuseReason!]!
   observedDependencyHeadRoot: Hash!
@@ -1452,16 +1566,24 @@ type AgenticDecisionReusePayload {
   releaseKind: String
 }
 
-type AgenticDecisionTemplate {
+type AgenticReuseBudget {
+  maxDependencies: Int!
+  maxSemanticCandidates: Int!
+  maxPolicyChecks: Int!
+  maxEstimatedRowReads: BigInt!
+  maxEstimatedBytes: BigInt!
+  timeoutMs: Int!
+}
+
+type AgenticDecisionTemplateMetadata {
   accountId: AccountID!
   templateId: ID!
   templateVersion: String!
   decisionType: String!
-  instructions: JSON!
   preconditionContractId: ID!
   allowedPurposeIds: [ID!]!
   requiredCapabilityIds: [ID!]!
-  maximumBudget: JSON!
+  maximumBudget: AgenticReuseBudget!
   outputSchemaId: ID!
   status: AgenticDecisionTemplateStatus!
   artifactHash: Hash!
@@ -1470,9 +1592,24 @@ type AgenticDecisionTemplate {
 }
 
 type AgenticDecisionTemplateMutationPayload {
-  template: AgenticDecisionTemplate
+  template: AgenticDecisionTemplateMetadata
   accepted: Boolean!
   reasonCodes: [String!]!
+  auditEventId: ID!
+}
+
+type AgenticDecisionTemplateEvaluationPayload {
+  template: AgenticDecisionTemplateMetadata!
+  evaluationId: ID!
+  applicable: Boolean!
+  reasonCodes: [String!]!
+  visibilityCheckpointId: ID!
+  authorizationAttestationHash: Hash!
+  preconditionEvaluationHash: Hash!
+  capabilityEvaluationHash: Hash!
+  budgetEvaluationHash: Hash!
+  instructionReleaseCapability: String
+  releaseCapabilityExpiresAt: DateTime
   auditEventId: ID!
 }
 
@@ -1493,7 +1630,7 @@ extend type Query {
     purposeId: ID!
     templateId: ID!
     templateVersion: String!
-  ): AgenticDecisionTemplate
+  ): AgenticDecisionTemplateMetadata
 
   searchAgenticDecisions(
     input: SearchAgenticDecisionsInput!
@@ -1512,6 +1649,10 @@ extend type Mutation {
   registerAgenticDecisionTemplate(
     input: RegisterAgenticDecisionTemplateInput!
   ): AgenticDecisionTemplateMutationPayload!
+
+  evaluateAgenticDecisionTemplate(
+    input: EvaluateAgenticDecisionTemplateInput!
+  ): AgenticDecisionTemplateEvaluationPayload!
 }
 ```
 
@@ -1521,6 +1662,11 @@ account-, checkpoint-, and revocation-fence-bound release capability. The encryp
 artifact service rechecks the capability and current revocation fence at fetch time.
 It never accepts an evaluation ID as authority. This prevents an API client from
 bypassing current authorization and dependency checks by reading old metadata.
+The exact template query likewise returns metadata only. Instructions are released
+only through `evaluateAgenticDecisionTemplate` after current status, purpose,
+authorization, context-snapshot preconditions, capabilities, and effective budget are
+checked and audited. Its short-lived instruction capability uses the same account and
+revocation fencing as result release.
 The reuse input also omits a claimed “current” policy version: the service resolves the
 authoritative version after authenticating the account, so a caller cannot pin an old
 policy to make a stale receipt appear eligible.
@@ -1569,6 +1715,9 @@ another tenant's reserved interactive capacity.
   reads. Complexity depends on the decision closure, not board size.
 - Exact-intent lookup: bounded by
   `(account_id, canonical_intent_hash, decision_type, created_at)`.
+- Template applicability: one exact template-version read plus bounded point checks for
+  its declared preconditions and at most 32 capabilities; no template instructions are
+  released before those checks.
 - Outcome history: cursor pagination on
   `(account_id, decision_id, observed_at, outcome_id)`.
 - Semantic discovery: account-bound HNSW traversal with bounded candidates and no exact
