@@ -77,7 +77,7 @@ Version 1 supports:
 - exact receipt lookup;
 - bounded semantic discovery of decision receipts and templates;
 - revalidation of at most 128 exact dependencies;
-- deterministic reuse of informational results;
+- deterministic reuse of informational and recommendation results;
 - plan-template reuse for tool or mutation decisions, followed by fresh preflight;
 - append-only outcome observations; and
 - background proactive revalidation for high-value receipts.
@@ -173,6 +173,7 @@ interface AgenticDecisionReceipt {
   principalId: string;
   purposeId: string;
   decisionClass: DecisionClass;
+  decisionType: string;
   intent: AgenticDecisionIntent;
   temporalSnapshotId: string;
   temporalSnapshotHash: string;
@@ -185,7 +186,7 @@ interface AgenticDecisionReceipt {
   }>;
   dependencies: DecisionDependency[];
   resultSchemaId: string;
-  encryptedResultRef: string;
+  encryptedResultArtifactId: string;
   resultHash: string;
   explanationHash?: string;
   modelArtifactRefs: Array<{
@@ -216,6 +217,7 @@ interface DecisionReuseRequest {
   purposeId: string;
   decisionId: string;
   expectedIntentHash: string;
+  minimumVisibilityCheckpointToken?: string;
   allowPlanTemplateReuse: boolean;
   budget: DecisionReuseBudget;
   idempotencyKey: string;
@@ -231,6 +233,21 @@ interface DependencyHeadObservation {
   visibilityEpoch: string;
   revoked: boolean;
   observedAtSequence: string;
+  authorityCheckpointSequence: string;
+}
+
+interface DecisionVisibilityCheckpoint {
+  accountId: string;
+  checkpointId: string;
+  checkpointSequence: string;
+  dependencyHeadAppliedSequence: string;
+  policyAppliedSequence: string;
+  authorizationAppliedSequence: string;
+  sourceVisibilityEpoch: string;
+  revocationFenceEpoch: string;
+  checkpointHash: string;
+  signedToken: string;
+  expiresAt: string;
 }
 
 interface DecisionReuseEvaluation {
@@ -243,10 +260,11 @@ interface DecisionReuseEvaluation {
   decision: ReuseDecision;
   reasonCodes: ReuseReasonCode[];
   observedDependencyHeadRoot: string;
+  visibilityCheckpointId: string;
+  visibilityCheckpointHash: string;
   currentPolicyVersion: string;
   currentAuthorizationDecisionHash: string;
-  resultRef?: string;
-  planTemplateRef?: string;
+  authorizationAttestationHash: string;
   freshPreflightRequired: boolean;
   consumed: {
     dependencyReads: number;
@@ -258,6 +276,14 @@ interface DecisionReuseEvaluation {
   auditEventId: string;
   evaluationHash: string;
   evaluatedAt: string;
+}
+
+interface DecisionReuseRelease {
+  accountId: string;
+  evaluation: DecisionReuseEvaluation;
+  releaseCapability?: string;
+  releaseCapabilityExpiresAt?: string;
+  releaseKind?: "RESULT" | "PLAN_TEMPLATE";
 }
 
 interface DecisionTemplate {
@@ -309,6 +335,11 @@ interface DecisionSearchRequest {
   sourceTypes: Array<"DECISION_RECEIPT" | "DECISION_TEMPLATE">;
   decisionTypes: string[];
   embeddingModelVersion: string;
+  queryEmbeddingRef: {
+    accountId: string;
+    embeddingId: string;
+    embeddingHash: string;
+  };
   queryEmbeddingHash: string;
   topK: number;
   maxCandidates: number;
@@ -323,6 +354,7 @@ interface DecisionSearchCandidate {
   distance: number;
   discoveryOnly: true;
   exactEligibilityCheckRequired: true;
+  candidatePolicyDecisionHash: string;
   candidateAttestationHash: string;
 }
 
@@ -383,11 +415,50 @@ CREATE TYPE agentic_reuse_decision AS ENUM (
   'REJECT'
 );
 
+CREATE TYPE agentic_reuse_reason AS ENUM (
+  'ELIGIBLE',
+  'DEPENDENCY_CHANGED',
+  'DEPENDENCY_REVOKED',
+  'DEPENDENCY_MISSING',
+  'POLICY_CHANGED',
+  'PRINCIPAL_NOT_AUTHORIZED',
+  'PURPOSE_MISMATCH',
+  'PROCEDURE_RETIRED',
+  'SOURCE_VISIBILITY_CHANGED',
+  'RESULT_EXPIRED',
+  'ACTION_REQUIRES_FRESH_PREFLIGHT',
+  'DEPENDENCY_LIMIT_EXCEEDED',
+  'BUDGET_EXHAUSTED',
+  'RECURSIVE_REUSE_FORBIDDEN'
+);
+
+CREATE TABLE agentic_decision_idempotency_records (
+  account_id             bigint        NOT NULL,
+  operation              text          NOT NULL,
+  principal_id           bigint        NOT NULL,
+  idempotency_key        text          NOT NULL,
+  canonical_request_hash bytea         NOT NULL,
+  response_type          text          NOT NULL,
+  response_id            uuid          NOT NULL,
+  created_at             timestamptz   NOT NULL,
+  PRIMARY KEY (account_id, operation, principal_id, idempotency_key),
+  CHECK (
+    operation IN (
+      'RECORD_DECISION',
+      'EVALUATE_REUSE',
+      'REGISTER_TEMPLATE',
+      'REGISTER_OUTCOME'
+    )
+  )
+) PARTITION BY HASH (account_id);
+
 CREATE TABLE agentic_decision_receipts (
   account_id              bigint        NOT NULL,
   decision_id             uuid          NOT NULL,
   request_id              uuid          NOT NULL,
   principal_id            bigint        NOT NULL,
+  idempotency_key         text          NOT NULL,
+  canonical_request_hash  bytea         NOT NULL,
   purpose_id              uuid          NOT NULL,
   decision_class          agentic_decision_class NOT NULL,
   decision_type           text          NOT NULL,
@@ -398,7 +469,7 @@ CREATE TABLE agentic_decision_receipts (
   policy_version          text          NOT NULL,
   procedure_set_hash      bytea         NOT NULL,
   result_schema_id        uuid          NOT NULL,
-  encrypted_result_ref    text          NOT NULL,
+  encrypted_result_artifact_id uuid      NOT NULL,
   result_hash             bytea         NOT NULL,
   explanation_hash        bytea,
   model_artifact_set_hash bytea         NOT NULL,
@@ -408,7 +479,7 @@ CREATE TABLE agentic_decision_receipts (
   created_at              timestamptz   NOT NULL,
   PRIMARY KEY (account_id, decision_id),
   UNIQUE (account_id, request_id),
-  UNIQUE (account_id, principal_id, canonical_intent_hash, decision_id),
+  UNIQUE (account_id, principal_id, idempotency_key),
   CHECK (jsonb_typeof(canonical_intent) = 'object')
 ) PARTITION BY HASH (account_id);
 
@@ -461,6 +532,43 @@ CREATE INDEX agentic_decision_dependencies_reverse_idx
     decision_id
   );
 
+CREATE TABLE agentic_decision_procedure_refs (
+  account_id         bigint        NOT NULL,
+  decision_id        uuid          NOT NULL,
+  procedure_ordinal  smallint      NOT NULL,
+  procedure_id       uuid          NOT NULL,
+  procedure_version  text          NOT NULL,
+  artifact_hash      bytea         NOT NULL,
+  created_at         timestamptz   NOT NULL,
+  PRIMARY KEY (account_id, decision_id, procedure_ordinal),
+  UNIQUE (account_id, decision_id, procedure_id, procedure_version),
+  FOREIGN KEY (account_id, decision_id)
+    REFERENCES agentic_decision_receipts (account_id, decision_id),
+  CHECK (procedure_ordinal BETWEEN 0 AND 31)
+) PARTITION BY HASH (account_id);
+
+CREATE TABLE agentic_decision_visibility_checkpoints (
+  account_id                       bigint        NOT NULL,
+  checkpoint_id                    uuid          NOT NULL,
+  checkpoint_sequence              bigint        NOT NULL,
+  dependency_head_applied_sequence bigint        NOT NULL,
+  policy_applied_sequence          bigint        NOT NULL,
+  authorization_applied_sequence   bigint        NOT NULL,
+  source_visibility_epoch          bigint        NOT NULL,
+  revocation_fence_epoch           bigint        NOT NULL,
+  checkpoint_hash                  bytea         NOT NULL,
+  authority_signature              bytea         NOT NULL,
+  expires_at                       timestamptz   NOT NULL,
+  created_at                       timestamptz   NOT NULL,
+  PRIMARY KEY (account_id, checkpoint_id),
+  UNIQUE (account_id, checkpoint_sequence),
+  CHECK (checkpoint_sequence >= dependency_head_applied_sequence),
+  CHECK (checkpoint_sequence >= policy_applied_sequence),
+  CHECK (checkpoint_sequence >= authorization_applied_sequence),
+  CHECK (source_visibility_epoch >= 0),
+  CHECK (revocation_fence_epoch >= 0)
+) PARTITION BY HASH (account_id);
+
 CREATE TABLE agentic_dependency_heads (
   account_id            bigint        NOT NULL,
   dependency_kind       agentic_dependency_kind NOT NULL,
@@ -470,9 +578,11 @@ CREATE TABLE agentic_dependency_heads (
   visibility_epoch      bigint        NOT NULL,
   revoked               boolean       NOT NULL DEFAULT false,
   observed_at_sequence  bigint        NOT NULL,
+  authority_checkpoint_sequence bigint NOT NULL,
   updated_at            timestamptz   NOT NULL,
   PRIMARY KEY (account_id, dependency_kind, dependency_id),
   CHECK (observed_at_sequence >= 0),
+  CHECK (authority_checkpoint_sequence >= observed_at_sequence),
   CHECK (visibility_epoch >= 0)
 ) PARTITION BY HASH (account_id);
 
@@ -481,14 +591,19 @@ CREATE TABLE agentic_decision_reuse_evaluations (
   evaluation_id                       uuid          NOT NULL,
   request_id                          uuid          NOT NULL,
   idempotency_key                     text          NOT NULL,
+  canonical_request_hash              bytea         NOT NULL,
   decision_id                         uuid          NOT NULL,
   principal_id                        bigint        NOT NULL,
   purpose_id                          uuid          NOT NULL,
   reuse_decision                      agentic_reuse_decision NOT NULL,
-  reason_codes                        text[]        NOT NULL,
+  reason_codes                        agentic_reuse_reason[] NOT NULL,
   observed_dependency_head_root       bytea         NOT NULL,
+  visibility_checkpoint_id            uuid          NOT NULL,
+  visibility_checkpoint_hash          bytea         NOT NULL,
   current_policy_version              text          NOT NULL,
   current_authorization_decision_hash bytea         NOT NULL,
+  authorization_attestation_hash      bytea         NOT NULL,
+  decision_table_version              text          NOT NULL,
   consumed_dependency_reads           smallint      NOT NULL,
   consumed_policy_checks              smallint      NOT NULL,
   consumed_estimated_row_reads        bigint        NOT NULL,
@@ -502,6 +617,11 @@ CREATE TABLE agentic_decision_reuse_evaluations (
   UNIQUE (account_id, principal_id, idempotency_key),
   FOREIGN KEY (account_id, decision_id)
     REFERENCES agentic_decision_receipts (account_id, decision_id),
+  FOREIGN KEY (account_id, visibility_checkpoint_id)
+    REFERENCES agentic_decision_visibility_checkpoints (
+      account_id,
+      checkpoint_id
+    ),
   CHECK (cardinality(reason_codes) BETWEEN 1 AND 16),
   CHECK (consumed_dependency_reads BETWEEN 0 AND 128),
   CHECK (consumed_policy_checks BETWEEN 0 AND 32),
@@ -509,8 +629,7 @@ CREATE TABLE agentic_decision_reuse_evaluations (
   CHECK (consumed_estimated_bytes >= 0),
   CHECK (consumed_elapsed_ms >= 0),
   CHECK (
-    (reuse_decision IN ('REUSE_PLAN_ONLY', 'RECOMPUTE', 'REJECT'))
-    OR NOT fresh_preflight_required
+    (reuse_decision = 'REUSE_PLAN_ONLY') = fresh_preflight_required
   )
 ) PARTITION BY HASH (account_id);
 
@@ -520,6 +639,27 @@ CREATE INDEX agentic_decision_reuse_request_idx
     request_id,
     evaluated_at DESC
   );
+
+CREATE TABLE agentic_decision_reuse_observations (
+  account_id                    bigint        NOT NULL,
+  evaluation_id                 uuid          NOT NULL,
+  dependency_ordinal            smallint      NOT NULL,
+  dependency_kind               agentic_dependency_kind NOT NULL,
+  dependency_id                 text          NOT NULL,
+  observed_version              text          NOT NULL,
+  observed_version_hash         bytea         NOT NULL,
+  observed_visibility_epoch     bigint        NOT NULL,
+  observed_at_sequence          bigint        NOT NULL,
+  authority_checkpoint_sequence bigint        NOT NULL,
+  revoked                       boolean       NOT NULL,
+  observation_hash              bytea         NOT NULL,
+  PRIMARY KEY (account_id, evaluation_id, dependency_ordinal),
+  UNIQUE (account_id, evaluation_id, dependency_kind, dependency_id),
+  FOREIGN KEY (account_id, evaluation_id)
+    REFERENCES agentic_decision_reuse_evaluations (account_id, evaluation_id),
+  CHECK (dependency_ordinal BETWEEN 0 AND 127),
+  CHECK (authority_checkpoint_sequence >= observed_at_sequence)
+) PARTITION BY HASH (account_id);
 
 CREATE TABLE agentic_decision_templates (
   account_id                  bigint        NOT NULL,
@@ -578,9 +718,9 @@ CREATE TABLE agentic_decision_perception_cards (
   CHECK (cardinality(allowed_purpose_ids) BETWEEN 1 AND 32)
 ) PARTITION BY HASH (account_id);
 
--- Build one HNSW graph per physical account bucket, model version, and
--- immutable vector manifest. Query routing derives the bucket from the
--- authenticated account and always applies account_id as an exact filter.
+-- This relation is an authoritative staging catalog, not a shared HNSW graph.
+-- The vector publisher exports one sealed graph object per exact account,
+-- model version, and immutable manifest into an account-authorized namespace.
 CREATE INDEX agentic_decision_perception_metadata_idx
   ON agentic_decision_perception_cards (
     account_id,
@@ -644,7 +784,7 @@ CREATE TABLE agentic_decision_revalidation_jobs (
   created_at               timestamptz   NOT NULL,
   updated_at               timestamptz   NOT NULL,
   PRIMARY KEY (account_id, job_id),
-  UNIQUE (
+  UNIQUE NULLS NOT DISTINCT (
     account_id,
     decision_id,
     trigger_kind,
@@ -670,20 +810,68 @@ CREATE INDEX agentic_decision_revalidation_claim_idx
   WHERE state = 'QUEUED';
 
 CREATE TABLE agentic_decision_audit_events (
-  account_id         bigint        NOT NULL,
-  audit_event_id     uuid          NOT NULL,
-  decision_id        uuid,
-  evaluation_id      uuid,
-  event_type         text          NOT NULL,
-  actor_principal_id bigint        NOT NULL,
-  canonical_payload  jsonb         NOT NULL,
+  account_id          bigint        NOT NULL,
+  audit_event_id      uuid          NOT NULL,
+  audit_shard         smallint      NOT NULL,
+  event_sequence      bigint        NOT NULL,
+  commit_sequence     bigint        NOT NULL,
+  aggregate_type      text          NOT NULL,
+  aggregate_id        uuid          NOT NULL,
+  decision_id         uuid,
+  evaluation_id       uuid,
+  event_type          text          NOT NULL,
+  actor_principal_id  bigint        NOT NULL,
+  checkpoint_id       uuid          NOT NULL,
+  canonical_payload   jsonb         NOT NULL,
+  retained_attestation_artifact_id uuid NOT NULL,
+  retained_attestation_hash bytea   NOT NULL,
   previous_event_hash bytea,
-  event_hash         bytea         NOT NULL,
-  created_at         timestamptz   NOT NULL,
+  event_hash          bytea         NOT NULL,
+  created_at          timestamptz   NOT NULL,
   PRIMARY KEY (account_id, audit_event_id),
   UNIQUE (account_id, event_hash),
+  UNIQUE (account_id, audit_shard, event_sequence),
   CHECK (jsonb_typeof(canonical_payload) = 'object'),
-  CHECK (decision_id IS NOT NULL OR evaluation_id IS NOT NULL)
+  CHECK (audit_shard BETWEEN 0 AND 63),
+  CHECK (event_sequence >= 0),
+  CHECK (commit_sequence >= 0),
+  CHECK (
+    aggregate_type IN (
+      'DECISION',
+      'REUSE_EVALUATION',
+      'DECISION_TEMPLATE',
+      'DECISION_OUTCOME'
+    )
+  )
+) PARTITION BY HASH (account_id);
+
+CREATE INDEX agentic_decision_audit_aggregate_idx
+  ON agentic_decision_audit_events (
+    account_id,
+    aggregate_type,
+    aggregate_id,
+    event_sequence
+  );
+
+CREATE UNIQUE INDEX agentic_decision_audit_predecessor_idx
+  ON agentic_decision_audit_events (
+    account_id,
+    audit_shard,
+    previous_event_hash
+  )
+  WHERE previous_event_hash IS NOT NULL;
+
+CREATE TABLE agentic_decision_audit_heads (
+  account_id          bigint        NOT NULL,
+  audit_shard         smallint      NOT NULL,
+  head_event_sequence bigint        NOT NULL,
+  head_event_hash     bytea         NOT NULL,
+  lease_generation    bigint        NOT NULL,
+  updated_at          timestamptz   NOT NULL,
+  PRIMARY KEY (account_id, audit_shard),
+  CHECK (audit_shard BETWEEN 0 AND 63),
+  CHECK (head_event_sequence >= 0),
+  CHECK (lease_generation >= 0)
 ) PARTITION BY HASH (account_id);
 
 CREATE TABLE agentic_decision_outbox (
@@ -700,6 +888,14 @@ CREATE TABLE agentic_decision_outbox (
   UNIQUE (account_id, commit_sequence, outbox_id),
   CHECK (commit_sequence >= 0)
 ) PARTITION BY HASH (account_id);
+
+CREATE INDEX agentic_decision_outbox_unpublished_idx
+  ON agentic_decision_outbox (
+    account_id,
+    commit_sequence,
+    outbox_id
+  )
+  WHERE published_at IS NULL;
 ```
 
 Production DDL must add composite foreign keys from evidence, snapshot, policy,
@@ -714,36 +910,104 @@ the GraphQL argument before planning. Database roles use row-level security as a
 boundary:
 
 ```sql
+ALTER TABLE agentic_decision_idempotency_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_receipts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_dependencies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agentic_decision_procedure_refs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agentic_decision_visibility_checkpoints ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_dependency_heads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_reuse_evaluations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agentic_decision_reuse_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_templates ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_perception_cards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_revalidation_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agentic_decision_audit_heads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agentic_decision_outbox ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY tenant_receipts ON agentic_decision_receipts
+CREATE POLICY tenant_isolation ON agentic_decision_idempotency_records
   USING (account_id = current_setting('monday.account_id')::bigint)
   WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
 
-CREATE POLICY tenant_dependencies ON agentic_decision_dependencies
+CREATE POLICY tenant_isolation ON agentic_decision_receipts
   USING (account_id = current_setting('monday.account_id')::bigint)
   WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
 
-CREATE POLICY tenant_heads ON agentic_dependency_heads
+CREATE POLICY tenant_isolation ON agentic_decision_dependencies
   USING (account_id = current_setting('monday.account_id')::bigint)
   WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
 
--- Apply the identical account policy to every remaining table. Production roles
--- must not own these tables and must not have BYPASSRLS.
+CREATE POLICY tenant_isolation ON agentic_decision_procedure_refs
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_visibility_checkpoints
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_dependency_heads
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_reuse_evaluations
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_reuse_observations
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_templates
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_perception_cards
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_outcomes
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_revalidation_jobs
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_audit_events
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_audit_heads
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
+
+CREATE POLICY tenant_isolation ON agentic_decision_outbox
+  USING (account_id = current_setting('monday.account_id')::bigint)
+  WITH CHECK (account_id = current_setting('monday.account_id')::bigint);
 ```
 
 The query compiler rejects a statement unless its normalized predicate contains
 `account_id = :authenticated_account_id`. RLS is defense in depth, not a replacement
-for tenant-leading plans.
+for tenant-leading plans. Production roles do not own these tables and do not have
+`BYPASSRLS`.
+
+### Consistency checkpoint and release fence
+
+The tenant control cell issues a signed visibility checkpoint only after its quorum has
+applied source commits, dependency heads, policy, authorization, and revocation
+prefixes through the checkpoint sequence. A reuse evaluation reads all of those
+authorities from one MVCC snapshot at that checkpoint. If a client supplies a minimum
+checkpoint token for read-your-writes, the service may advance it but never select an
+older checkpoint.
+
+The evaluation commit is the linearization point for ordinary source changes. A
+subsequent edit does not retroactively change a read that already linearized. Safety
+revocations are stricter: any result capability carries the checkpoint and
+`revocation_fence_epoch`, and the encrypted artifact service compares that epoch with
+its linearizable revocation head immediately before release. A concurrent fetch and
+revocation therefore orders before or after the revocation; it cannot silently use an
+old evaluation after the fence closes.
 
 ## Deterministic lifecycle
 
@@ -758,12 +1022,18 @@ for tenant-leading plans.
 5. Deduplicate dependencies by `(kind, id)`, sort by that tuple, and reject more than
    128 dependencies.
 6. Verify every dependency belongs to the same account and is visible at the snapshot.
-7. Hash the ordered dependency set, result schema, encrypted result reference, result,
+7. Hash the ordered dependency set, result schema, tenant-bound encrypted result
+   artifact, result,
    explanation, and model artifacts.
-8. In one serializable row-store transaction, insert the receipt, dependency rows,
-   audit event, and outbox event. A repeated `(account_id, request_id)` must return the
-   same receipt or an idempotency conflict.
+8. In one serializable row-store transaction, insert the receipt, dependency and
+   procedure-reference rows, sharded audit event/head, idempotency tuple, and outbox
+   event.
 9. Asynchronously create a redacted perception card from policy-approved fields.
+
+The idempotency tuple is `(account_id, operation, principal_id, idempotency_key,
+canonical_request_hash, response_id)`. A retry with the same key and hash returns the
+same response. The same key with a different hash is rejected; uniqueness alone is not
+treated as sufficient idempotency.
 
 The LLM's chain-of-thought is not required and should not be stored. The receipt keeps
 structured evidence references, the disclosed explanation hash, and the final result
@@ -773,17 +1043,23 @@ hash needed for replay without retaining hidden reasoning or sensitive prompt co
 
 The release path is exact and bounded:
 
-1. Read the receipt by `(account_id, decision_id)`.
-2. Verify `expected_intent_hash`, purpose compatibility, expiry, source visibility
-   epoch, and the request's idempotency key.
-3. Re-evaluate current authorization for the new principal. Never copy the receipt's
-   old authorization result.
-4. Read at most 128 dependencies from
+1. Authenticate the account and obtain a signed tenant visibility checkpoint no older
+   than the optional minimum supplied by the caller.
+2. At one checkpoint-bound MVCC snapshot, read the receipt by
+   `(account_id, decision_id)`.
+3. Verify `expected_intent_hash`, purpose compatibility, expiry, source visibility
+   epoch, and the request's idempotency tuple.
+4. Resolve the authoritative current policy and re-evaluate authorization for the new
+   principal at the same checkpoint. Never trust a caller's policy version or copy the
+   receipt's old authorization result.
+5. Read at most 128 dependencies from
    `agentic_decision_dependencies` and batch-read their current rows from
    `agentic_dependency_heads` by full composite keys.
-5. Canonically sort the observations and compute `observed_dependency_head_root`.
-6. Compare required captured hashes and visibility epochs with current heads.
-7. Apply the deterministic decision table:
+6. Require every head's authority checkpoint sequence to be covered by the signed
+   checkpoint. Canonically sort and persist the observations, then compute
+   `observed_dependency_head_root`.
+7. Compare required captured hashes and visibility epochs with current heads.
+8. Apply the deterministic decision table:
 
 | Condition | Result |
 | --- | --- |
@@ -795,8 +1071,14 @@ The release path is exact and bounded:
 | Tool/mutation plan, all checks pass, plan reuse allowed | `REUSE_PLAN_ONLY` |
 | Tool/mutation plan, plan reuse not allowed | `RECOMPUTE` |
 
-8. Persist the evaluation and audit event before releasing the result reference.
-9. For `REUSE_PLAN_ONLY`, issue no side effect. Submit the plan to fresh policy,
+9. In one control-cell transaction, persist the evaluation, exact observation rows,
+   retained authorization attestation hash, audit event/head, idempotency tuple, and
+   outbox event.
+10. If eligible, mint a short-lived release capability bound to the account, principal,
+    purpose, evaluation, checkpoint, artifact, and revocation fence. The artifact
+    service validates it immediately before fetch. Historical evaluation reads never
+    return this capability.
+11. For `REUSE_PLAN_ONLY`, issue no side effect. Submit the plan to fresh policy,
    neighbor-impact, budget, tool-lease, and transaction-intent preflight.
 
 The engine does not recursively look for another reusable receipt when this evaluation
@@ -805,10 +1087,36 @@ envelope carries a reuse depth of zero.
 
 ### 3. React to dependency changes
 
-Source transactions update their exact dependency head and append an outbox event.
-Consumers may use the reverse dependency index to enqueue proactive revalidation, but
-they must page by `(account_id, dependency_kind, dependency_id, decision_id)` and obey
-per-tenant budgets.
+For row-store facts, the authoritative source mutation, exact dependency-head advance,
+audit event, and outbox event commit in the same ACID transaction. For columnar,
+vector, procedure, policy, contract, and capability artifacts, the head advances in
+the tenant control cell only after the immutable artifact is sealed and the coordinator
+has committed its visibility record. An asynchronous consumer may request publication
+but cannot authoritatively advance a head.
+
+Head updates use compare-and-set:
+
+```sql
+UPDATE agentic_dependency_heads
+SET current_version = :version,
+    current_version_hash = :version_hash,
+    visibility_epoch = :visibility_epoch,
+    revoked = :revoked,
+    observed_at_sequence = :sequence,
+    authority_checkpoint_sequence = :checkpoint_sequence,
+    updated_at = :updated_at
+WHERE account_id = :account_id
+  AND dependency_kind = :dependency_kind
+  AND dependency_id = :dependency_id
+  AND observed_at_sequence < :sequence;
+```
+
+Zero updated rows means duplicate, stale, or conflicting publication and must be
+resolved against the stored hash; a `CHECK` constraint alone does not prove monotonic
+updates. Consumers may use the reverse dependency index to enqueue proactive
+revalidation, but they page by
+`(account_id, dependency_kind, dependency_id, decision_id)` and obey per-tenant
+budgets.
 
 Synchronous writes never update every dependent receipt. That would turn one board
 change into an unbounded invalidation transaction. Correctness instead comes from the
@@ -837,17 +1145,26 @@ Decision search is useful when an agent asks, “Have we handled a similar escal
 It is not an eligibility mechanism.
 
 1. The embedding pipeline consumes only the policy-approved perception-card projection.
-2. Each vector artifact is sealed for one account bucket, embedding model version, and
-   manifest generation. Cross-account HNSW graphs are forbidden.
-3. The router requires exact `account_id`, model version, purpose, source type, and
-   freshness metadata before ANN traversal.
-4. `topK <= 50`, `maxCandidates <= 500`, and `efSearch <= 256`.
-5. Results include an ordered candidate attestation hash and the vector manifest hash.
-6. Underfilled ANN results remain underfilled. The engine does not scan receipt text or
+2. The SQL hash partition is staging storage, not a shared ANN graph. The vector
+   publisher builds a sealed HNSW object for exactly one `account_id`, embedding model
+   version, and manifest generation. Small accounts may share hosts, but never a graph
+   object, access key, cache namespace, or candidate list.
+3. The query uses a server-minted embedding reference scoped by `(account_id,
+   embedding_id, embedding_hash)`. A hash alone is not accepted as a query vector.
+4. The router authenticates the exact account and model before ANN traversal. Purpose
+   and object visibility are checked against a strongly consistent sidecar for each
+   bounded candidate before any card is returned. Sensitive purpose domains may use
+   separate per-account graph objects; the system never relies on a stale
+   `allowed_purpose_ids` array as authorization.
+5. `topK <= 50`, `maxCandidates <= 500`, and `efSearch <= 256`.
+6. Results include an ordered candidate attestation hash, per-candidate policy decision
+   hashes, and the vector manifest hash. Rejected candidates are omitted, not exposed
+   with redacted fields.
+7. Underfilled ANN results remain underfilled. The engine does not scan receipt text or
    compute exact distance over all vectors.
-7. Every receipt candidate must pass exact intent, authorization, and dependency
+8. Every receipt candidate must pass exact intent, authorization, and dependency
    revalidation before a result can be reused.
-8. Every template candidate must pass exact status, purpose, precondition-contract,
+9. Every template candidate must pass exact status, purpose, precondition-contract,
    capability, and budget checks before its instructions are exposed.
 
 HNSW traversal can change when a graph is rebuilt. Auditability therefore binds the
@@ -881,9 +1198,33 @@ enum AgenticReuseDecision {
   REJECT
 }
 
+enum AgenticReuseReason {
+  ELIGIBLE
+  DEPENDENCY_CHANGED
+  DEPENDENCY_REVOKED
+  DEPENDENCY_MISSING
+  POLICY_CHANGED
+  PRINCIPAL_NOT_AUTHORIZED
+  PURPOSE_MISMATCH
+  PROCEDURE_RETIRED
+  SOURCE_VISIBILITY_CHANGED
+  RESULT_EXPIRED
+  ACTION_REQUIRES_FRESH_PREFLIGHT
+  DEPENDENCY_LIMIT_EXCEEDED
+  BUDGET_EXHAUSTED
+  RECURSIVE_REUSE_FORBIDDEN
+}
+
 enum AgenticDecisionSourceType {
   DECISION_RECEIPT
   DECISION_TEMPLATE
+}
+
+enum AgenticDecisionTemplateStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+  REVOKED
 }
 
 input AgenticObjectRefInput {
@@ -914,24 +1255,33 @@ input AgenticDecisionDependencyInput {
   evidenceItemId: ID
 }
 
+input AgenticDecisionProcedureRefInput {
+  accountId: AccountID!
+  procedureId: ID!
+  procedureVersion: String!
+  artifactHash: Hash!
+}
+
 input RecordAgenticDecisionInput {
   accountId: AccountID!
   requestId: ID!
   principalId: ID!
   purposeId: ID!
   decisionClass: AgenticDecisionClass!
+  decisionType: String!
   intent: AgenticDecisionIntentInput!
   temporalSnapshotToken: String!
-  policyVersion: String!
-  procedureArtifactHashes: [Hash!]!
+  expectedPolicyVersion: String!
+  procedureRefs: [AgenticDecisionProcedureRefInput!]!
   dependencies: [AgenticDecisionDependencyInput!]!
   resultSchemaId: ID!
-  encryptedResultRef: String!
+  encryptedResultArtifactId: ID!
   resultHash: Hash!
   explanationHash: Hash
   modelArtifactHashes: [Hash!]!
   expiresAt: DateTime
   idempotencyKey: String!
+  canonicalRequestHash: Hash!
 }
 
 input AgenticReuseBudgetInput {
@@ -950,6 +1300,7 @@ input EvaluateAgenticDecisionReuseInput {
   purposeId: ID!
   decisionId: ID!
   expectedIntentHash: Hash!
+  minimumVisibilityCheckpointToken: String
   allowPlanTemplateReuse: Boolean!
   budget: AgenticReuseBudgetInput!
   idempotencyKey: String!
@@ -964,12 +1315,40 @@ input SearchAgenticDecisionsInput {
   sourceTypes: [AgenticDecisionSourceType!]!
   decisionTypes: [String!]!
   embeddingModelVersion: String!
+  queryEmbeddingId: ID!
   queryEmbeddingHash: Hash!
   topK: Int!
   maxCandidates: Int!
   efSearch: Int!
   timeoutMs: Int!
   metadataFilterHash: Hash!
+}
+
+input RegisterAgenticDecisionTemplateInput {
+  accountId: AccountID!
+  requestId: ID!
+  principalId: ID!
+  templateId: ID!
+  templateVersion: String!
+  decisionType: String!
+  instructions: JSON!
+  preconditionContractId: ID!
+  allowedPurposeIds: [ID!]!
+  requiredCapabilityIds: [ID!]!
+  maximumBudget: AgenticReuseBudgetInput!
+  outputSchemaId: ID!
+  status: AgenticDecisionTemplateStatus!
+  artifactHash: Hash!
+  supersedesTemplateVersion: String
+  idempotencyKey: String!
+  canonicalRequestHash: Hash!
+}
+
+type AgenticDecisionProcedureRef {
+  accountId: AccountID!
+  procedureId: ID!
+  procedureVersion: String!
+  artifactHash: Hash!
 }
 
 type AgenticDecisionReceipt {
@@ -984,6 +1363,7 @@ type AgenticDecisionReceipt {
   temporalSnapshotId: ID!
   temporalSnapshotHash: Hash!
   policyVersion: String!
+  procedureRefs: [AgenticDecisionProcedureRef!]!
   resultSchemaId: ID!
   resultHash: Hash!
   explanationHash: Hash
@@ -1007,12 +1387,13 @@ type AgenticDecisionReuseEvaluation {
   requestId: ID!
   decisionId: ID!
   decision: AgenticReuseDecision!
-  reasonCodes: [String!]!
+  reasonCodes: [AgenticReuseReason!]!
   observedDependencyHeadRoot: Hash!
+  visibilityCheckpointId: ID!
+  visibilityCheckpointHash: Hash!
   currentPolicyVersion: String!
   currentAuthorizationDecisionHash: Hash!
-  resultRef: String
-  planTemplateRef: String
+  authorizationAttestationHash: Hash!
   freshPreflightRequired: Boolean!
   consumed: AgenticReuseConsumption!
   auditEventId: ID!
@@ -1046,6 +1427,7 @@ type AgenticDecisionSearchCandidate {
   distance: Float!
   discoveryOnly: Boolean!
   exactEligibilityCheckRequired: Boolean!
+  candidatePolicyDecisionHash: Hash!
   candidateAttestationHash: Hash!
 }
 
@@ -1063,6 +1445,37 @@ type AgenticDecisionMutationPayload {
   auditEventId: ID!
 }
 
+type AgenticDecisionReusePayload {
+  evaluation: AgenticDecisionReuseEvaluation!
+  releaseCapability: String
+  releaseCapabilityExpiresAt: DateTime
+  releaseKind: String
+}
+
+type AgenticDecisionTemplate {
+  accountId: AccountID!
+  templateId: ID!
+  templateVersion: String!
+  decisionType: String!
+  instructions: JSON!
+  preconditionContractId: ID!
+  allowedPurposeIds: [ID!]!
+  requiredCapabilityIds: [ID!]!
+  maximumBudget: JSON!
+  outputSchemaId: ID!
+  status: AgenticDecisionTemplateStatus!
+  artifactHash: Hash!
+  supersedesTemplateVersion: String
+  createdAt: DateTime!
+}
+
+type AgenticDecisionTemplateMutationPayload {
+  template: AgenticDecisionTemplate
+  accepted: Boolean!
+  reasonCodes: [String!]!
+  auditEventId: ID!
+}
+
 extend type Query {
   agenticDecision(
     accountId: AccountID!
@@ -1073,6 +1486,14 @@ extend type Query {
     accountId: AccountID!
     evaluationId: ID!
   ): AgenticDecisionReuseEvaluation
+
+  agenticDecisionTemplate(
+    accountId: AccountID!
+    principalId: ID!
+    purposeId: ID!
+    templateId: ID!
+    templateVersion: String!
+  ): AgenticDecisionTemplate
 
   searchAgenticDecisions(
     input: SearchAgenticDecisionsInput!
@@ -1086,16 +1507,26 @@ extend type Mutation {
 
   evaluateAgenticDecisionReuse(
     input: EvaluateAgenticDecisionReuseInput!
-  ): AgenticDecisionReuseEvaluation!
+  ): AgenticDecisionReusePayload!
+
+  registerAgenticDecisionTemplate(
+    input: RegisterAgenticDecisionTemplateInput!
+  ): AgenticDecisionTemplateMutationPayload!
 }
 ```
 
-Receipt lookup intentionally omits the encrypted result reference. Result release is
-available only through `evaluateAgenticDecisionReuse`; otherwise an API client could
-bypass current authorization and dependency checks by reading an old receipt directly.
+Receipt and historical evaluation lookups intentionally omit result references.
+`evaluateAgenticDecisionReuse` may return only a short-lived, principal-, purpose-,
+account-, checkpoint-, and revocation-fence-bound release capability. The encrypted
+artifact service rechecks the capability and current revocation fence at fetch time.
+It never accepts an evaluation ID as authority. This prevents an API client from
+bypassing current authorization and dependency checks by reading old metadata.
 The reuse input also omits a claimed “current” policy version: the service resolves the
 authoritative version after authenticating the account, so a caller cannot pin an old
 policy to make a stale receipt appear eligible.
+`encryptedResultArtifactId` and `queryEmbeddingId` must be server-minted handles whose
+owning artifact rows have composite `(account_id, artifact_id)` keys. The gateway
+rejects a handle whose account differs before any blob or vector service call.
 Outcome registration should use the existing typed event-ingestion API so callers
 cannot invent an outcome without an auditable source event.
 
@@ -1144,6 +1575,10 @@ another tenant's reserved interactive capacity.
   fallback.
 - Proactive invalidation: cursor pagination through the reverse dependency index under
   a background tenant budget.
+- Unpublished outbox work: partial index on
+  `(account_id, commit_sequence, outbox_id) WHERE published_at IS NULL`.
+- Audit append: point compare-and-swap on `(account_id, audit_shard)` followed by an
+  account- and shard-leading event insert.
 - Broad outcome analytics: admitted columnar query over partition-pruned data, never
   interactive row-store aggregation.
 
@@ -1185,6 +1620,19 @@ dependency-head observations, policy version, purpose, budget, decision table ve
 and evaluation hash. It can prove why reuse was allowed or denied without asking the
 model to reproduce its reasoning.
 
+Exact observation rows remain in the row store for the enterprise replay window. The
+retained, tenant-bound attestation artifact contains the signed authorization inputs,
+checkpoint, normalized request, budget, dependency observations, and decision-table
+version. The audit event stores its artifact ID and hash, so archival of row details
+does not break proof verification.
+
+Audit appends cannot race on a shared predecessor. A stable hash of the aggregate ID
+selects one of 64 tenant audit shards. The transaction locks or compare-and-swaps
+`agentic_decision_audit_heads`, inserts exactly the next sequence with the previous
+head hash, and advances the head. The unique sequence and predecessor indexes reject a
+fork. Signed periodic Merkle checkpoints combine the 64 shard heads into one tenant
+audit root; external audit export consumes the transactional outbox asynchronously.
+
 Mutable HNSW traversal is not replayed as though it were deterministic. Semantic audit
 stores the sealed graph artifact hash and signed ordered candidate attestation. A
 different graph generation is a new search, not a replay.
@@ -1193,25 +1641,30 @@ different graph generation is a new search, not a replay.
 
 - Receipt commits use the strongly consistent row path. Perception cards, embeddings,
   columnar outcomes, and proactive revalidation are asynchronous derived layers.
-- A receipt is durable only when receipt, dependencies, audit event, and outbox record
-  commit together.
+- A receipt is durable only when receipt, dependencies, procedure references,
+  idempotency tuple, local audit event/head, and outbox record commit together.
 - A dependency-head update is monotonic by `observed_at_sequence`; stale consumers
   cannot restore an older head.
-- If current authorization, a required dependency head, or the audit sink is
-  unavailable, reuse fails closed. An old result is never returned “for availability.”
+- If current authorization, a required dependency head, checkpoint quorum, local audit
+  commit, or result-fence check is unavailable, reuse fails closed. An old result is
+  never returned “for availability.” External audit export is not synchronous.
 - If vector search is unavailable, exact receipt lookup and exact reuse evaluation
   remain available. The API returns a typed vector-layer omission.
 - If the proactive queue is delayed, release-time checks remain correct. Only the
   probability of a fast successful reuse decreases.
 - Encrypted result retention may be shorter than receipt retention. An expired result
-  reference yields `RECOMPUTE`; the hash-only receipt remains auditable.
+  artifact yields `RECOMPUTE`; the hash-only receipt remains auditable.
 - Multi-region reads must observe a signed dependency-head checkpoint at least as new
   as the request's required visibility epoch. A lagging region returns
   `SOURCE_VISIBILITY_CHANGED` or retries within the bounded timeout.
 
-This design protects the 99.99% availability target by keeping exact operational paths
-independent of vector and columnar layers, while refusing to trade correctness or
-tenant isolation for stale-result availability.
+Exact reuse runs inside the tenant's multi-AZ control cell: row data, dependency heads,
+policy snapshots, authorization snapshots, local audit, and revocation fences use
+quorum replication and bounded failover. Vector, columnar, proactive queue, and
+external audit-export outages are outside this synchronous path. Before general
+availability, mondayDB must allocate the 99.99% error budget across every synchronous
+dependency and prove the composed SLI with fault injection; this design reduces the
+dependency set but does not claim that a schema alone guarantees the SLO.
 
 ## Rollout sequence
 
