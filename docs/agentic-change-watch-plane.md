@@ -328,7 +328,6 @@ interface SemanticContextRequest extends TenantScope {
   watchId: string;
   deltaId: string;
   pullReceiptToken: string;
-  causationCapabilityToken?: string;
   queryText: string;
   embeddingModelId: string;
   embeddingManifestVersion: string;
@@ -414,9 +413,9 @@ tenant-scoped grant; it is never inferred from account membership.
 Reaction lineage is not accepted as caller-authored JSON. If
 `causationCapabilityToken` is absent, the server creates a root causation at depth
 zero. If present, it verifies the signed token, point-reads the server-side causation
-record, and derives root, parent, depth, and recent lineage hashes. The same rule
-applies to semantic context retrieval. Forged or expired capabilities fail before
-downstream work.
+record, and derives root, parent, depth, and recent lineage hashes. Semantic context is
+different: its lineage is always derived from the delivered delta and can never start a
+new root. Forged or expired capabilities fail before downstream work.
 
 ## SQL row-store schema
 
@@ -806,6 +805,47 @@ CREATE INDEX agent_change_pull_request_lease_idx
     (account_id, request_state, lease_expires_at, request_id)
   WHERE request_state = 'PROCESSING';
 
+CREATE TABLE agent_change_context_request (
+  account_id BIGINT NOT NULL,
+  request_id UUID NOT NULL,
+  requested_watch_id UUID NOT NULL,
+  requested_delta_id UUID NOT NULL,
+  authenticated_principal_id UUID NOT NULL,
+  requested_purpose_id UUID NOT NULL,
+  request_payload_hash TEXT NOT NULL,
+  request_state TEXT NOT NULL CHECK (request_state IN ('PROCESSING', 'COMPLETE')),
+  terminal_decision TEXT,
+  reason_codes TEXT[] NOT NULL DEFAULT '{}',
+  encrypted_response_artifact_id UUID,
+  response_hash TEXT,
+  lease_owner TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  completed_at TIMESTAMPTZ,
+  PRIMARY KEY (account_id, request_id),
+  CHECK (
+    (
+      request_state = 'PROCESSING'
+      AND terminal_decision IS NULL
+      AND encrypted_response_artifact_id IS NULL
+      AND response_hash IS NULL
+      AND completed_at IS NULL
+    )
+    OR (
+      request_state = 'COMPLETE'
+      AND terminal_decision IS NOT NULL
+      AND encrypted_response_artifact_id IS NOT NULL
+      AND response_hash IS NOT NULL
+      AND completed_at IS NOT NULL
+    )
+  )
+);
+
+CREATE INDEX agent_change_context_request_lease_idx
+  ON agent_change_context_request
+    (account_id, request_state, lease_expires_at, request_id)
+  WHERE request_state = 'PROCESSING';
+
 CREATE TABLE agent_change_procedure_binding (
   account_id BIGINT NOT NULL,
   watch_id UUID NOT NULL,
@@ -914,8 +954,7 @@ CREATE TABLE agent_change_audit_event (
     previous_audit_sequence,
     previous_event_hash
   ) REFERENCES agent_change_audit_event
-      (account_id, audit_shard, audit_sequence, event_hash)
-      MATCH FULL,
+      (account_id, audit_shard, audit_sequence, event_hash),
   CHECK (
     (
       audit_sequence = 0
@@ -1019,6 +1058,7 @@ ALTER TABLE agent_change_delta ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_watch_cursor ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_pull_receipt ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_pull_request ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_context_request ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_procedure_binding ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_hint_work ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_webhook_hint_state ENABLE ROW LEVEL SECURITY;
@@ -1039,6 +1079,7 @@ ALTER TABLE agent_change_delta FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_watch_cursor FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_pull_receipt FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_pull_request FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_context_request FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_procedure_binding FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_hint_work FORCE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_webhook_hint_state FORCE ROW LEVEL SECURITY;
@@ -1091,6 +1132,10 @@ CREATE POLICY agent_change_receipt_tenant_policy ON agent_change_pull_receipt
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
 
 CREATE POLICY agent_change_pull_request_tenant_policy ON agent_change_pull_request
+  USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
+  WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
+
+CREATE POLICY agent_change_context_request_tenant_policy ON agent_change_context_request
   USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
 
@@ -1609,7 +1654,6 @@ input AgentChangeContextInput {
   watchId: ID!
   deltaId: ID!
   pullReceiptToken: String!
-  causationCapabilityToken: String
   queryText: String!
   embeddingModelId: String!
   embeddingManifestVersion: String!
@@ -1646,10 +1690,6 @@ type Query {
     purposeId: ID!
     watchId: ID!
   ): AgentChangeWatch
-
-  agentChangeContext(
-    input: AgentChangeContextInput!
-  ): AgentChangeContextPayload!
 }
 
 type Mutation {
@@ -1660,6 +1700,10 @@ type Mutation {
   pullAgentChangeDeltas(
     input: PullAgentChangeDeltasInput!
   ): PullAgentChangeDeltasPayload!
+
+  agentChangeContext(
+    input: AgentChangeContextInput!
+  ): AgentChangeContextPayload!
 
   acknowledgeAgentChangeDeltas(
     input: AcknowledgeAgentChangeDeltasInput!
@@ -1725,9 +1769,11 @@ Change matching is never semantic. After deterministic delivery, an agent can re
 bounded context for one delta:
 
 1. validate the watch and pull receipt against the current principal and purpose;
-2. verify from the receipt's delta-set hash that this exact delta was delivered;
+2. decrypt the receipt's bounded canonical response artifact, recompute its
+   `delta_set_hash`, and verify that this exact delta ID and event hash were delivered;
 3. point-read the delta by `(account_id, delta_id)` and re-check current visibility;
-4. derive reaction lineage from the optional signed causation capability;
+4. derive the same root causation from the delta, set the delta as parent, increment
+   its server-recorded depth, and reject depth/lineage loops;
 5. verify the requested sealed embedding manifest and account-owned segment set;
 6. mint the query embedding server-side from redaction-safe text;
 7. search at most four deterministically routed HNSW segments;
@@ -1735,6 +1781,13 @@ bounded context for one delta:
 9. post-filter every candidate against authoritative current visibility;
 10. return an underfilled result rather than cross segments or exact-scan fallback; and
 11. record receipt, lineage, manifest, plan, candidate, visibility, and result hashes.
+
+Before watch or delta lookup, the mutation claims
+`agent_change_context_request` by `(account_id, request_id)` and payload hash. Every
+success, denial, throttle, underfill, and vector failure persists one encrypted
+canonical response. Retries return that response while its authorization checkpoint is
+valid; payload mismatch is an idempotency conflict. This bounds duplicate ANN cost and
+produces one logical audit outcome under gateway retries.
 
 Embeddings may cover redacted perception cards, board schema metadata, procedure
 descriptions, and semantic memory. They do not include raw restricted values or opaque
