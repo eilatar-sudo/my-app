@@ -38,7 +38,8 @@ whether the watch fired.
 - **Explicit consistency:** row commit is synchronous; delta projection is
   asynchronous. Every response reports source and projected watermarks and lag.
 - **At-least-once delivery:** retries may repeat a delta. Stable `delta_id`,
-  `event_hash`, and pull receipts make consumer handling idempotent.
+  `event_hash`, persisted idempotent responses, and pull receipts make consumer
+  handling deterministic.
 - **No false global order:** ordering is monotonic only within
   `(account_id, board_id)`. Version 1 gives each watch exactly one board.
 - **Fresh authorization:** registration permission does not grant perpetual access.
@@ -62,15 +63,18 @@ watermark; it does not backfill board history by default.
 
 A **source event** is the immutable, transaction-coupled record that a board object
 changed. It contains typed object and column identifiers, source versions, origin
-metadata, and encrypted payload references. It does not contain embeddings.
+metadata, the immutable classification/redaction schema references observed by the
+transaction, and encrypted payload references. It does not contain embeddings.
 
 A **change delta** is a canonical projection of one source event. It contains bounded
-metadata, changed-field descriptors, current classification labels, semantic journal
+metadata, changed-field descriptors, source-time classification labels, semantic journal
 pointers, and hashes. Sensitive values remain in separately authorized artifacts.
 
 A **watch cursor** is the last acknowledged board change sequence for one watch
-generation. The sequence is allocated by the authoritative row-store partition in
-commit order. Gaps are valid; reuse and reordering are not.
+generation. The sequence is allocated at the board partition's serialization point.
+The board-local allocator lock is held until commit or abort, so a later sequence
+cannot become visible before an earlier committed sequence. Aborted transactions do
+not publish source events. Ordering is serialization order, not wall-clock order.
 
 A **pull receipt** seals the exact sequence range, delta IDs, policy version,
 visibility checkpoint, packet hash, and expiration returned by one pull. An
@@ -86,7 +90,8 @@ Version 1 supports:
 - one board per watch;
 - `ALL_ITEMS` or at most 256 exact item IDs;
 - at most 32 projected column IDs and 16 event kinds;
-- start at `NOW` or replay from a still-retained, server-issued cursor;
+- new registration at an atomically captured `NOW` source watermark;
+- continued pull from an existing watch's still-retained cursor;
 - pull packets of at most 500 deltas and 1 MiB;
 - monotonic compare-and-set acknowledgement;
 - pause, resume, and generation-fenced scope replacement;
@@ -98,7 +103,7 @@ Version 1 rejects:
 
 - account-wide and multi-board watches;
 - view, formula, natural-language, regex, vector, or arbitrary JSON trigger predicates;
-- unbounded historical replay;
+- new-watch historical replay or unbounded existing-watch replay;
 - raw database log sequence numbers as an API contract;
 - exact vector fallback scans;
 - synchronous embedding generation in a source transaction;
@@ -155,6 +160,7 @@ interface AgentChangeWatchScope {
 
 interface WatchDeliveryBudget {
   maxDeltasPerPull: number;
+  maxEventsExamined: number;
   maxPacketBytes: DecimalString;
   maxReplayEvents: DecimalString;
   maxProjectedColumns: number;
@@ -204,10 +210,11 @@ interface AgentChangeDelta {
   sourceEventId: string;
   boardId: string;
   boardChangeSequence: DecimalString;
-  commitTimestamp: IsoTimestamp;
+  recordedAt: IsoTimestamp;
   eventKind: ChangeEventKind;
   objectType: "BOARD" | "ITEM" | "COLUMN";
   objectId: string;
+  subjectItemId?: string;
   objectVersion: DecimalString;
   changedFields: ChangedFieldDescriptor[];
   origin: ChangeOrigin;
@@ -253,6 +260,7 @@ interface PullChangeDeltasRequest extends TenantScope {
   watchId: string;
   cursorToken: string;
   limit: number;
+  maxEventsExamined: number;
   maxPacketBytes: DecimalString;
   expectedWatchGeneration: DecimalString;
   reactionContext?: {
@@ -261,6 +269,9 @@ interface PullChangeDeltasRequest extends TenantScope {
     reactionDepth: number;
     recentLineageHashes: string[];
   };
+  consistency:
+    | { mode: "PROJECTED" }
+    | { mode: "AT_LEAST_SEQUENCE"; sequence: DecimalString };
 }
 
 type PullDecision =
@@ -282,8 +293,7 @@ interface PullChangeDeltasResult {
   deltas: AgentChangeDelta[];
   perceptionCards: ChangePerceptionCard[];
   pullReceiptToken?: string;
-  nextCursorToken?: string;
-  deliveredThroughSequence: DecimalString;
+  scannedThroughSequence: DecimalString;
   sourceWatermark: DecimalString;
   projectedWatermark: DecimalString;
   projectionLagEvents: DecimalString;
@@ -337,6 +347,7 @@ interface SemanticContextRequest extends TenantScope {
 interface AuthContext {
   accountId: string;
   principalId: string;
+  authorizedPurposeIds: readonly string[];
   policyVersion: string;
   visibilityEpoch: string;
 }
@@ -347,6 +358,9 @@ function assertTenantScope(input: TenantScope, auth: AuthContext): void {
   }
   if (input.principalId !== auth.principalId) {
     throw new Error("PRINCIPAL_SCOPE_MISMATCH");
+  }
+  if (!auth.authorizedPurposeIds.includes(input.purposeId)) {
+    throw new Error("PURPOSE_NOT_AUTHORIZED");
   }
 }
 
@@ -360,11 +374,21 @@ function validatePullBounds(
   if (input.limit > Math.min(policy.maxDeltasPerPull, 500)) {
     throw new Error("DELTA_LIMIT_EXCEEDED");
   }
-  if (BigInt(input.maxPacketBytes) > BigInt(policy.maxPacketBytes)) {
+  if (
+    !Number.isInteger(input.maxEventsExamined) ||
+    input.maxEventsExamined < input.limit ||
+    input.maxEventsExamined > Math.min(policy.maxEventsExamined, 2000)
+  ) {
+    throw new Error("EVENT_SCAN_LIMIT_EXCEEDED");
+  }
+  if (
+    !/^[1-9][0-9]*$/.test(input.maxPacketBytes) ||
+    BigInt(input.maxPacketBytes) > BigInt(policy.maxPacketBytes)
+  ) {
     throw new Error("PACKET_BUDGET_EXCEEDED");
   }
   const depth = input.reactionContext?.reactionDepth ?? 0;
-  if (depth > policy.maxReactionDepth) {
+  if (!Number.isInteger(depth) || depth < 0 || depth > policy.maxReactionDepth) {
     throw new Error("REACTION_DEPTH_EXCEEDED");
   }
   if ((input.reactionContext?.recentLineageHashes.length ?? 0) > 32) {
@@ -375,13 +399,19 @@ function validatePullBounds(
 
 These examples are defense in depth. The storage adapter must still bind
 `account_id = auth.accountId` in every statement; validating an object once is not a
-substitute for tenant-leading SQL predicates and row-level security.
+substitute for tenant-leading SQL predicates and row-level security. Version 1 permits
+only the owning principal to pull a watch: after the point read, the resolver must also
+verify `watch.ownerPrincipalId === auth.principalId` and
+`watch.purposeId === input.purposeId`. Delegation requires a future explicit,
+tenant-scoped grant; it is never inferred from account membership.
 
 ## SQL row-store schema
 
 The SQL is illustrative PostgreSQL. Production mondayDB may map the same logical
 contracts to its hybrid row store. UUIDs are server-minted. Artifact payloads are
-encrypted and stored separately from searchable metadata.
+encrypted and stored separately from searchable metadata. The `vector` extension is
+provisioned by infrastructure before this migration; API roles cannot create
+extensions.
 
 ```sql
 CREATE TYPE agent_watch_status AS ENUM (
@@ -498,14 +528,18 @@ CREATE TABLE agent_change_source_outbox (
   board_change_sequence BIGINT NOT NULL CHECK (board_change_sequence > 0),
   source_event_id UUID NOT NULL,
   source_transaction_id UUID NOT NULL,
-  commit_timestamp TIMESTAMPTZ NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL,
   event_kind agent_change_event_kind NOT NULL,
   object_type TEXT NOT NULL CHECK (object_type IN ('BOARD', 'ITEM', 'COLUMN')),
   object_id BIGINT NOT NULL,
+  subject_item_id BIGINT,
   object_version BIGINT NOT NULL CHECK (object_version > 0),
   changed_column_ids BIGINT[] NOT NULL DEFAULT '{}',
   encrypted_payload_artifact_id UUID,
   payload_hash TEXT NOT NULL,
+  classification_snapshot_id UUID NOT NULL,
+  redaction_schema_version TEXT NOT NULL,
+  canonicalization_version TEXT NOT NULL,
   origin_kind agent_change_origin_kind NOT NULL,
   origin_principal_id UUID,
   origin_agent_id UUID,
@@ -530,10 +564,13 @@ CREATE TABLE agent_change_projection_checkpoint (
   board_id BIGINT NOT NULL,
   projected_through_sequence BIGINT NOT NULL CHECK (projected_through_sequence >= 0),
   source_watermark BIGINT NOT NULL CHECK (source_watermark >= 0),
+  retained_from_sequence BIGINT NOT NULL CHECK (retained_from_sequence >= 0),
   projector_version TEXT NOT NULL,
   checkpoint_hash TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (account_id, board_id)
+  PRIMARY KEY (account_id, board_id),
+  CHECK (retained_from_sequence <= projected_through_sequence),
+  CHECK (projected_through_sequence <= source_watermark)
 );
 
 CREATE TABLE agent_change_delta (
@@ -542,18 +579,23 @@ CREATE TABLE agent_change_delta (
   board_change_sequence BIGINT NOT NULL CHECK (board_change_sequence > 0),
   delta_id UUID NOT NULL,
   source_event_id UUID NOT NULL,
-  commit_timestamp TIMESTAMPTZ NOT NULL,
+  recorded_at TIMESTAMPTZ NOT NULL,
   event_kind agent_change_event_kind NOT NULL,
   object_type TEXT NOT NULL CHECK (object_type IN ('BOARD', 'ITEM', 'COLUMN')),
   object_id BIGINT NOT NULL,
+  subject_item_id BIGINT,
   object_version BIGINT NOT NULL CHECK (object_version > 0),
   changed_column_ids BIGINT[] NOT NULL DEFAULT '{}',
   changed_field_manifest_json JSONB NOT NULL,
   semantic_journal_refs_json JSONB NOT NULL DEFAULT '[]',
   classification_labels TEXT[] NOT NULL DEFAULT '{}',
+  classification_snapshot_id UUID NOT NULL,
+  redaction_schema_version TEXT NOT NULL,
   redaction_envelope_hash TEXT NOT NULL,
   source_visibility_epoch BIGINT NOT NULL CHECK (source_visibility_epoch > 0),
   event_hash TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL DEFAULT 'SHA-256',
+  canonicalization_version TEXT NOT NULL,
   projector_version TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, board_id, board_change_sequence),
@@ -568,7 +610,8 @@ CREATE TABLE agent_change_delta (
 
 CREATE INDEX agent_change_delta_item_idx
   ON agent_change_delta
-    (account_id, board_id, object_id, board_change_sequence);
+    (account_id, board_id, subject_item_id, board_change_sequence)
+  WHERE subject_item_id IS NOT NULL;
 
 CREATE INDEX agent_change_delta_kind_idx
   ON agent_change_delta
@@ -605,10 +648,15 @@ CREATE TABLE agent_change_pull_receipt (
   packet_bytes BIGINT NOT NULL CHECK (packet_bytes BETWEEN 0 AND 1048576),
   delta_set_hash TEXT NOT NULL,
   packet_hash TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL DEFAULT 'SHA-256',
+  canonicalization_version TEXT NOT NULL,
   policy_version TEXT NOT NULL,
   visibility_epoch BIGINT NOT NULL CHECK (visibility_epoch > 0),
   receipt_token_hash TEXT NOT NULL,
   request_id UUID NOT NULL,
+  request_payload_hash TEXT NOT NULL,
+  encrypted_response_artifact_id UUID NOT NULL,
+  response_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   acknowledged_at TIMESTAMPTZ,
@@ -639,31 +687,41 @@ CREATE TABLE agent_change_procedure_binding (
     ON DELETE CASCADE
 );
 
-CREATE TABLE agent_change_webhook_hint (
+CREATE TABLE agent_change_webhook_hint_state (
   account_id BIGINT NOT NULL,
-  hint_id UUID NOT NULL,
   watch_id UUID NOT NULL,
   watch_generation BIGINT NOT NULL CHECK (watch_generation > 0),
   projected_watermark BIGINT NOT NULL CHECK (projected_watermark >= 0),
   endpoint_ref_id UUID NOT NULL,
-  attempt_number SMALLINT NOT NULL CHECK (attempt_number BETWEEN 1 AND 12),
+  delivery_state TEXT NOT NULL CHECK (delivery_state IN ('PENDING', 'DELIVERED')),
+  attempt_number SMALLINT NOT NULL CHECK (attempt_number BETWEEN 0 AND 12),
   not_before TIMESTAMPTZ NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   delivered_at TIMESTAMPTZ,
   response_class TEXT,
   hint_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (account_id, hint_id),
-  UNIQUE (account_id, watch_id, watch_generation, projected_watermark, attempt_number),
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, watch_id),
   FOREIGN KEY (account_id, watch_id)
     REFERENCES agent_change_watch (account_id, watch_id),
   CHECK (expires_at > created_at)
 );
 
 CREATE INDEX agent_change_webhook_hint_queue_idx
-  ON agent_change_webhook_hint
-    (account_id, not_before, hint_id)
-  WHERE delivered_at IS NULL;
+  ON agent_change_webhook_hint_state
+    (account_id, delivery_state, not_before, watch_id)
+  WHERE delivery_state = 'PENDING';
+
+CREATE TABLE agent_change_audit_head (
+  account_id BIGINT NOT NULL,
+  audit_shard SMALLINT NOT NULL CHECK (audit_shard BETWEEN 0 AND 63),
+  head_sequence BIGINT NOT NULL CHECK (head_sequence >= 0),
+  head_event_hash TEXT NOT NULL,
+  head_version BIGINT NOT NULL CHECK (head_version > 0),
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, audit_shard)
+);
 
 CREATE TABLE agent_change_audit_event (
   account_id BIGINT NOT NULL,
@@ -681,17 +739,92 @@ CREATE TABLE agent_change_audit_event (
   output_hash TEXT NOT NULL,
   policy_version TEXT NOT NULL,
   visibility_epoch BIGINT NOT NULL CHECK (visibility_epoch > 0),
+  previous_audit_sequence BIGINT NOT NULL CHECK (previous_audit_sequence >= 0),
   previous_event_hash TEXT NOT NULL,
   event_hash TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL DEFAULT 'SHA-256',
+  canonicalization_version TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, audit_shard, audit_sequence),
   UNIQUE (account_id, audit_event_id),
-  UNIQUE (account_id, audit_shard, event_hash)
+  UNIQUE (account_id, audit_shard, event_hash),
+  UNIQUE (
+    account_id,
+    audit_shard,
+    previous_audit_sequence,
+    previous_event_hash
+  ),
+  CHECK (previous_audit_sequence + 1 = audit_sequence)
 );
 
 CREATE INDEX agent_change_audit_watch_idx
   ON agent_change_audit_event
     (account_id, watch_id, created_at, audit_event_id);
+
+CREATE TABLE agent_change_audit_checkpoint (
+  account_id BIGINT NOT NULL,
+  audit_shard SMALLINT NOT NULL CHECK (audit_shard BETWEEN 0 AND 63),
+  audit_sequence BIGINT NOT NULL CHECK (audit_sequence > 0),
+  event_hash TEXT NOT NULL,
+  checkpoint_hash TEXT NOT NULL,
+  signer_key_id TEXT NOT NULL,
+  signature_bytes BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, audit_shard, audit_sequence),
+  UNIQUE (account_id, audit_shard, checkpoint_hash),
+  FOREIGN KEY (account_id, audit_shard, audit_sequence)
+    REFERENCES agent_change_audit_event
+      (account_id, audit_shard, audit_sequence)
+);
+
+CREATE TABLE agent_change_vector_manifest (
+  account_id BIGINT NOT NULL,
+  model_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  embedding_dimensions INTEGER NOT NULL CHECK (embedding_dimensions = 1536),
+  distance_metric TEXT NOT NULL CHECK (distance_metric = 'COSINE'),
+  physical_partition_id TEXT NOT NULL,
+  canonicalization_version TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('BUILDING', 'SEALED', 'RETIRED')),
+  sealed_watermark BIGINT NOT NULL CHECK (sealed_watermark >= 0),
+  manifest_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, model_id, manifest_version),
+  UNIQUE (account_id, physical_partition_id)
+);
+
+CREATE TABLE agent_change_context_embedding_1536 (
+  account_id BIGINT NOT NULL,
+  model_id TEXT NOT NULL,
+  manifest_version TEXT NOT NULL,
+  semantic_object_id UUID NOT NULL,
+  object_type TEXT NOT NULL,
+  source_object_id BIGINT NOT NULL,
+  board_id BIGINT NOT NULL,
+  source_version BIGINT NOT NULL CHECK (source_version > 0),
+  visibility_epoch BIGINT NOT NULL CHECK (visibility_epoch > 0),
+  perception_card_hash TEXT NOT NULL,
+  embedding VECTOR(1536) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    model_id,
+    manifest_version,
+    semantic_object_id
+  ),
+  FOREIGN KEY (account_id, model_id, manifest_version)
+    REFERENCES agent_change_vector_manifest
+      (account_id, model_id, manifest_version)
+) PARTITION BY LIST (account_id);
+
+CREATE INDEX agent_change_context_embedding_lookup_idx
+  ON agent_change_context_embedding_1536
+    (account_id, model_id, manifest_version, semantic_object_id);
+
+CREATE INDEX agent_change_context_embedding_hnsw_idx
+  ON agent_change_context_embedding_1536
+  USING HNSW (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
 
 ALTER TABLE agent_change_watch ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_watch_item ENABLE ROW LEVEL SECURITY;
@@ -703,8 +836,29 @@ ALTER TABLE agent_change_delta ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_watch_cursor ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_pull_receipt ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_procedure_binding ENABLE ROW LEVEL SECURITY;
-ALTER TABLE agent_change_webhook_hint ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_webhook_hint_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_audit_head ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_change_audit_event ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_audit_checkpoint ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_vector_manifest ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_context_embedding_1536 ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE agent_change_watch FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_watch_item FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_watch_column FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_watch_event_kind FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_source_outbox FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_projection_checkpoint FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_delta FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_watch_cursor FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_pull_receipt FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_procedure_binding FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_webhook_hint_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_audit_head FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_audit_event FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_audit_checkpoint FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_vector_manifest FORCE ROW LEVEL SECURITY;
+ALTER TABLE agent_change_context_embedding_1536 FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY agent_change_watch_tenant_policy ON agent_change_watch
   USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
@@ -748,32 +902,70 @@ CREATE POLICY agent_change_procedure_tenant_policy
   USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
 
-CREATE POLICY agent_change_hint_tenant_policy ON agent_change_webhook_hint
+CREATE POLICY agent_change_hint_tenant_policy ON agent_change_webhook_hint_state
+  USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
+  WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
+
+CREATE POLICY agent_change_audit_head_tenant_policy ON agent_change_audit_head
   USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
 
 CREATE POLICY agent_change_audit_tenant_policy ON agent_change_audit_event
   USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
+
+CREATE POLICY agent_change_audit_checkpoint_tenant_policy
+  ON agent_change_audit_checkpoint
+  USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
+  WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
+
+CREATE POLICY agent_change_vector_manifest_tenant_policy
+  ON agent_change_vector_manifest
+  USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
+  WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
+
+CREATE POLICY agent_change_context_embedding_tenant_policy
+  ON agent_change_context_embedding_1536
+  USING (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT)
+  WITH CHECK (account_id = NULLIF(current_setting('app.account_id', TRUE), '')::BIGINT);
 ```
 
 ### Physical layout
 
-- Hash-partition high-volume tables by `account_id`, then range-partition
-  `agent_change_source_outbox` and `agent_change_delta` by commit time or board
-  sequence. A tenant can move partitions without mixing data with another tenant.
+- Hash-partition row and audit tables by `account_id`. Version 1 does not add native
+  time/sequence subpartitions because PostgreSQL uniqueness would then require the
+  subpartition key in every ID constraint. mondayDB may compact account-owned physical
+  segments behind the logical table while preserving the declared global tenant keys.
 - Keep source outbox, cursor, and acknowledgement state in the ACID row path.
   Columnar storage may mirror delta metadata for aggregate observability, but it is not
   authoritative for delivery.
-- Allocate `board_change_sequence` in the authoritative board transaction partition.
-  Range leasing may create gaps, which cursor semantics tolerate. A sequence may never
-  be reused after rollback or failover.
+- Allocate `board_change_sequence` from a board-local counter at the authoritative
+  partition's serialization point. Hold the allocator lock through transaction end;
+  do not lease ranges. The source watermark is the greatest contiguously committed
+  sequence, so a projector never advances over an unresolved transaction.
 - Compact immutable delta segments only below the minimum retained acknowledged
   sequence plus enterprise retention. Compaction produces a signed manifest and audit
   event; it does not rewrite surviving event hashes.
+- Retention is not pinned indefinitely by a silent consumer. When cursor lag exceeds
+  `maxReplayEvents` or the retention class, a transaction records the retained floor,
+  moves the watch to `CURSOR_EXPIRED`, emits an audit event, and permits compaction.
 - Queue workers claim exact account-leading ranges. Cross-account queue scans require a
   privileged control-plane role and fair scheduling; application roles never receive
   that capability.
+- Provision `agent_change_context_embedding_1536` as one physical list partition per
+  account, with its own HNSW child index. There is no default partition. Queries first
+  resolve the sealed manifest and account-owned partition; the planner prunes every
+  other tenant before ANN traversal. Models with another dimension use another typed
+  table family rather than a nullable or variable-dimension vector.
+- Grant API roles only the partitioned parent, never direct child-table privileges.
+  Parent RLS and partition pruning therefore remain mandatory on every vector query.
+
+Application connections use a non-owner, non-`BYPASSRLS` role. A trusted gateway sets
+`app.account_id` with transaction-local `SET LOCAL` after authenticating the request
+and resets it on every pooled transaction. Request fields can never set this GUC.
+Projectors use a separate least-privilege role scoped to explicitly claimed accounts.
+`FORCE ROW LEVEL SECURITY` applies even to table owners; emergency administrative
+roles are isolated, audited, and unavailable to API processes.
 
 ### Transaction boundaries
 
@@ -781,43 +973,81 @@ CREATE POLICY agent_change_audit_tenant_policy ON agent_change_audit_event
 
 1. Lock or validate the target board item version.
 2. Apply the row mutation.
-3. Allocate the next board change sequence.
-4. Insert `agent_change_source_outbox` with payload and lineage hashes.
-5. Append the source-capture audit event.
-6. Commit once.
+3. Read immutable classification snapshot and redaction schema versions in the same
+   transaction.
+4. Lock the board-local allocator and allocate the next serialization sequence.
+5. Insert `agent_change_source_outbox` with snapshot, payload, and lineage hashes.
+6. Append the source-capture audit event through the locked audit-shard head.
+7. Commit once, releasing both allocator locks.
 
 Embedding, webhook, semantic retrieval, and LLM work are not allowed in this
 transaction.
 
+Registration with `NOW` locks the same board allocator long enough to capture its
+contiguous source watermark. That watermark becomes `start_sequence`, even when
+projection is behind. Pull never returns sequences at or below it; it may wait within a
+declared consistency timeout for projection to catch up. This prevents pre-registration
+changes from leaking into a new watch.
+
 **Projection**
 
 1. Claim a bounded `(account_id, board_id, sequence range)`.
-2. Read current classification and redaction metadata with a visibility checkpoint.
-3. Build canonical field descriptors and semantic journal pointers.
+2. Load the immutable classification snapshot and redaction schema versions captured
+   by each source event.
+3. Build canonical field descriptors and semantic journal pointers with the declared
+   canonicalization version.
 4. Insert `agent_change_delta` idempotently by source event.
 5. Advance `agent_change_projection_checkpoint` with compare-and-set.
-6. Enqueue coalesced webhook hints and append an audit event.
+6. Append an audit event through a locked shard head.
 
 Projection may lag without blocking board writes. If lag exceeds policy, hints stop,
 pulls report `THROTTLED`, and operators scale or isolate the projector. The service
 does not skip source events to appear current.
 
+Projection does not enumerate watches. A separate fairly scheduled hint worker reads a
+bounded page of active watches from
+`(account_id, board_id, status, watch_id)` after a board watermark advances. Admission
+enforces a hard active-watch fanout per account/board. The worker compare-and-sets the
+single `agent_change_webhook_hint_state` row for each watch to the newest watermark,
+coalescing intermediate changes. If it exhausts its page or tenant hint budget, it
+persists its account-leading continuation and yields; pull durability is unaffected.
+
 **Pull and acknowledge**
 
 1. Resolve the authenticated account, principal, purpose, and current policy.
 2. Point-read the watch and cursor by `(account_id, watch_id)`.
-3. Verify generation, status, cursor token, retention, and reaction lineage.
+3. Verify owner, exact purpose, generation, status, cursor token, retention, and
+   reaction lineage.
 4. Reserve packet and visibility-check budgets.
-5. Range-read deltas by `(account_id, board_id, sequence)` and apply bounded exact
-   item, event-kind, and column projection filters.
+5. Range-read at most `maxEventsExamined` deltas by
+   `(account_id, board_id, sequence)`, tracking `scannedThroughSequence`, and apply
+   bounded exact subject-item, event-kind, and column projection filters.
 6. Materialize only authorized value artifacts; replace denied fields with typed
    redaction descriptors.
-7. Persist a pull receipt and audit decision, then return the packet.
+7. Persist a pull receipt for the entire scanned range, including an empty delta set,
+   plus an encrypted canonical response and audit decision; then return the packet.
 8. On acknowledgement, lock the cursor, validate the live receipt and expected
-   sequence, advance monotonically, append an audit event, and commit once.
+   sequence, advance to `scannedThroughSequence`, append an audit event through the
+   shard head, and commit once.
 
 The cursor never advances during pull. A consumer crash therefore repeats a packet
-rather than losing it.
+rather than losing it. A retry with the same `(account_id, request_id)` and payload hash
+returns the persisted response while its receipt and authorization checkpoint remain
+valid. A payload mismatch is an idempotency conflict; a now-revoked authorization
+returns a typed denial rather than replaying old values.
+
+Acknowledgement releases no new data. It validates the signed receipt's account,
+principal, purpose, generation, scanned range, and expiry, but does not require that
+the principal still be allowed to read the already delivered values. This lets a
+consumer advance after a policy change without pinning retention. Expired receipts
+require an audited re-pull or administrator-approved cursor reset; there is no silent
+skip.
+
+Scope creation and replacement lock the watch row and validate relational cardinality
+before commit: `ALL_ITEMS` has zero item rows; `ITEM_SET` has 1–256; column rows are
+0–32 with unique ordinals; event-kind rows are 1–16; procedure bindings are 0–8.
+PostgreSQL deployments enforce the same rules with deferred constraint triggers, so a
+partially written scope cannot become active.
 
 ## Open API GraphQL contract
 
@@ -851,11 +1081,6 @@ enum AgentChangeWatchStatus {
   REVOKED
 }
 
-enum AgentChangeWatchStart {
-  NOW
-  AFTER_CURSOR
-}
-
 enum AgentChangePullDecision {
   DELIVERED
   NO_CHANGES
@@ -865,6 +1090,37 @@ enum AgentChangePullDecision {
   WATCH_PAUSED
   REAUTHENTICATION_REQUIRED
   REJECTED
+}
+
+enum AgentChangeConsistencyMode {
+  PROJECTED
+  AT_LEAST_SEQUENCE
+}
+
+enum AgentChangeWatchOperation {
+  PAUSE
+  RESUME
+}
+
+enum AgentChangeAcknowledgeDecision {
+  ACKNOWLEDGED
+  ALREADY_ACKNOWLEDGED
+  CONFLICT
+  REJECTED
+}
+
+enum AgentChangeObjectType {
+  BOARD
+  ITEM
+  COLUMN
+}
+
+enum AgentChangedFieldOperation {
+  SET
+  CLEAR
+  APPEND
+  REMOVE
+  STRUCTURE
 }
 
 input AgentWatchItemScopeInput {
@@ -883,8 +1139,10 @@ input AgentChangeWatchScopeInput {
 
 input AgentWatchDeliveryBudgetInput {
   maxDeltasPerPull: Int!
+  maxEventsExamined: Int!
   maxPacketBytes: Long!
   maxReplayEvents: Long!
+  maxProjectedColumns: Int!
   maxVisibilityChecks: Int!
   maxReactionDepth: Int!
   maxDownstreamActionsPerDelta: Int!
@@ -898,8 +1156,6 @@ input RegisterAgentChangeWatchInput {
   requestId: ID!
   idempotencyKey: String!
   scope: AgentChangeWatchScopeInput!
-  start: AgentChangeWatchStart!
-  afterCursorToken: String
   budget: AgentWatchDeliveryBudgetInput!
   procedureVersionIds: [ID!]! = []
   webhookEndpointRefId: ID
@@ -957,7 +1213,10 @@ input PullAgentChangeDeltasInput {
   cursorToken: String!
   expectedWatchGeneration: Long!
   limit: Int!
+  maxEventsExamined: Int!
   maxPacketBytes: Long!
+  consistencyMode: AgentChangeConsistencyMode! = PROJECTED
+  atLeastSequence: Long
   reactionContext: AgentChangeReactionContextInput
 }
 
@@ -966,7 +1225,7 @@ type AgentChangedField {
   boardId: ID!
   columnId: ID!
   valueKind: String!
-  operation: String!
+  operation: AgentChangedFieldOperation!
   beforeValueHash: String
   afterValueHash: String
   authorizedValueArtifactId: ID
@@ -996,10 +1255,11 @@ type AgentChangeDelta {
   sourceEventId: ID!
   boardId: ID!
   boardChangeSequence: Long!
-  commitTimestamp: DateTime!
+  recordedAt: DateTime!
   eventKind: AgentChangeEventKind!
-  objectType: String!
+  objectType: AgentChangeObjectType!
   objectId: ID!
+  subjectItemId: ID
   objectVersion: Long!
   changedFields: [AgentChangedField!]!
   origin: AgentChangeOrigin!
@@ -1055,8 +1315,7 @@ type PullAgentChangeDeltasPayload {
   deltas: [AgentChangeDelta!]!
   perceptionCards: [AgentChangePerceptionCard!]!
   pullReceiptToken: String
-  nextCursorToken: String
-  deliveredThroughSequence: Long!
+  scannedThroughSequence: Long!
   sourceWatermark: Long!
   projectedWatermark: Long!
   projectionLagEvents: Long!
@@ -1082,7 +1341,7 @@ type AcknowledgeAgentChangeDeltasPayload {
   accountId: ID!
   requestId: ID!
   watchId: ID!
-  decision: String!
+  decision: AgentChangeAcknowledgeDecision!
   acknowledgedSequence: Long!
   cursorToken: String!
   auditEventId: ID!
@@ -1095,7 +1354,7 @@ input UpdateAgentChangeWatchStateInput {
   requestId: ID!
   watchId: ID!
   expectedGeneration: Long!
-  desiredStatus: AgentChangeWatchStatus!
+  operation: AgentChangeWatchOperation!
   reason: String!
 }
 
@@ -1142,10 +1401,6 @@ type Query {
     watchId: ID!
   ): AgentChangeWatch
 
-  pullAgentChangeDeltas(
-    input: PullAgentChangeDeltasInput!
-  ): PullAgentChangeDeltasPayload!
-
   agentChangeContext(
     input: AgentChangeContextInput!
   ): AgentChangeContextPayload!
@@ -1155,6 +1410,10 @@ type Mutation {
   registerAgentChangeWatch(
     input: RegisterAgentChangeWatchInput!
   ): RegisterAgentChangeWatchPayload!
+
+  pullAgentChangeDeltas(
+    input: PullAgentChangeDeltasInput!
+  ): PullAgentChangeDeltasPayload!
 
   acknowledgeAgentChangeDeltas(
     input: AcknowledgeAgentChangeDeltasInput!
@@ -1168,7 +1427,15 @@ type Mutation {
 
 GraphQL request complexity assigns fixed base cost plus declared packet, value artifact,
 and semantic candidate costs. The server clamps all client limits to the current policy;
-lower client limits never expand server limits. Pagination is cursor-only.
+lower client limits never expand server limits. Pagination is cursor-only. `Long`
+serializes as a canonical base-10 string, never a JSON number.
+
+Input validation requires exactly one of `allItems: true` or a non-empty `itemIds`
+list. Registration always starts at the atomically captured `NOW` source watermark.
+`AT_LEAST_SEQUENCE` requires `atLeastSequence`; `PROJECTED` forbids it. The public
+state operation accepts only `PAUSE` and `RESUME`. `POLICY_BLOCKED`,
+`CURSOR_EXPIRED`, and `REVOKED` are server-controlled states and cannot be requested
+by a client.
 
 ## Procedural memory
 
@@ -1235,6 +1502,17 @@ This separation lets an LLM perceive:
 
 Similarity is discovery, not trigger truth, permission, or authorization.
 
+The DDL fixes one table family at 1,536 dimensions and cosine distance. The sealed
+manifest must declare those exact values; a mismatched model is rejected before ANN
+work. At query time the vector adapter resolves `physical_partition_id`, verifies that
+the child partition belongs only to the authenticated account, and executes a statement
+with mandatory equality predicates on `account_id`, `model_id`, and
+`manifest_version`. It sets transaction-local `hnsw.ef_search <= 128`,
+`hnsw.iterative_scan = strict_order`, and `hnsw.max_scan_tuples <= 256`, then applies
+`LIMIT <= 32`. Authoritative visibility point reads happen after ANN and count against
+the same candidate budget. A missing child index or sealed manifest fails closed; the
+planner cannot choose a shared tenant partition or sequential fallback.
+
 ## Guardrails and neighbor protection
 
 Admission occurs at registration, pull, context retrieval, and every downstream
@@ -1246,17 +1524,22 @@ action.
 - Reject `ALL_ITEMS` when tenant policy requires an explicit item set.
 - Cap item IDs at 256, projected columns at 32, event kinds at 16, and procedures at 8.
 - Reject unknown, mirrored cross-account, or currently invisible IDs.
-- Start at the current projected watermark unless a valid retained cursor is supplied.
+- Atomically capture the current contiguous source watermark as `start_sequence`.
 - Estimate event rate and projected bytes from board synopses. Queue or reject a watch
   whose forecast exceeds the tenant's watch budget.
 - Charge active watch count, projected event rate, retained bytes, and hint rate to an
   account ledger.
+- Enforce a policy hard cap on active watches per account/board (default 1,024,
+  absolute maximum 4,096), so hint matching has a finite fanout.
 
 ### Pull
 
 - Require an exact watch point read and board-sequence range.
-- Enforce `limit <= 500`, packet bytes `<= 1 MiB`, and a short timeout.
-- Stop before a budget boundary and issue a receipt only for the returned range.
+- Enforce `limit <= 500`, `maxEventsExamined <= 2,000`, packet bytes `<= 1 MiB`,
+  maximum cursor lag, and a short timeout.
+- Stop at the first count, byte, visibility, or time boundary. Issue a receipt for the
+  scanned range even when no delta matched, so sparse filters advance without an
+  unbounded search.
 - Cap visibility checks and value artifact decryptions separately.
 - Apply per-account token buckets and weighted fair scheduling.
 - Return `THROTTLED` with retry guidance instead of borrowing another tenant's share.
@@ -1293,6 +1576,7 @@ VISIBILITY_CHANGED
 PROJECTION_LAG_EXCEEDED
 DELTA_LIMIT_EXCEEDED
 PACKET_BUDGET_EXCEEDED
+EVENT_SCAN_LIMIT_EXCEEDED
 VALUE_ARTIFACT_BUDGET_EXCEEDED
 REACTION_DEPTH_EXCEEDED
 LINEAGE_LOOP_DETECTED
@@ -1314,9 +1598,9 @@ forbids it.
 | Operation | Required access path | Bound | Full-scan response |
 | --- | --- | --- | --- |
 | Load watch | `(account_id, watch_id)` point read | 1 watch | Reject missing tenant key |
-| Match exact item | `(account_id, board_id, item_id, watch_id)` | 256 item refs/watch | Reject larger set |
+| Match exact item | `(account_id, board_id, subject_item_id, sequence)` plus exact watch item set | 2,000 events examined | Stop at scan bound |
 | Match event kind | `(account_id, board_id, event_kind, watch_id)` | 16 kinds/watch | Reject unknown kind |
-| Pull deltas | `(account_id, board_id, sequence)` range | 500 deltas / 1 MiB | Stop at budget |
+| Pull deltas | `(account_id, board_id, sequence)` range | 2,000 examined; 500 returned; 1 MiB | Receipt covers scanned range |
 | Load cursor | `(account_id, watch_id)` point read | 1 cursor | Reject token mismatch |
 | Ack receipt | `(account_id, watch_id, to_sequence, expiry)` | 1 receipt | Reject missing receipt |
 | Replay | Retained board-sequence range | Policy event cap | Return `CURSOR_EXPIRED` |
@@ -1328,6 +1612,9 @@ Specific rules:
 - Never reconstruct a cursor with `SELECT ... FROM items WHERE board_id = ?`.
 - Never filter an unbounded delta range with JSONPath, regex, or `unnest` after read.
 - `changed_field_manifest_json` is an output artifact, not a watch-filter index.
+- `subject_item_id` is populated only when an event belongs to one item. Item-scoped
+  watches reject board/column events with no subject; they never compare the overloaded
+  `object_id`.
 - `ALL_ITEMS` means all **future deltas** on one board, not a snapshot of existing rows.
 - Initial state must be obtained from a separate bounded snapshot API with explicit
   pagination and budget; watch registration does not return board contents.
@@ -1351,8 +1638,9 @@ The asynchronous path protects the primary transaction SLO:
   labels stale projection as current.
 - Webhook failure does not affect cursor durability. Hints retry with bounded,
   jittered schedules and expire; agents may always pull.
-- Region failover fences old sequence allocators. Gaps are allowed, but two committed
-  events cannot receive the same board sequence.
+- Region failover fences old board allocators through the row-store consensus term.
+  A later visible sequence cannot overtake an earlier committed sequence, and two
+  committed events cannot receive the same sequence.
 - A policy or visibility service outage fails closed for value artifacts and
   procedures. Metadata delivery may continue only when a predeclared enterprise policy
   explicitly permits it.
@@ -1385,6 +1673,18 @@ Raw values, prompts, embeddings, cursor tokens, receipt tokens, and webhook secr
 never placed in audit rows. Audit chains are sharded inside one account to avoid a
 tenant-wide serialization hotspot. Each shard has a monotonic sequence and signed
 checkpoint roots; replay verifies both chain continuity and checkpoint inclusion.
+
+An audit append locks `agent_change_audit_head` for the exact account/shard, verifies
+its version, inserts the sole successor with `previous_audit_sequence` and
+`previous_event_hash`, then compare-and-sets the head in the same transaction. The
+unique predecessor constraint prevents a fork even if a caller bypasses the normal
+adapter. Sequence zero and the deployment genesis hash initialize a shard. A signing
+worker periodically commits `agent_change_audit_checkpoint`; signatures cover account,
+shard, sequence, event hash, canonicalization version, and deployment identity.
+
+All hashes use length-prefixed canonical CBOR, SHA-256, sorted reason-code enums, UTC
+timestamps with fixed precision, and explicit schema/canonicalization versions.
+Unknown versions fail replay rather than falling back to ambient JSON serialization.
 
 A deterministic support replay can prove:
 
