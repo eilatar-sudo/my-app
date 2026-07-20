@@ -90,7 +90,7 @@ The active-session admission SLI is the fraction of otherwise valid requests tha
 7. Effective session expiry is the minimum of credential, attestation, delegation, runtime contract, and policy expiries.
 8. Emergency revocation advances a monotonic tenant-local epoch. A stale session can never become valid again.
 9. A retired key cannot open a session. An emergency-revoked key fences already open sessions.
-10. Writes lock the issuer, principal, key, and session in a fixed order inside the transaction that commits the mutation, attribution, audit reference, and outbox entry. Revocation updates the same rows in the same order.
+10. Writes lock the account fence, issuer, principal, key, and session in a fixed order inside the transaction that commits the mutation, attribution, audit reference, and outbox entry. Revocation updates the same rows in the same order.
 11. Verification uses canonical evidence, fixed algorithms, versioned trust material, and a persisted evaluation instant.
 12. Missing, stale, ambiguous, or unverifiable evidence fails closed.
 13. Each operation has one immutable admission record and at most one separately immutable completion record under a tenant-scoped request ID.
@@ -102,7 +102,9 @@ The active-session admission SLI is the fraction of otherwise valid requests tha
 
 ### 5.1 Register
 
-A tenant administrator maps an external issuer and a versioned tenant-keyed HMAC of its canonical subject to a tenant-local workload principal. The raw subject and a plain guessable hash are not stored. The same issuer subject in two accounts produces two unlinkable principal bindings.
+A tenant administrator first completes a dedicated enrollment challenge. The verifier creates a short-lived, single-use `enrollment_id` containing the issuer, a versioned tenant-keyed HMAC of its canonical subject, proposed proof key, artifact, administrator identity, and signed envelope reference. The GraphQL registration transaction consumes that enrollment while atomically creating the principal and initial key; it does not require a pre-existing principal or session challenge.
+
+The raw subject and a plain guessable hash are not stored. The same issuer subject in two accounts produces two unlinkable principal bindings.
 
 Public key bindings contain only thumbprints and key generations. Private keys remain in a workload identity system, KMS, HSM, or cloud provider.
 
@@ -133,15 +135,19 @@ In one row-store transaction, mondayDB:
 
 If rotation wins the race between external verification and transaction commit, session creation retries against the new epoch or rejects.
 
+The response contains an out-of-band session credential with only `sid`, `aud`, `exp`, and a `cnf` proof-key thumbprint. Each DPoP request supplies a unique `jti` and `ath` token hash plus method, URI, and canonical operation/body hash. mondayDB atomically inserts the tenant/session-scoped replay reservation before admission and retains its HMAC tombstone through the maximum proof replay window.
+
+Access, Purpose, Consent, and Runtime planes synchronously advance the principal or account aggregate authorization fence in the same authoritative row-store transaction that revokes a decision. The aggregate is deliberately coarse: it may force unrelated sessions to reopen, but it prevents stale authorization without adding four remote checks to every write.
+
 ### 5.4 Admit operation
 
-The gateway proves possession for the session and atomically reserves the DPoP `jti` or mTLS request binding. The planner derives a canonical operation hash. Storage admission creates an immutable operation-admission row containing the ingress proof receipt, query-governor scan-risk decision, session and decision hashes, audience, deadline, and query plan.
+The gateway proves possession for the session and atomically reserves the DPoP `jti` or mTLS exporter request binding. The planner derives a canonical operation hash. Storage admission creates an immutable operation-admission row containing the ingress proof receipt, query-governor scan-risk decision, session and decision hashes, audience, deadline, and query plan.
 
 For row mutations, the locked fence, data mutation, admission, central-audit reference, and outbox record commit atomically. Columnar and vector reads persist admission before dispatch and insert a distinct bounded completion record afterward; neither record is updated in place.
 
 ### 5.5 Revoke and rotate
 
-Routine rotation requires proof of the new key, and self-rotation requires both old- and new-key proof. It may preserve a bounded overlap for availability. Recovery without old-key proof uses a separate step-up or multi-party path. Emergency compromise increments a credential, minimum trust, or minimum session epoch, immediately fencing older sessions without scanning them.
+Routine rotation creates a single-use rotation authorization that binds old- and new-key verification IDs, the proposed thumbprint, expected credential epoch, validity, and approvers. Activation consumes its `rotation_id` atomically with the key state change. Recovery without old-key proof creates the same durable record through a distinct step-up or multi-party approval mode. It may preserve a bounded overlap for availability. Emergency compromise increments an account authorization, principal authorization, credential, minimum trust, or minimum session epoch, immediately fencing older sessions without scanning them.
 
 Closing millions of session rows is asynchronous hygiene; correctness comes from the epoch comparison, not bulk updates.
 
@@ -193,6 +199,7 @@ export interface AgentWorkloadPrincipal {
   credentialEpoch: bigint;
   minSessionEpoch: bigint;
   policyEpoch: bigint;
+  authorizationFenceEpoch: bigint;
   createdAt: Instant;
 }
 
@@ -221,6 +228,7 @@ export interface AgentWorkloadChallenge {
 export interface VerifiedAttestationDecision {
   accountId: UUID;
   verificationId: UUID;
+  challengeId: UUID;
   verifierKeyId: string;
   verifierBuildId: string;
   profile: string;
@@ -270,6 +278,8 @@ export interface AgentWorkloadSession {
   sessionEpoch: bigint;
   issuerPolicyEpoch: bigint;
   principalPolicyEpoch: bigint;
+  accountAuthorizationFenceEpoch: bigint;
+  principalAuthorizationFenceEpoch: bigint;
   trustBundleEpoch: bigint;
   verifierPolicyEpoch: bigint;
   proofKeyThumbprint: Sha256;
@@ -282,9 +292,33 @@ export interface AgentWorkloadSession {
   accessDecisionHash: Sha256;
   purposeDecisionId: UUID;
   purposeDecisionHash: Sha256;
+  credentialExpiresAt: Instant;
+  attestationExpiresAt: Instant;
+  delegationExpiresAt: Instant;
+  accessExpiresAt: Instant;
+  purposeExpiresAt: Instant;
+  runtimeExpiresAt: Instant;
   status: SessionStatus;
   openedAt: Instant;
   effectiveExpiresAt: Instant;
+}
+
+export interface AgentSessionCredentialClaims {
+  sessionId: UUID;
+  audience: string;
+  expiresAt: Instant;
+  confirmationKeyThumbprint: Sha256;
+}
+
+export interface AgentRequestProof {
+  sessionId: UUID;
+  jti: string;
+  audience: string;
+  issuedAt: Instant;
+  httpMethod: string;
+  canonicalUriHash: Sha256;
+  canonicalBodyHash: Sha256;
+  sessionTokenHash: Sha256;
 }
 
 export type AgentOperationKind =
@@ -398,7 +432,16 @@ RETURNS uuid
 AS 'mondaydb_identity', 'verified_account_id'
 LANGUAGE C
 STABLE
-PARALLEL SAFE;
+PARALLEL RESTRICTED;
+
+CREATE TABLE agent_workload_account_fences (
+  account_id uuid NOT NULL,
+  status text NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED')),
+  authorization_fence_epoch bigint NOT NULL DEFAULT 1
+    CHECK (authorization_fence_epoch > 0),
+  updated_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id)
+);
 
 CREATE TABLE agent_workload_issuers (
   account_id uuid NOT NULL,
@@ -435,6 +478,8 @@ CREATE TABLE agent_workload_principals (
   credential_epoch bigint NOT NULL DEFAULT 1 CHECK (credential_epoch > 0),
   min_session_epoch bigint NOT NULL DEFAULT 1 CHECK (min_session_epoch > 0),
   policy_epoch bigint NOT NULL DEFAULT 1 CHECK (policy_epoch > 0),
+  authorization_fence_epoch bigint NOT NULL DEFAULT 1
+    CHECK (authorization_fence_epoch > 0),
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL,
   PRIMARY KEY (account_id, principal_id),
@@ -448,6 +493,7 @@ CREATE TABLE agent_workload_key_bindings (
   account_id uuid NOT NULL,
   principal_id uuid NOT NULL,
   key_generation bigint NOT NULL CHECK (key_generation > 0),
+  rotation_id uuid,
   proof_key_thumbprint bytea NOT NULL
     CHECK (octet_length(proof_key_thumbprint) = 32),
   status mondaydb.agent_workload_key_status NOT NULL,
@@ -483,6 +529,9 @@ CREATE TABLE agent_workload_challenges (
     ),
   PRIMARY KEY (account_id, challenge_id),
   UNIQUE (account_id, challenge_id, principal_id),
+  UNIQUE (
+    account_id, challenge_id, principal_id, challenge_hash, audience
+  ),
   UNIQUE (account_id, principal_id, challenge_hash),
   UNIQUE (account_id, principal_id, idempotency_key_hmac),
   FOREIGN KEY (account_id, principal_id)
@@ -498,6 +547,7 @@ CREATE TABLE agent_workload_challenges (
 CREATE TABLE agent_workload_verification_decisions (
   account_id uuid NOT NULL,
   verification_id uuid NOT NULL,
+  challenge_id uuid,
   resolved_issuer_id uuid,
   resolved_principal_id uuid,
   verifier_key_id text NOT NULL,
@@ -541,13 +591,29 @@ CREATE TABLE agent_workload_verification_decisions (
   PRIMARY KEY (account_id, verification_id),
   UNIQUE (account_id, signed_envelope_hash),
   UNIQUE (
-    account_id, verification_id, resolved_principal_id,
+    account_id, verification_id, decision, challenge_id,
+    resolved_issuer_id, resolved_principal_id, challenge_hash, audience,
     proof_key_thumbprint, artifact_digest, verified_instance_measurement,
-    trust_bundle_epoch, verifier_policy_epoch, credential_epoch
+    evidence_hash, claims_hash, trust_bundle_version, trust_bundle_epoch,
+    verifier_policy_version, verifier_policy_epoch, credential_epoch,
+    credential_expires_at, attestation_expires_at
   ),
+  FOREIGN KEY (
+    account_id, challenge_id, resolved_principal_id, challenge_hash, audience
+  )
+    REFERENCES agent_workload_challenges (
+      account_id, challenge_id, principal_id, challenge_hash, audience
+    ),
+  FOREIGN KEY (
+    account_id, resolved_principal_id, resolved_issuer_id
+  )
+    REFERENCES agent_workload_principals (
+      account_id, principal_id, issuer_id
+    ),
   CHECK (
     decision <> 'VERIFIED'
     OR (
+      challenge_id IS NOT NULL
       resolved_issuer_id IS NOT NULL
       AND resolved_principal_id IS NOT NULL
       AND proof_key_thumbprint IS NOT NULL
@@ -560,11 +626,106 @@ CREATE TABLE agent_workload_verification_decisions (
   )
 );
 
+CREATE TABLE agent_workload_enrollments (
+  account_id uuid NOT NULL,
+  enrollment_id uuid NOT NULL,
+  issuer_id uuid NOT NULL,
+  external_subject_hmac bytea NOT NULL
+    CHECK (octet_length(external_subject_hmac) = 32),
+  proposed_proof_key_thumbprint bytea NOT NULL
+    CHECK (octet_length(proposed_proof_key_thumbprint) = 32),
+  artifact_digest bytea NOT NULL CHECK (octet_length(artifact_digest) = 32),
+  administrator_actor_id uuid NOT NULL,
+  signed_envelope_hash bytea NOT NULL
+    CHECK (octet_length(signed_envelope_hash) = 32),
+  encrypted_envelope_ref text NOT NULL,
+  status text NOT NULL CHECK (status IN ('PENDING', 'CONSUMED', 'EXPIRED')),
+  issued_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  consumed_principal_id uuid,
+  consumed_at timestamptz,
+  PRIMARY KEY (account_id, enrollment_id),
+  UNIQUE (account_id, signed_envelope_hash),
+  FOREIGN KEY (account_id, issuer_id)
+    REFERENCES agent_workload_issuers (account_id, issuer_id),
+  FOREIGN KEY (account_id, consumed_principal_id)
+    REFERENCES agent_workload_principals (account_id, principal_id),
+  CHECK (expires_at > issued_at),
+  CHECK (
+    (status = 'CONSUMED' AND consumed_principal_id IS NOT NULL
+      AND consumed_at IS NOT NULL)
+    OR
+    (status <> 'CONSUMED' AND consumed_principal_id IS NULL
+      AND consumed_at IS NULL)
+  )
+);
+
+CREATE TABLE agent_workload_rotation_authorizations (
+  account_id uuid NOT NULL,
+  rotation_id uuid NOT NULL,
+  principal_id uuid NOT NULL,
+  old_key_verification_id uuid,
+  new_key_verification_id uuid NOT NULL,
+  proposed_proof_key_thumbprint bytea NOT NULL
+    CHECK (octet_length(proposed_proof_key_thumbprint) = 32),
+  approval_mode text NOT NULL
+    CHECK (approval_mode IN ('DUAL_PROOF', 'STEP_UP_RECOVERY', 'MULTI_PARTY')),
+  expected_credential_epoch bigint NOT NULL
+    CHECK (expected_credential_epoch > 0),
+  status text NOT NULL CHECK (status IN ('PENDING', 'CONSUMED', 'EXPIRED')),
+  approved_by_actor_ids jsonb NOT NULL
+    CHECK (jsonb_typeof(approved_by_actor_ids) = 'array'),
+  issued_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  consumed_key_generation bigint,
+  consumed_at timestamptz,
+  PRIMARY KEY (account_id, rotation_id),
+  UNIQUE (
+    account_id, rotation_id, principal_id, proposed_proof_key_thumbprint
+  ),
+  FOREIGN KEY (account_id, principal_id)
+    REFERENCES agent_workload_principals (account_id, principal_id),
+  FOREIGN KEY (account_id, old_key_verification_id)
+    REFERENCES agent_workload_verification_decisions (
+      account_id, verification_id
+    ),
+  FOREIGN KEY (account_id, new_key_verification_id)
+    REFERENCES agent_workload_verification_decisions (
+      account_id, verification_id
+    ),
+  CHECK (expires_at > issued_at),
+  CHECK (
+    (approval_mode = 'DUAL_PROOF' AND old_key_verification_id IS NOT NULL)
+    OR approval_mode <> 'DUAL_PROOF'
+  ),
+  CHECK (
+    (status = 'CONSUMED' AND consumed_key_generation IS NOT NULL
+      AND consumed_at IS NOT NULL)
+    OR
+    (status <> 'CONSUMED' AND consumed_key_generation IS NULL
+      AND consumed_at IS NULL)
+  )
+);
+
+ALTER TABLE agent_workload_key_bindings
+  ADD FOREIGN KEY (
+    account_id, rotation_id, principal_id, proof_key_thumbprint
+  )
+  REFERENCES agent_workload_rotation_authorizations (
+    account_id, rotation_id, principal_id, proposed_proof_key_thumbprint
+  );
+
 CREATE TABLE agent_workload_attestations (
   account_id uuid NOT NULL,
   attestation_id uuid NOT NULL,
   verification_id uuid NOT NULL,
+  verification_decision mondaydb.agent_verification_decision NOT NULL
+    CHECK (verification_decision = 'VERIFIED'),
+  issuer_id uuid NOT NULL,
   principal_id uuid NOT NULL,
+  challenge_id uuid NOT NULL,
+  challenge_hash bytea NOT NULL CHECK (octet_length(challenge_hash) = 32),
+  audience text NOT NULL,
   key_generation bigint NOT NULL,
   proof_key_thumbprint bytea NOT NULL
     CHECK (octet_length(proof_key_thumbprint) = 32),
@@ -587,19 +748,27 @@ CREATE TABLE agent_workload_attestations (
   PRIMARY KEY (account_id, attestation_id),
   UNIQUE (account_id, principal_id, evidence_hash, verifier_policy_version),
   UNIQUE (
-    account_id, attestation_id, principal_id, key_generation,
+    account_id, attestation_id, issuer_id, principal_id, challenge_id,
+    key_generation,
     proof_key_thumbprint, artifact_digest, verified_instance_measurement,
-    trust_bundle_epoch, verifier_policy_epoch, credential_epoch
+    trust_bundle_epoch, verifier_policy_epoch, credential_epoch,
+    credential_expires_at, attestation_expires_at
   ),
   FOREIGN KEY (
-    account_id, verification_id, principal_id, proof_key_thumbprint,
-    artifact_digest, verified_instance_measurement, trust_bundle_epoch,
-    verifier_policy_epoch, credential_epoch
+    account_id, verification_id, verification_decision, challenge_id,
+    issuer_id, principal_id, challenge_hash, audience, proof_key_thumbprint,
+    artifact_digest, verified_instance_measurement, evidence_hash, claims_hash,
+    trust_bundle_version, trust_bundle_epoch, verifier_policy_version,
+    verifier_policy_epoch, credential_epoch, credential_expires_at,
+    attestation_expires_at
   )
     REFERENCES agent_workload_verification_decisions (
-      account_id, verification_id, resolved_principal_id,
+      account_id, verification_id, decision, challenge_id,
+      resolved_issuer_id, resolved_principal_id, challenge_hash, audience,
       proof_key_thumbprint, artifact_digest, verified_instance_measurement,
-      trust_bundle_epoch, verifier_policy_epoch, credential_epoch
+      evidence_hash, claims_hash, trust_bundle_version, trust_bundle_epoch,
+      verifier_policy_version, verifier_policy_epoch, credential_epoch,
+      credential_expires_at, attestation_expires_at
     ),
   FOREIGN KEY (
     account_id, principal_id, key_generation, proof_key_thumbprint
@@ -625,6 +794,12 @@ CREATE TABLE agent_workload_sessions (
   session_epoch bigint NOT NULL CHECK (session_epoch > 0),
   issuer_policy_epoch bigint NOT NULL CHECK (issuer_policy_epoch > 0),
   principal_policy_epoch bigint NOT NULL CHECK (principal_policy_epoch > 0),
+  account_authorization_fence_epoch bigint NOT NULL CHECK (
+    account_authorization_fence_epoch > 0
+  ),
+  principal_authorization_fence_epoch bigint NOT NULL CHECK (
+    principal_authorization_fence_epoch > 0
+  ),
   trust_bundle_epoch bigint NOT NULL CHECK (trust_bundle_epoch > 0),
   verifier_policy_epoch bigint NOT NULL CHECK (verifier_policy_epoch > 0),
   proof_key_thumbprint bytea NOT NULL
@@ -642,6 +817,12 @@ CREATE TABLE agent_workload_sessions (
   purpose_decision_id uuid NOT NULL,
   purpose_decision_hash bytea NOT NULL
     CHECK (octet_length(purpose_decision_hash) = 32),
+  credential_expires_at timestamptz NOT NULL,
+  attestation_expires_at timestamptz NOT NULL,
+  delegation_expires_at timestamptz NOT NULL,
+  access_expires_at timestamptz NOT NULL,
+  purpose_expires_at timestamptz NOT NULL,
+  runtime_expires_at timestamptz NOT NULL,
   status mondaydb.agent_workload_session_status NOT NULL,
   opened_at timestamptz NOT NULL,
   effective_expires_at timestamptz NOT NULL,
@@ -665,17 +846,53 @@ CREATE TABLE agent_workload_sessions (
       account_id, challenge_id, principal_id
     ),
   FOREIGN KEY (
-    account_id, attestation_id, principal_id, key_generation,
+    account_id, attestation_id, issuer_id, principal_id, challenge_id,
+    key_generation,
     proof_key_thumbprint, artifact_digest, verified_instance_measurement,
-    trust_bundle_epoch, verifier_policy_epoch, credential_epoch
+    trust_bundle_epoch, verifier_policy_epoch, credential_epoch,
+    credential_expires_at, attestation_expires_at
   )
     REFERENCES agent_workload_attestations (
-      account_id, attestation_id, principal_id, key_generation,
+      account_id, attestation_id, issuer_id, principal_id, challenge_id,
+      key_generation,
       proof_key_thumbprint, artifact_digest, verified_instance_measurement,
-      trust_bundle_epoch, verifier_policy_epoch, credential_epoch
+      trust_bundle_epoch, verifier_policy_epoch, credential_epoch,
+      credential_expires_at, attestation_expires_at
     ),
   CHECK (effective_expires_at > opened_at),
+  CHECK (
+    effective_expires_at <= LEAST(
+      credential_expires_at,
+      attestation_expires_at,
+      delegation_expires_at,
+      access_expires_at,
+      purpose_expires_at,
+      runtime_expires_at
+    )
+  ),
   CHECK (closed_at IS NULL OR closed_at >= opened_at)
+);
+
+CREATE TABLE agent_workload_proof_replay_reservations (
+  account_id uuid NOT NULL,
+  session_id uuid NOT NULL,
+  proof_jti_hmac bytea NOT NULL CHECK (octet_length(proof_jti_hmac) = 32),
+  request_id uuid NOT NULL,
+  canonical_body_hash bytea NOT NULL
+    CHECK (octet_length(canonical_body_hash) = 32),
+  exporter_binding_hash bytea
+    CHECK (
+      exporter_binding_hash IS NULL
+      OR octet_length(exporter_binding_hash) = 32
+    ),
+  audience text NOT NULL,
+  reserved_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, session_id, proof_jti_hmac),
+  UNIQUE (account_id, request_id),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_workload_sessions (account_id, session_id),
+  CHECK (expires_at > reserved_at)
 );
 
 CREATE TABLE agent_workload_operation_admissions (
@@ -750,6 +967,52 @@ CREATE TABLE agent_workload_operation_completions (
     REFERENCES agent_workload_operation_admissions (account_id, request_id)
 ) PARTITION BY HASH (account_id);
 
+CREATE TABLE agent_workload_operation_release_claims (
+  account_id uuid NOT NULL,
+  request_id uuid NOT NULL,
+  claim_kind text NOT NULL
+    CHECK (claim_kind IN ('RESULT_RELEASE', 'TOOL_DELIVERY')),
+  account_authorization_fence_epoch bigint NOT NULL,
+  principal_authorization_fence_epoch bigint NOT NULL,
+  claimed_at timestamptz NOT NULL,
+  claim_hash bytea NOT NULL CHECK (octet_length(claim_hash) = 32),
+  PRIMARY KEY (account_id, request_id, claim_kind),
+  UNIQUE (account_id, claim_hash),
+  FOREIGN KEY (account_id, request_id)
+    REFERENCES agent_workload_operation_admissions (account_id, request_id)
+);
+
+CREATE TABLE agent_workload_operation_archive_locators (
+  account_id uuid NOT NULL,
+  request_id uuid NOT NULL,
+  storage_tier text NOT NULL CHECK (storage_tier IN ('HOT', 'COLUMNAR')),
+  archive_bucket integer,
+  archive_object_key_hash bytea
+    CHECK (
+      archive_object_key_hash IS NULL
+      OR octet_length(archive_object_key_hash) = 32
+    ),
+  archive_checksum bytea
+    CHECK (archive_checksum IS NULL OR octet_length(archive_checksum) = 32),
+  admission_hash bytea NOT NULL CHECK (octet_length(admission_hash) = 32),
+  completion_hash bytea
+    CHECK (completion_hash IS NULL OR octet_length(completion_hash) = 32),
+  central_audit_checkpoint_id uuid,
+  state text NOT NULL
+    CHECK (state IN ('HOT', 'COPYING', 'VERIFIED', 'ARCHIVED')),
+  updated_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, request_id),
+  CHECK (
+    storage_tier = 'HOT'
+    OR (
+      archive_bucket IS NOT NULL
+      AND archive_object_key_hash IS NOT NULL
+      AND archive_checksum IS NOT NULL
+      AND central_audit_checkpoint_id IS NOT NULL
+    )
+  )
+) PARTITION BY HASH (account_id);
+
 CREATE TABLE awo_admission_p00 PARTITION OF agent_workload_operation_admissions
   FOR VALUES WITH (MODULUS 16, REMAINDER 0);
 CREATE TABLE awo_admission_p01 PARTITION OF agent_workload_operation_admissions
@@ -816,6 +1079,39 @@ CREATE TABLE awo_completion_p14 PARTITION OF agent_workload_operation_completion
 CREATE TABLE awo_completion_p15 PARTITION OF agent_workload_operation_completions
   FOR VALUES WITH (MODULUS 16, REMAINDER 15);
 
+CREATE TABLE awo_locator_p00 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 0);
+CREATE TABLE awo_locator_p01 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 1);
+CREATE TABLE awo_locator_p02 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 2);
+CREATE TABLE awo_locator_p03 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 3);
+CREATE TABLE awo_locator_p04 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 4);
+CREATE TABLE awo_locator_p05 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 5);
+CREATE TABLE awo_locator_p06 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 6);
+CREATE TABLE awo_locator_p07 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 7);
+CREATE TABLE awo_locator_p08 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 8);
+CREATE TABLE awo_locator_p09 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 9);
+CREATE TABLE awo_locator_p10 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 10);
+CREATE TABLE awo_locator_p11 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 11);
+CREATE TABLE awo_locator_p12 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 12);
+CREATE TABLE awo_locator_p13 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 13);
+CREATE TABLE awo_locator_p14 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 14);
+CREATE TABLE awo_locator_p15 PARTITION OF agent_workload_operation_archive_locators
+  FOR VALUES WITH (MODULUS 16, REMAINDER 15);
+
 CREATE INDEX agent_workload_keys_active_idx
   ON agent_workload_key_bindings (
     account_id, principal_id, status, key_generation DESC
@@ -823,6 +1119,14 @@ CREATE INDEX agent_workload_keys_active_idx
 CREATE INDEX agent_workload_attestations_principal_idx
   ON agent_workload_attestations (
     account_id, principal_id, evaluated_at DESC, attestation_id
+  );
+CREATE INDEX agent_workload_attestations_verification_fk_idx
+  ON agent_workload_attestations (
+    account_id, verification_id
+  );
+CREATE INDEX agent_workload_attestations_key_fk_idx
+  ON agent_workload_attestations (
+    account_id, principal_id, key_generation, proof_key_thumbprint
   );
 CREATE INDEX agent_workload_sessions_principal_idx
   ON agent_workload_sessions (
@@ -832,6 +1136,14 @@ CREATE INDEX agent_workload_sessions_expiry_idx
   ON agent_workload_sessions (
     account_id, effective_expires_at, session_id
   ) WHERE status = 'ACTIVE';
+CREATE INDEX agent_workload_sessions_attestation_fk_idx
+  ON agent_workload_sessions (
+    account_id, attestation_id
+  );
+CREATE INDEX agent_workload_sessions_issuer_fk_idx
+  ON agent_workload_sessions (
+    account_id, issuer_id, session_id
+  );
 CREATE INDEX agent_workload_challenges_expiry_idx
   ON agent_workload_challenges (
     account_id, expires_at, challenge_id
@@ -839,6 +1151,18 @@ CREATE INDEX agent_workload_challenges_expiry_idx
 CREATE INDEX agent_workload_verifications_principal_idx
   ON agent_workload_verification_decisions (
     account_id, resolved_principal_id, evaluated_at DESC, verification_id
+  );
+CREATE INDEX agent_workload_enrollments_expiry_idx
+  ON agent_workload_enrollments (
+    account_id, expires_at, enrollment_id
+  );
+CREATE INDEX agent_workload_rotations_expiry_idx
+  ON agent_workload_rotation_authorizations (
+    account_id, expires_at, rotation_id
+  );
+CREATE INDEX agent_workload_replay_expiry_idx
+  ON agent_workload_proof_replay_reservations (
+    account_id, expires_at, session_id, proof_jti_hmac
   );
 CREATE INDEX agent_workload_admissions_principal_idx
   ON agent_workload_operation_admissions (
@@ -852,6 +1176,17 @@ CREATE INDEX agent_workload_completions_time_idx
   ON agent_workload_operation_completions (
     account_id, completed_at DESC, request_id
   );
+CREATE INDEX agent_workload_archive_state_idx
+  ON agent_workload_operation_archive_locators (
+    account_id, state, updated_at, request_id
+  );
+
+ALTER TABLE agent_workload_account_fences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_account_fences FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_account_fences_tenant_policy
+  ON agent_workload_account_fences
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
 
 ALTER TABLE agent_workload_issuers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_workload_issuers FORCE ROW LEVEL SECURITY;
@@ -888,6 +1223,20 @@ CREATE POLICY agent_workload_verification_decisions_tenant_policy
   USING (account_id = mondaydb.current_account_id())
   WITH CHECK (account_id = mondaydb.current_account_id());
 
+ALTER TABLE agent_workload_enrollments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_enrollments FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_enrollments_tenant_policy
+  ON agent_workload_enrollments
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
+
+ALTER TABLE agent_workload_rotation_authorizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_rotation_authorizations FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_rotation_authorizations_tenant_policy
+  ON agent_workload_rotation_authorizations
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
+
 ALTER TABLE agent_workload_attestations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_workload_attestations FORCE ROW LEVEL SECURITY;
 CREATE POLICY agent_workload_attestations_tenant_policy
@@ -902,6 +1251,15 @@ CREATE POLICY agent_workload_sessions_tenant_policy
   USING (account_id = mondaydb.current_account_id())
   WITH CHECK (account_id = mondaydb.current_account_id());
 
+ALTER TABLE agent_workload_proof_replay_reservations
+  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_proof_replay_reservations
+  FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_proof_replay_reservations_tenant_policy
+  ON agent_workload_proof_replay_reservations
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
+
 ALTER TABLE agent_workload_operation_admissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_workload_operation_admissions FORCE ROW LEVEL SECURITY;
 CREATE POLICY agent_workload_operation_admissions_tenant_policy
@@ -913,6 +1271,24 @@ ALTER TABLE agent_workload_operation_completions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE agent_workload_operation_completions FORCE ROW LEVEL SECURITY;
 CREATE POLICY agent_workload_operation_completions_tenant_policy
   ON agent_workload_operation_completions
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
+
+ALTER TABLE agent_workload_operation_release_claims
+  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_operation_release_claims
+  FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_operation_release_claims_tenant_policy
+  ON agent_workload_operation_release_claims
+  USING (account_id = mondaydb.current_account_id())
+  WITH CHECK (account_id = mondaydb.current_account_id());
+
+ALTER TABLE agent_workload_operation_archive_locators
+  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_workload_operation_archive_locators
+  FORCE ROW LEVEL SECURITY;
+CREATE POLICY agent_workload_operation_archive_locators_tenant_policy
+  ON agent_workload_operation_archive_locators
   USING (account_id = mondaydb.current_account_id())
   WITH CHECK (account_id = mondaydb.current_account_id());
 ```
@@ -945,7 +1321,7 @@ DECLARE
   v_issuer_id uuid;
   v_principal_id uuid;
   v_key_generation bigint;
-  v_evaluated_at timestamptz := statement_timestamp();
+  v_evaluated_at timestamptz;
 BEGIN
   IF p_account_id IS DISTINCT FROM mondaydb.current_account_id() THEN
     RAISE EXCEPTION 'tenant context mismatch' USING ERRCODE = '42501';
@@ -961,7 +1337,12 @@ BEGIN
     RAISE EXCEPTION 'agent workload session rejected' USING ERRCODE = '28000';
   END IF;
 
-  -- Revocation uses the same issuer → principal → key → session lock order.
+  -- Revocation uses the same account → issuer → principal → key → session order.
+  PERFORM 1
+  FROM public.agent_workload_account_fences AS a
+  WHERE a.account_id = p_account_id
+  FOR SHARE;
+
   PERFORM 1
   FROM public.agent_workload_issuers AS i
   WHERE i.account_id = p_account_id
@@ -987,6 +1368,9 @@ BEGIN
     AND s.session_id = p_session_id
   FOR SHARE;
 
+  -- Capture time after lock waits so an expired session cannot be revived.
+  v_evaluated_at := clock_timestamp();
+
   RETURN QUERY
   SELECT
     s.principal_id,
@@ -998,6 +1382,8 @@ BEGIN
     s.purpose_decision_hash,
     v_evaluated_at
   FROM public.agent_workload_sessions AS s
+  JOIN public.agent_workload_account_fences AS a
+    ON a.account_id = s.account_id
   JOIN public.agent_workload_issuers AS i
     ON i.account_id = s.account_id
    AND i.issuer_id = s.issuer_id
@@ -1011,11 +1397,14 @@ BEGIN
   WHERE s.account_id = p_account_id
     AND s.session_id = p_session_id
     AND s.status = 'ACTIVE'
+    AND a.status = 'ACTIVE'
     AND i.status = 'ACTIVE'
     AND p.status = 'ACTIVE'
     AND k.status IN ('ACTIVE', 'RETIRING')
     AND s.issuer_policy_epoch = i.policy_epoch
     AND s.principal_policy_epoch = p.policy_epoch
+    AND s.account_authorization_fence_epoch = a.authorization_fence_epoch
+    AND s.principal_authorization_fence_epoch = p.authorization_fence_epoch
     AND s.trust_bundle_epoch >= i.min_trust_bundle_epoch
     AND s.trust_bundle_epoch <= i.trust_bundle_epoch
     AND s.verifier_policy_epoch >= i.min_verifier_policy_epoch
@@ -1038,7 +1427,7 @@ The function derives the evaluation instant from the database and returns it for
 
 ## 8. Open API GraphQL
 
-Every lifecycle feature is available through monday.com's Open API. Bounded raw attestation exchange uses a dedicated binary endpoint with mTLS, envelope encryption, and mandatory log/tracing suppression; GraphQL receives only the resulting opaque `verificationId` or one-use subject-binding token. Credentials and evidence are never ordinary GraphQL values, so persisted operations and variables cannot become credential stores.
+Every lifecycle feature is available through monday.com's Open API. Bounded raw attestation and enrollment exchange uses a dedicated binary endpoint with mTLS, envelope encryption, and mandatory log/tracing suppression; GraphQL receives only a non-secret, administrator- and proof-bound `verificationId`, `enrollmentId`, or `rotationId`. Credentials, subject-binding tokens, and evidence are never ordinary GraphQL values, so persisted operations and variables cannot become credential stores.
 
 ```graphql
 scalar DateTime
@@ -1186,16 +1575,14 @@ input CloseAgentWorkloadSessionInput {
 }
 
 input RegisterAgentWorkloadIdentityInput {
-  issuerId: ID!
-  subjectBindingToken: OpaqueToken!
+  enrollmentId: ID!
   displayName: String!
-  verificationId: ID!
   idempotencyKey: String!
 }
 
 input StageAgentWorkloadKeyInput {
   identityId: ID!
-  keyProofVerificationId: ID!
+  rotationId: ID!
   validFrom: DateTime!
   validUntil: DateTime!
   expectedCredentialEpoch: BigInt!
@@ -1204,9 +1591,33 @@ input StageAgentWorkloadKeyInput {
 
 input ActivateAgentWorkloadKeyInput {
   identityId: ID!
+  rotationId: ID!
   keyGeneration: BigInt!
   expectedCredentialEpoch: BigInt!
   idempotencyKey: String!
+}
+
+input AuthorizeAgentWorkloadRotationInput {
+  identityId: ID!
+  oldKeyVerificationId: ID!
+  newKeyVerificationId: ID!
+  expectedCredentialEpoch: BigInt!
+  idempotencyKey: String!
+}
+
+input AuthorizeAgentWorkloadRecoveryInput {
+  identityId: ID!
+  newKeyVerificationId: ID!
+  recoveryApprovalId: ID!
+  expectedCredentialEpoch: BigInt!
+  idempotencyKey: String!
+}
+
+type AgentWorkloadRotationAuthorization {
+  id: ID!
+  identityId: ID!
+  approvalMode: String!
+  expiresAt: DateTime!
 }
 
 input RevokeAgentWorkloadSessionsInput {
@@ -1293,6 +1704,14 @@ type Mutation {
   registerAgentWorkloadIdentity(
     input: RegisterAgentWorkloadIdentityInput!
   ): AgentWorkloadIdentity!
+
+  authorizeAgentWorkloadRotation(
+    input: AuthorizeAgentWorkloadRotationInput!
+  ): AgentWorkloadRotationAuthorization!
+
+  authorizeAgentWorkloadRecovery(
+    input: AuthorizeAgentWorkloadRecoveryInput!
+  ): AgentWorkloadRotationAuthorization!
 
   stageAgentWorkloadKey(
     input: StageAgentWorkloadKeyInput!
@@ -1385,9 +1804,10 @@ These paths cannot share a transaction with decoupled compute:
 1. persist admission and pinned identity/session hashes;
 2. revalidate the authoritative epoch immediately before data access and dispatch a bounded query with authenticated internal metadata;
 3. require compute to echo request, account, session, and operation hashes;
-4. revalidate before releasing results to the caller;
-5. insert immutable completion counters and source watermarks;
-6. flag missing completion records for reconciliation.
+4. under the shared account/issuer/principal/key/session locks, atomically insert `RESULT_RELEASE` claim with current fence epochs;
+5. release results only after that claim commits;
+6. insert immutable completion counters and source watermarks;
+7. flag missing completion records for reconciliation.
 
 Admission is durable and deterministic even when compute fails. A completion receipt says what was observed; it does not pretend the distributed read was ACID.
 
@@ -1396,13 +1816,15 @@ Admission is durable and deterministic even when compute fails. A completion rec
 Tool execution is a saga:
 
 - commit an identity-fenced tool intent and outbox row;
-- revalidate the originating session immediately before claiming and again before delivering an undelivered intent;
+- under the shared fence locks, atomically insert `TOOL_DELIVERY` claim before delivering an undelivered intent;
 - deliver with a stable tenant-scoped idempotency key;
 - verify the tool worker's own workload identity;
 - record its signed receipt;
 - compensate where a compensating action is defined.
 
 “Exactly once external effect” is not a supported claim.
+
+The release/delivery claim is the linearization point. Revocation prevents claims that have not committed; work whose claim committed first is explicitly classified as pre-revocation and may finish. Already begun external effects require reconciliation or compensation.
 
 ## 11. Auditability and replay
 
@@ -1449,7 +1871,9 @@ Identity admission must be independent of board size. A board with one million o
 
 The Query Governor emits a deterministic `ESTIMATED_ROWS_GE_1M` warning or `FULL_SCAN_REJECTED` decision before identity creates an operation admission. Identity binds that decision hash but never estimates board cardinality itself.
 
-Admission and completion tables have a complete 16-leaf account-hash layout in the reference DDL; deployment may choose a benchmarked modulus before first write. Changing the modulus requires a controlled repartition migration. Recent point reads stay in the row store; bounded account-local jobs copy immutable older records to columnar storage, verify central-audit checkpoints, then delete in small batches. A compact tenant-leading archive locator preserves point lookup by request ID. Archive queries require explicit time bounds and a separate analytical budget.
+Admission, completion, and locator tables have a complete 16-leaf account-hash layout in the reference DDL; deployment may choose a benchmarked modulus before first write. Changing the modulus requires a controlled repartition migration. Every admission transaction creates a `HOT` locator. A bounded account-local archive job copies the admission, optional completion, and release claim under one snapshot; verifies the object checksum and central-audit checkpoint; then uses compare-and-set to mark the locator `ARCHIVED` and delete claim, completion, and admission children in referential order. A crash before the CAS is retryable and never exposes an unverified object.
+
+The locator is a narrow directory, not a duplicate receipt. Capacity approval includes bytes per locator, B-tree amplification, WAL, replicas, and a measured `(account_id, request_id)` point plan at one billion simulated entries. If the benchmarked row-store directory cannot meet the latency/storage objective, the same SQL contract is backed by mondayDB's tenant-partitioned durable KV layer before archival launches. Archive queries require explicit time bounds and a separate analytical budget.
 
 Global cleanup never scans a tenant-leading index. The maintenance scheduler enumerates account partitions and issues bounded per-account ranges for sessions, challenges, and idempotency tombstones. Foreign-key support and retention access paths are verified from real `EXPLAIN` plans before launch.
 
@@ -1538,6 +1962,8 @@ Effects already linearized or begun before revocation cannot be described as rev
 - FORCE RLS, no-direct-DML grants, child-partition grants, extension-protected tenant context, malicious `SET LOCAL`, and cross-tenant IDs are tested adversarially.
 - Session creation is server-challenge, DPoP/mTLS proof, signed-envelope, epoch, authoritative-decision, and payload-idempotency bound.
 - Emergency revocation is a point update and linearly fences stale writes, result release, and undelivered tool effects.
+- Enrollment and rotation consume single-use durable authorizations; self-rotation proves both keys and recovery requires step-up or multi-party approval.
+- DPoP `jti` or mTLS exporter replay reservations are unique per tenant/session and retained through the replay window.
 - Open API schema compiles and every connection is keyset-paginated and bounded.
 - TypeScript contracts compile in strict mode.
 - SQL parses; all hash leaves exist; relational copies are composite-FK bound; and every hot path has a measured tenant-scoped plan.
@@ -1545,6 +1971,7 @@ Effects already linearized or begun before revocation cannot be described as rev
 - Procedural memories are discoverable but cannot mutate identity state without governed authorization.
 - During evidence retention, replay cryptographically reverifies every acceptance or rejection; afterward, signed trace reconstruction makes the reduced guarantee explicit.
 - Load tests show identity admission latency is independent of board row count.
+- Billion-entry locator sizing and hot/archive point plans meet the storage and latency budget before archival is enabled.
 - Active-session admission meets mondayDB's 99.99% objective under verifier outage; session-opening SLI and its external dependency errors are reported separately.
 - Failure tests cover verifier outage, audit outage, key rotation race, epoch revocation, stale cache, challenge/DPoP replay, cross-tenant IDs, malicious tenant-context changes, and internal context substitution.
 
