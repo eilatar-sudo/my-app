@@ -614,7 +614,7 @@ CREATE TABLE agent_workload_verification_decisions (
     decision <> 'VERIFIED'
     OR (
       challenge_id IS NOT NULL
-      resolved_issuer_id IS NOT NULL
+      AND resolved_issuer_id IS NOT NULL
       AND resolved_principal_id IS NOT NULL
       AND proof_key_thumbprint IS NOT NULL
       AND artifact_digest IS NOT NULL
