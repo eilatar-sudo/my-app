@@ -514,11 +514,15 @@ CREATE TABLE agent_workload_key_bindings (
   CHECK (revoked_at IS NULL OR revoked_at >= valid_from),
   CHECK (
     (
+      key_generation = 1
+      AND
       rotation_id IS NULL
       AND rotation_status IS NULL
       AND rotation_expires_at IS NULL
     )
     OR (
+      key_generation > 1
+      AND
       rotation_id IS NOT NULL
       AND rotation_status = 'CONSUMED'
       AND rotation_expires_at IS NOT NULL
