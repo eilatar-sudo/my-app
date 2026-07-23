@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import process from "node:process";
-import ts from "typescript";
+import * as ts from "typescript";
 import { buildSchema, validateSchema } from "graphql";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
