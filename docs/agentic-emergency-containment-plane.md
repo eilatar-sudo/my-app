@@ -503,7 +503,8 @@ export interface ContainmentApproval {
   readonly accountId: AccountId;
   readonly proposalId: ProposalId;
   readonly approverPrincipalId: PrincipalId;
-  readonly approverHumanSubjectId: string;
+  readonly approverSubjectKind: "HUMAN" | "WORKLOAD" | "DETECTOR";
+  readonly approverSubjectId: string;
   readonly approvalClass:
     | "SELF_OPERATION"
     | "SINGLE_OPERATOR"
@@ -615,19 +616,38 @@ export interface CheckpointRequest {
   readonly idempotencyKey: string;
 }
 
-export interface CheckpointResult {
+export interface CheckpointResultBase {
   readonly accountId: AccountId;
   readonly operationId: OperationId;
   readonly checkpoint: CheckpointKind;
-  readonly decision: CheckpointDecision;
   readonly reasonCodes: readonly string[];
-  readonly effectiveActions?: readonly ContainmentAction[];
-  readonly snapshot: ContainmentSnapshot;
   readonly quarantineRef?: string;
   readonly retryable: boolean;
-  readonly authorizesEffects: boolean;
   readonly decisionHash: Sha256;
 }
+
+export type CheckpointResult =
+  | (CheckpointResultBase & {
+      readonly decision: "ALLOW";
+      readonly effectiveActions: readonly ContainmentAction[];
+      readonly snapshot: VerifiedAllowSnapshot;
+      readonly authorizesEffects: true;
+    })
+  | (CheckpointResultBase & {
+      readonly decision: Exclude<
+        CheckpointDecision,
+        "ALLOW" | "UNVERIFIED_SAFE_READ"
+      >;
+      readonly effectiveActions: readonly ContainmentAction[];
+      readonly snapshot: VerifiedNonAuthorizingSnapshot;
+      readonly authorizesEffects: false;
+    })
+  | (CheckpointResultBase & {
+      readonly decision: "UNVERIFIED_SAFE_READ";
+      readonly effectiveActions?: never;
+      readonly snapshot: UnverifiedSafeReadSnapshot;
+      readonly authorizesEffects: false;
+    });
 
 export type ExternalEffectState =
   | "PENDING"
@@ -860,7 +880,10 @@ CREATE TABLE agent_containment_approval (
   account_id bigint NOT NULL,
   proposal_id uuid NOT NULL,
   approver_principal_id uuid NOT NULL,
-  approver_human_subject_id uuid NOT NULL,
+  approver_subject_kind text NOT NULL CHECK (
+    approver_subject_kind IN ('HUMAN', 'WORKLOAD', 'DETECTOR')
+  ),
+  approver_subject_id text NOT NULL,
   approval_class text NOT NULL CHECK (
     approval_class IN (
       'SELF_OPERATION',
@@ -874,10 +897,27 @@ CREATE TABLE agent_containment_approval (
   approved_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
   revoked_at timestamptz,
-  PRIMARY KEY (account_id, proposal_id, approver_human_subject_id),
+  PRIMARY KEY (
+    account_id,
+    proposal_id,
+    approver_subject_kind,
+    approver_subject_id
+  ),
   FOREIGN KEY (account_id, proposal_id)
     REFERENCES agent_containment_proposal (account_id, proposal_id),
-  CHECK (expires_at > approved_at)
+  CHECK (expires_at > approved_at),
+  CHECK (
+    approval_class NOT IN ('SINGLE_OPERATOR', 'TWO_PERSON') OR
+    approver_subject_kind = 'HUMAN'
+  ),
+  CHECK (
+    approval_class <> 'AUTOMATED_BREAK_GLASS' OR
+    approver_subject_kind = 'DETECTOR'
+  ),
+  CHECK (
+    approval_class <> 'SELF_OPERATION' OR
+    approver_subject_kind IN ('HUMAN', 'WORKLOAD')
+  )
 );
 
 CREATE INDEX agent_containment_approval_live_idx
@@ -885,7 +925,8 @@ CREATE INDEX agent_containment_approval_live_idx
     account_id,
     proposal_id,
     expires_at,
-    approver_human_subject_id
+    approver_subject_kind,
+    approver_subject_id
   )
   WHERE revoked_at IS NULL;
 
@@ -1867,6 +1908,71 @@ CREATE INDEX agent_containment_operational_audit_operation_idx
   )
   WHERE operation_id IS NOT NULL;
 
+CREATE TABLE agent_containment_operational_audit_incident (
+  account_id bigint NOT NULL,
+  audit_partition smallint NOT NULL,
+  partition_sequence bigint NOT NULL,
+  incident_id uuid NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    audit_partition,
+    partition_sequence,
+    incident_id
+  ),
+  FOREIGN KEY (account_id, audit_partition, partition_sequence)
+    REFERENCES agent_containment_operational_audit_event (
+      account_id,
+      audit_partition,
+      partition_sequence
+    ),
+  FOREIGN KEY (account_id, incident_id)
+    REFERENCES agent_containment_incident (account_id, incident_id)
+);
+
+CREATE INDEX agent_containment_operational_incident_reverse_idx
+  ON agent_containment_operational_audit_incident (
+    account_id,
+    incident_id,
+    audit_partition,
+    partition_sequence
+  );
+
+CREATE TABLE agent_containment_operational_audit_directive (
+  account_id bigint NOT NULL,
+  audit_partition smallint NOT NULL,
+  partition_sequence bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    audit_partition,
+    partition_sequence,
+    directive_id,
+    directive_revision
+  ),
+  FOREIGN KEY (account_id, audit_partition, partition_sequence)
+    REFERENCES agent_containment_operational_audit_event (
+      account_id,
+      audit_partition,
+      partition_sequence
+    ),
+  FOREIGN KEY (account_id, directive_id, directive_revision)
+    REFERENCES agent_containment_directive (
+      account_id,
+      directive_id,
+      revision
+    )
+);
+
+CREATE INDEX agent_containment_operational_directive_reverse_idx
+  ON agent_containment_operational_audit_directive (
+    account_id,
+    directive_id,
+    directive_revision,
+    audit_partition,
+    partition_sequence
+  );
+
 CREATE TABLE agent_containment_audit_merkle_anchor (
   account_id bigint NOT NULL,
   anchor_id uuid NOT NULL,
@@ -1891,6 +1997,90 @@ CREATE TABLE agent_containment_audit_merkle_anchor (
     REFERENCES agent_containment_audit_event (
       account_id,
       audit_sequence
+    )
+);
+
+CREATE TABLE agent_containment_operational_merkle_inclusion (
+  account_id bigint NOT NULL,
+  audit_partition smallint NOT NULL,
+  partition_sequence bigint NOT NULL,
+  anchor_id uuid NOT NULL,
+  leaf_ordinal integer NOT NULL CHECK (leaf_ordinal >= 0),
+  leaf_hash bytea NOT NULL,
+  inclusion_path_ref text NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    audit_partition,
+    partition_sequence,
+    anchor_id
+  ),
+  FOREIGN KEY (account_id, audit_partition, partition_sequence)
+    REFERENCES agent_containment_operational_audit_event (
+      account_id,
+      audit_partition,
+      partition_sequence
+    ),
+  FOREIGN KEY (account_id, anchor_id)
+    REFERENCES agent_containment_audit_merkle_anchor (
+      account_id,
+      anchor_id
+    )
+);
+
+CREATE TABLE agent_containment_checkpoint_merkle_anchor (
+  account_id bigint NOT NULL,
+  anchor_id uuid NOT NULL,
+  operation_id uuid NOT NULL,
+  first_checkpoint_sequence bigint NOT NULL
+    CHECK (first_checkpoint_sequence > 0),
+  last_checkpoint_sequence bigint NOT NULL
+    CHECK (last_checkpoint_sequence >= first_checkpoint_sequence),
+  merkle_root_hash bytea NOT NULL,
+  signature_ref text NOT NULL,
+  control_audit_sequence bigint NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, anchor_id),
+  UNIQUE (account_id, operation_id, anchor_id),
+  UNIQUE (
+    account_id,
+    operation_id,
+    first_checkpoint_sequence,
+    last_checkpoint_sequence
+  ),
+  FOREIGN KEY (account_id, operation_id)
+    REFERENCES agent_containment_operation (account_id, operation_id),
+  FOREIGN KEY (account_id, control_audit_sequence)
+    REFERENCES agent_containment_audit_event (
+      account_id,
+      audit_sequence
+    )
+);
+
+CREATE TABLE agent_containment_checkpoint_merkle_inclusion (
+  account_id bigint NOT NULL,
+  operation_id uuid NOT NULL,
+  checkpoint_sequence bigint NOT NULL,
+  anchor_id uuid NOT NULL,
+  leaf_ordinal integer NOT NULL CHECK (leaf_ordinal >= 0),
+  leaf_hash bytea NOT NULL,
+  inclusion_path_ref text NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    operation_id,
+    checkpoint_sequence,
+    anchor_id
+  ),
+  FOREIGN KEY (account_id, operation_id, checkpoint_sequence)
+    REFERENCES agent_containment_checkpoint (
+      account_id,
+      operation_id,
+      checkpoint_sequence
+    ),
+  FOREIGN KEY (account_id, operation_id, anchor_id)
+    REFERENCES agent_containment_checkpoint_merkle_anchor (
+      account_id,
+      operation_id,
+      anchor_id
     )
 );
 ```
@@ -2063,6 +2253,8 @@ FOR UPDATE;
 -- Remove live action contributions, decrement action reference counts,
 -- rebuild only affected effective masks, and advance the epoch.
 -- Persist the release revision and tenant control-chain audit event.
+-- Set all barrier shards back to OPEN, clear release_request_id, and
+-- increment freeze_generation. Row locks remain held through commit.
 
 COMMIT;
 ```
@@ -2075,6 +2267,12 @@ shards with conflicting updates; decrements remain allowed so draining can
 complete. A `DISPATCH_STARTED` effect already contributes to
 `dispatched_unresolved_count`, so release cannot race a provider call whose
 outcome may later become unknown.
+
+On successful release, the same transaction reopens every barrier shard only
+after the directive contributions are removed, the new epoch is installed,
+and zero counts are proven. Locks are retained until commit, so a waiting
+producer resumes only against released policy and the new epoch. A failed
+release aborts the freeze with the transaction.
 
 ### 8.6 Physical layout
 
@@ -2882,9 +3080,12 @@ worker events, and exceptional receipts without an operation use 64 fixed
 account-local audit partitions selected by stable event key. A checkpoint that
 matched multiple directives stores normalized
 checkpoint-to-directive-revision membership rows; control events store
-event-to-incident and event-to-directive-revision memberships. A set hash alone
-is not replay evidence. Canonical event payloads are retained by immutable
-content-addressed reference, not discarded after hashing.
+event-to-incident and event-to-directive-revision memberships; partitioned
+events store equivalent account-leading reverse memberships. The
+incident-filtered GraphQL cursor merges these three indexed streams without a
+scan. A set hash alone is not replay evidence. Canonical event payloads are
+retained by immutable content-addressed reference, not discarded after
+hashing.
 
 All operation checkpoints append to the operation's
 `previous_checkpoint_hash` chain without locking the tenant control head.
@@ -2892,7 +3093,9 @@ Operational partition events follow the same pattern. Fixed-size batches are
 sealed into Merkle trees; signed roots are periodically anchored in the tenant
 control chain and copied to retention-locked WORM storage. This avoids a
 tenant-wide hot row during normal traffic or an incident while preserving
-tamper evidence.
+tamper evidence. Every sealed checkpoint or partition event stores its leaf
+ordinal, leaf hash, and immutable inclusion-path reference to a signed anchor,
+so replay can verify membership rather than merely trust a root.
 
 Replay uses immutable payloads, policy versions, canonicalization versions,
 target hashes, exact fence generations, scope-vector hashes, database
