@@ -136,6 +136,12 @@ Every autonomous envelope carries the last evaluated containment epoch and a has
 
 Mutation commit and tool release recheck the durable head in their authorization transaction. A cache hit is not sufficient for a side effect.
 
+The side-effect transaction takes a shared lock on the tenant head that
+conflicts with the activation transaction's head update. Existing shared
+holders may finish and therefore serialize before activation; activation must
+commit before it returns, and no transaction that acquires the shared barrier
+afterward can validate an older epoch.
+
 ### 3.5 Release guarantee
 
 Release is a new directive revision, never deletion. It requires:
@@ -147,15 +153,36 @@ Release is a new directive revision, never deletion. It requires:
 - no unresolved mandatory reconciliation task;
 - a fresh containment epoch.
 
+Release starts with an immutable release request. Its canonical hash binds the
+account, directive ID and revision, expected epoch, exact evidence-set hash,
+reason code, policy version, requester, and approval expiry. Release approvals
+sign that hash and are distinct from activation approvals. Policy enforces
+requester/approver/releaser separation and, where required, distinct verified
+human subjects rather than merely different workload principal IDs.
+
+Safe-state checks bind named producer streams and their counter generations.
+The release transaction locks the account head and every bounded affected
+scope counter, verifies that required open counters are zero, verifies that no
+counter generation changed since evidence compilation, and advances the epoch
+before releasing the directive. Operation, publication, and external-effect
+transitions update the same counters under the same scope locks. This prevents
+a dispatcher from creating a new unresolved outcome between safe-state
+evaluation and release.
+
 Expiry transitions a directive to `EXPIRED_PENDING_REVIEW`; it does not silently restore write or tool authority. Policy may allow low-risk observation-only directives to expire automatically, but deny directives default to explicit release.
 
 ### 3.6 Availability behavior
 
 - Human reads and writes follow their existing authorization path unless an independent human-safety policy applies.
 - Autonomous writes and tool releases fail closed when the current containment head cannot be durably verified.
-- Bounded autonomous reads may fail open only under a precompiled policy that marks them `SAFE_READ`; returned packets state `containmentStatus: UNVERIFIED`, cannot authorize a later effect, and are not written to long-term memory.
+- Bounded autonomous reads may fail open only under a precompiled policy that marks them `SAFE_READ`; returned packets state `containmentStatus: UNVERIFIED`, omit authoritative epoch/action fields and the effect-authorization MAC, set `authorizesEffects: false`, cannot authorize a later effect, and are not written to long-term memory.
 - An account-specific activation never acquires a global tenant lock and never touches another account's row, queue, or cache key.
 - Regional promotion requires RPO=0 replication for the tenant containment head and increments the regional leadership epoch before autonomous effects resume.
+- The leadership epoch mirrors a term from a consensus-backed, time-bounded
+  writer lease enforced by row storage, request routers, result/vector
+  publishers, and tool dispatchers. A region that loses lease quorum cannot
+  validate its own stale copy and fails autonomous effects closed. Replication
+  of an epoch field alone is not a fencing mechanism.
 
 ## 4. Deterministic invariants
 
@@ -172,7 +199,9 @@ Expiry transitions a directive to `EXPIRED_PENDING_REVIEW`; it does not silently
 11. **Idempotent transitions:** an operation key plus canonical request hash returns one durable result.
 12. **Current authorization:** containment release never bypasses access, consent, purpose, delegation, runtime, or identity checks.
 13. **No scan fallback:** missing indexes, stale snapshots, or exhausted budgets reject or queue; they never trigger a board scan.
-14. **Audited decision:** every state transition and checkpoint result is hash chained in tenant order.
+14. **Audited decision:** control transitions and exceptional checkpoint
+    results are hash chained in tenant order; ordinary allow receipts use
+    per-operation chains sealed into tenant Merkle roots.
 15. **Database determinism:** no LLM decides scope, action composition, activation, checkpoint outcome, safe state, or release.
 
 ## 5. Containment model
@@ -189,15 +218,31 @@ Expiry transitions a directive to `EXPIRED_PENDING_REVIEW`; it does not silently
 
 Advancing the epoch invalidates snapshots only inside the affected tenant. It does not require a cache broadcast to be safe: cache invalidation improves latency, while the durable comparison protects effects.
 
+`regional_leadership_epoch` is evidence of a consensus-issued writer term, not
+the source of leadership truth. Every autonomous side-effect transaction also
+proves that its region currently owns the unexpired term. Lease loss blocks
+new shared-barrier acquisition; promotion waits for the old lease to expire or
+be quorum-revoked, allocates a higher term, then updates the tenant head.
+
 ### 5.2 Effective fences
 
 An effective fence is materialized at:
 
 `(account_id, scope_type, scope_key_hash, scope_key)`
 
-It contains the union action mask, highest source directive generation, active-directive count, and evidence hash. Activation locks and recomputes only explicitly targeted fence rows. The server sorts targets canonically before locking to avoid deadlocks.
+It contains the union action mask, highest source directive generation,
+active-directive count, and evidence hash. The write path also maintains one
+live reference count per `(scope, action_bit)` and an immutable contribution
+row per directive revision. Activation increments and release decrements only
+the bounded affected action counts; the effective mask is compiled from
+positive counts. Historical directive targets are never scanned to recompute a
+hot fence. The server sorts targets canonically before locking to avoid
+deadlocks.
 
-Hash is an index accelerator, not identity. Equality compares both hash and canonical key.
+The stored hash is a versioned tenant-keyed HMAC used as an index accelerator,
+not identity. Equality compares both HMAC and canonical key. API-visible scope
+tokens use a separate audience-bound opaque-reference key so database index
+values are never exposed.
 
 ### 5.3 Scope evaluation
 
@@ -233,24 +278,61 @@ An operation cannot omit a resource, connector, or capability used by its immuta
 | `RESULT_PUBLISH` | linearizable | retain encrypted result in quarantine |
 | `VECTOR_PUBLISH` | linearizable | prevent index visibility |
 | `TOOL_RELEASE` | same ACID transaction as outbox release token | cancel or hold delivery |
+| `DISPATCH_START` | generation CAS plus linearizable containment and writer-term check | cancel token before provider I/O |
 | `PROCEDURE_STEP` | durable on every side-effect boundary | drain or stop |
 
 Long-running columnar and vector reads poll at fixed work-unit boundaries. They may finish local compute after a fence, but cannot publish, cache, index, or use the result to authorize an effect without a current checkpoint.
 
-### 5.5 External point of no return
+Result and vector publication use the same atomic visibility pattern as a row
+mutation: under the shared tenant barrier they persist the current checkpoint
+and transition the artifact from private staging to visible state in one
+transaction. An object-store upload may occur earlier, but an unpublished
+object is unreachable and remains eligible for quarantine or destruction.
+
+### 5.5 Action compilation and precedence
+
+Action bits use fixed values:
+
+| Action | Bit | Compiler closure |
+|---|---:|---|
+| `DENY_NEW_OPERATIONS` | 1 | none |
+| `DENY_MUTATION_COMMIT` | 2 | none |
+| `DENY_TOOL_RELEASE` | 4 | also denies `DISPATCH_START` |
+| `CANCEL_PENDING` | 8 | implies `DENY_NEW_OPERATIONS` |
+| `DRAIN_ACTIVE` | 16 | implies both side-effect deny bits |
+| `QUARANTINE_RESULTS` | 32 | applies at result and vector publication |
+| `REQUIRE_REAUTH` | 64 | denies all checkpoints except safe reads until reauthentication |
+| `REQUIRE_HUMAN_RELEASE` | 128 | release workflow only |
+
+The compiler stores the closed mask, not the raw request. At a checkpoint,
+precedence is `DENY` > `REAUTH_REQUIRED` > `QUARANTINE` > `DRAIN` > `ALLOW`.
+`CANCEL_PENDING` alone can never race newly admitted work because its closure
+also denies admission. Unknown bits reject activation and replay.
+
+### 5.6 External point of no return
 
 Tool Execution has explicit phases:
 
 1. `PENDING`: durable outbox exists; no provider call.
 2. `RELEASED`: a short-lived, generation-bound release token was issued after containment check.
-3. `DISPATCH_STARTED`: worker is entering the provider call.
+3. `DISPATCH_STARTED`: a generation compare-and-swap transaction rechecked the
+   current containment epoch, exact scope vector, consensus writer term, and
+   token expiry, then durably claimed provider I/O.
 4. `ACKNOWLEDGED`: provider supplied a durable success identifier.
 5. `OUTCOME_UNKNOWN`: timeout or containment raced after dispatch started.
 6. `COMPENSATION_PENDING` or `RECONCILED`.
 
-Containment before `RELEASED` prevents dispatch. After `DISPATCH_STARTED`, cancellation is best effort. Provider idempotency, status lookup, and reviewed compensation procedures resolve uncertainty; mondayDB never claims that revoking a token retracts bytes already received by a provider.
+Containment before the `DISPATCH_STARTED` claim prevents dispatch, including a
+token that was previously `RELEASED`. The dispatch-start commit is the
+provider-I/O serialization point and persists worker generation, writer term,
+scope-vector hash, claim time, and token expiry. The worker must begin I/O
+within the policy's tiny post-claim interval or abandon the generation and
+recheck. After `DISPATCH_STARTED`, cancellation is best effort. Provider
+idempotency, status lookup, and reviewed compensation procedures resolve
+uncertainty; mondayDB never claims that revoking a token retracts bytes already
+received by a provider.
 
-### 5.6 Safe-state evidence
+### 5.7 Safe-state evidence
 
 Safe state is a deterministic conjunction of policy-required checks, such as:
 
@@ -261,7 +343,10 @@ Safe state is a deterministic conjunction of policy-required checks, such as:
 - replacement credentials have passed workload attestation;
 - required compensation tasks are completed or explicitly risk-accepted.
 
-Each check records a typed evidence reference, source watermark, evaluator version, result, and hash. Free-form incident prose may accompany evidence but cannot satisfy a release predicate.
+Each check records typed evidence references, named producer streams,
+transactionally maintained scope-counter generations, evaluator version,
+result, and hash. Free-form incident prose may accompany evidence but cannot
+satisfy a release predicate.
 
 ## 6. Lifecycle
 
@@ -361,6 +446,7 @@ export type CheckpointKind =
   | "RESULT_PUBLISH"
   | "VECTOR_PUBLISH"
   | "TOOL_RELEASE"
+  | "DISPATCH_START"
   | "PROCEDURE_STEP";
 
 export type CheckpointDecision =
@@ -369,6 +455,10 @@ export type CheckpointDecision =
   | "DRAIN"
   | "QUARANTINE"
   | "REAUTH_REQUIRED"
+  | "UNVERIFIED_SAFE_READ";
+
+export type ContainmentVerificationStatus =
+  | "VERIFIED"
   | "UNVERIFIED_SAFE_READ";
 
 export interface ContainmentTarget {
@@ -404,6 +494,30 @@ export interface ContainmentApproval {
   readonly expiresAt: DateTimeString;
 }
 
+export interface ContainmentReleaseRequest {
+  readonly accountId: AccountId;
+  readonly releaseRequestId: string;
+  readonly directiveId: DirectiveId;
+  readonly expectedDirectiveRevision: NonNegativeInt64String;
+  readonly expectedEpoch: NonNegativeInt64String;
+  readonly evidenceSetHash: Sha256;
+  readonly reasonCode: string;
+  readonly policyVersion: NonNegativeInt64String;
+  readonly requesterPrincipalId: PrincipalId;
+  readonly approvalExpiresAt: DateTimeString;
+  readonly canonicalReleaseHash: Sha256;
+}
+
+export interface ContainmentReleaseApproval {
+  readonly accountId: AccountId;
+  readonly releaseRequestId: string;
+  readonly approverHumanSubjectId: string;
+  readonly approverPrincipalId: PrincipalId;
+  readonly canonicalReleaseHash: Sha256;
+  readonly signatureRef: string;
+  readonly expiresAt: DateTimeString;
+}
+
 export interface ContainmentDirective {
   readonly accountId: AccountId;
   readonly directiveId: DirectiveId;
@@ -433,9 +547,10 @@ export interface OperationScopeVector {
   readonly scopeVectorHash: Sha256;
 }
 
-export interface ContainmentSnapshot {
+export interface VerifiedContainmentSnapshot {
   readonly accountId: AccountId;
   readonly operationId: OperationId;
+  readonly verificationStatus: "VERIFIED";
   readonly containmentEpoch: NonNegativeInt64String;
   readonly regionalLeadershipEpoch: NonNegativeInt64String;
   readonly scopeVectorHash: Sha256;
@@ -444,7 +559,24 @@ export interface ContainmentSnapshot {
   readonly evaluatedAt: DateTimeString;
   readonly expiresAt: DateTimeString;
   readonly snapshotHash: Sha256;
+  readonly authorizesEffects: true;
+  readonly effectAuthorizationMacRef: string;
 }
+
+export interface UnverifiedSafeReadSnapshot {
+  readonly accountId: AccountId;
+  readonly operationId: OperationId;
+  readonly verificationStatus: "UNVERIFIED_SAFE_READ";
+  readonly scopeVectorHash: Sha256;
+  readonly evaluatedAt: DateTimeString;
+  readonly expiresAt: DateTimeString;
+  readonly snapshotHash: Sha256;
+  readonly authorizesEffects: false;
+}
+
+export type ContainmentSnapshot =
+  | VerifiedContainmentSnapshot
+  | UnverifiedSafeReadSnapshot;
 
 export interface CheckpointRequest {
   readonly accountId: AccountId;
@@ -465,6 +597,7 @@ export interface CheckpointResult {
   readonly snapshot: ContainmentSnapshot;
   readonly quarantineRef?: string;
   readonly retryable: boolean;
+  readonly authorizesEffects: boolean;
   readonly decisionHash: Sha256;
 }
 
@@ -485,6 +618,11 @@ export interface ExternalEffectReceipt {
   readonly state: ExternalEffectState;
   readonly releaseGeneration: NonNegativeInt64String;
   readonly releaseContainmentEpoch?: NonNegativeInt64String;
+  readonly releaseRegionalLeadershipEpoch?: NonNegativeInt64String;
+  readonly releaseTokenExpiresAt?: DateTimeString;
+  readonly dispatchClaimedAt?: DateTimeString;
+  readonly dispatchWorkerGeneration?: NonNegativeInt64String;
+  readonly scopeVectorHash: Sha256;
   readonly providerIdempotencyKey: string;
   readonly providerReceiptRef?: string;
   readonly reconciliationEvidenceRef?: EvidenceId;
@@ -496,7 +634,10 @@ export interface SafeStateCheck {
   readonly directiveId: DirectiveId;
   readonly checkCode: string;
   readonly evaluatorVersion: string;
-  readonly sourceWatermark: NonNegativeInt64String;
+  readonly streamWatermarks: Readonly<
+    Record<string, NonNegativeInt64String>
+  >;
+  readonly scopeCounterGenerations: readonly NonNegativeInt64String[];
   readonly passed: boolean;
   readonly evidenceRefs: readonly EvidenceId[];
   readonly checkHash: Sha256;
@@ -506,6 +647,14 @@ export interface ContainmentPerceptionCard {
   readonly accountId: AccountId;
   readonly incidentId: IncidentId;
   readonly containmentEpoch: NonNegativeInt64String;
+  readonly regionalLeadershipEpoch: NonNegativeInt64String;
+  readonly schemaVersion: string;
+  readonly audiencePrincipalId: PrincipalId;
+  readonly policyVersion: NonNegativeInt64String;
+  readonly generatedAt: DateTimeString;
+  readonly expiresAt: DateTimeString;
+  readonly sourceWatermark: NonNegativeInt64String;
+  readonly sourceLagMillis: NonNegativeInt64String;
   readonly status: "ACTIVE" | "REVIEW_REQUIRED" | "SAFE_TO_RELEASE" | "RELEASED";
   readonly effectiveActions: readonly ContainmentAction[];
   readonly targetTypeCounts: Readonly<
@@ -523,6 +672,7 @@ export interface ContainmentPerceptionCard {
     | "WAIT"
   )[];
   readonly cardHash: Sha256;
+  readonly signatureRef: string;
 }
 ```
 
@@ -569,6 +719,7 @@ CREATE TYPE containment_checkpoint_kind AS ENUM (
   'RESULT_PUBLISH',
   'VECTOR_PUBLISH',
   'TOOL_RELEASE',
+  'DISPATCH_START',
   'PROCEDURE_STEP'
 );
 
@@ -705,6 +856,61 @@ CREATE INDEX agent_containment_approval_live_idx
   )
   WHERE revoked_at IS NULL;
 
+CREATE TABLE agent_containment_release_request (
+  account_id bigint NOT NULL,
+  release_request_id uuid NOT NULL,
+  directive_id uuid NOT NULL,
+  expected_directive_revision bigint NOT NULL
+    CHECK (expected_directive_revision > 0),
+  expected_epoch bigint NOT NULL CHECK (expected_epoch >= 0),
+  evidence_set_hash bytea NOT NULL,
+  reason_code text NOT NULL,
+  policy_version bigint NOT NULL CHECK (policy_version >= 0),
+  requester_principal_id uuid NOT NULL,
+  requester_human_subject_id uuid NOT NULL,
+  canonical_release_hash bytea NOT NULL,
+  state text NOT NULL CHECK (
+    state IN ('APPROVAL_PENDING', 'APPROVED', 'RELEASED', 'REJECTED', 'EXPIRED')
+  ),
+  created_at timestamptz NOT NULL,
+  approval_expires_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, release_request_id),
+  UNIQUE (account_id, canonical_release_hash),
+  CHECK (approval_expires_at > created_at)
+);
+
+CREATE TABLE agent_containment_release_approval (
+  account_id bigint NOT NULL,
+  release_request_id uuid NOT NULL,
+  approver_principal_id uuid NOT NULL,
+  approver_human_subject_id uuid NOT NULL,
+  canonical_release_hash bytea NOT NULL,
+  signature_ref text NOT NULL,
+  approved_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  PRIMARY KEY (
+    account_id,
+    release_request_id,
+    approver_human_subject_id
+  ),
+  FOREIGN KEY (account_id, release_request_id)
+    REFERENCES agent_containment_release_request (
+      account_id,
+      release_request_id
+    ),
+  CHECK (expires_at > approved_at)
+);
+
+CREATE INDEX agent_containment_release_approval_live_idx
+  ON agent_containment_release_approval (
+    account_id,
+    release_request_id,
+    expires_at,
+    approver_human_subject_id
+  )
+  WHERE revoked_at IS NULL;
+
 CREATE TABLE agent_containment_directive (
   account_id bigint NOT NULL,
   directive_id uuid NOT NULL,
@@ -810,6 +1016,77 @@ CREATE INDEX agent_containment_directive_target_scope_idx
     directive_revision
   );
 
+ALTER TABLE agent_containment_release_request
+  ADD FOREIGN KEY (
+    account_id,
+    directive_id,
+    expected_directive_revision
+  ) REFERENCES agent_containment_directive (
+    account_id,
+    directive_id,
+    revision
+  );
+
+CREATE TABLE agent_containment_live_contribution (
+  account_id bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  scope_type containment_scope_type NOT NULL,
+  scope_key_hash bytea NOT NULL,
+  canonical_scope_key text NOT NULL,
+  action_bit smallint NOT NULL CHECK (
+    action_bit IN (1, 2, 4, 8, 16, 32, 64, 128)
+  ),
+  contribution_epoch bigint NOT NULL CHECK (contribution_epoch >= 0),
+  PRIMARY KEY (
+    account_id,
+    directive_id,
+    directive_revision,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key,
+    action_bit
+  ),
+  FOREIGN KEY (account_id, directive_id, directive_revision)
+    REFERENCES agent_containment_directive (
+      account_id,
+      directive_id,
+      revision
+    )
+);
+
+CREATE INDEX agent_containment_live_contribution_scope_idx
+  ON agent_containment_live_contribution (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key,
+    action_bit,
+    directive_id,
+    directive_revision
+  );
+
+CREATE TABLE agent_containment_scope_action_count (
+  account_id bigint NOT NULL,
+  scope_type containment_scope_type NOT NULL,
+  scope_key_hash bytea NOT NULL,
+  canonical_scope_key text NOT NULL,
+  action_bit smallint NOT NULL CHECK (
+    action_bit IN (1, 2, 4, 8, 16, 32, 64, 128)
+  ),
+  active_reference_count integer NOT NULL
+    CHECK (active_reference_count > 0),
+  counter_generation bigint NOT NULL CHECK (counter_generation > 0),
+  highest_epoch bigint NOT NULL CHECK (highest_epoch >= 0),
+  PRIMARY KEY (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key,
+    action_bit
+  )
+);
+
 CREATE TABLE agent_containment_effective_fence (
   account_id bigint NOT NULL,
   scope_type containment_scope_type NOT NULL,
@@ -837,6 +1114,29 @@ CREATE INDEX agent_containment_effective_fence_epoch_idx
     scope_type,
     scope_key_hash
   );
+
+CREATE TABLE agent_containment_scope_open_counter (
+  account_id bigint NOT NULL,
+  scope_type containment_scope_type NOT NULL,
+  scope_key_hash bytea NOT NULL,
+  canonical_scope_key text NOT NULL,
+  counter_generation bigint NOT NULL CHECK (counter_generation >= 0),
+  live_operation_count bigint NOT NULL DEFAULT 0
+    CHECK (live_operation_count >= 0),
+  unpublished_result_count bigint NOT NULL DEFAULT 0
+    CHECK (unpublished_result_count >= 0),
+  releasable_outbox_count bigint NOT NULL DEFAULT 0
+    CHECK (releasable_outbox_count >= 0),
+  dispatched_unresolved_count bigint NOT NULL DEFAULT 0
+    CHECK (dispatched_unresolved_count >= 0),
+  updated_at timestamptz NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key
+  )
+);
 
 CREATE TABLE agent_containment_operation (
   account_id bigint NOT NULL,
@@ -885,6 +1185,14 @@ CREATE INDEX agent_containment_operation_principal_idx
     state,
     operation_id
   );
+
+CREATE INDEX agent_containment_operation_live_account_idx
+  ON agent_containment_operation (
+    account_id,
+    state,
+    operation_id
+  )
+  WHERE state IN ('ADMITTED', 'RUNNING', 'DRAINING', 'QUARANTINED');
 
 CREATE INDEX agent_containment_operation_session_idx
   ON agent_containment_operation (
@@ -962,15 +1270,21 @@ CREATE TABLE agent_containment_checkpoint (
   operation_id uuid NOT NULL,
   checkpoint_sequence bigint NOT NULL CHECK (checkpoint_sequence > 0),
   checkpoint_kind containment_checkpoint_kind NOT NULL,
-  containment_epoch bigint NOT NULL CHECK (containment_epoch >= 0),
-  regional_leadership_epoch bigint NOT NULL
+  verification_status text NOT NULL CHECK (
+    verification_status IN ('VERIFIED', 'UNVERIFIED_SAFE_READ')
+  ),
+  containment_epoch bigint CHECK (containment_epoch >= 0),
+  regional_leadership_epoch bigint
     CHECK (regional_leadership_epoch >= 0),
-  effective_action_mask bigint NOT NULL
+  effective_action_mask bigint
     CHECK (effective_action_mask >= 0),
   decision containment_checkpoint_decision NOT NULL,
   scope_vector_hash bytea NOT NULL,
-  matched_directive_set_hash bytea NOT NULL,
+  matched_directive_set_hash bytea,
   snapshot_hash bytea NOT NULL,
+  effect_authorization_mac_ref text,
+  authorizes_effects boolean NOT NULL,
+  previous_checkpoint_hash bytea NOT NULL,
   decision_hash bytea NOT NULL,
   evaluated_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
@@ -978,7 +1292,29 @@ CREATE TABLE agent_containment_checkpoint (
   UNIQUE (account_id, operation_id, decision_hash),
   FOREIGN KEY (account_id, operation_id)
     REFERENCES agent_containment_operation (account_id, operation_id),
-  CHECK (expires_at > evaluated_at)
+  CHECK (expires_at > evaluated_at),
+  CHECK (
+    (
+      verification_status = 'VERIFIED' AND
+      containment_epoch IS NOT NULL AND
+      regional_leadership_epoch IS NOT NULL AND
+      effective_action_mask IS NOT NULL AND
+      matched_directive_set_hash IS NOT NULL AND
+      effect_authorization_mac_ref IS NOT NULL
+    )
+    OR
+    (
+      verification_status = 'UNVERIFIED_SAFE_READ' AND
+      decision = 'UNVERIFIED_SAFE_READ' AND
+      containment_epoch IS NULL AND
+      regional_leadership_epoch IS NULL AND
+      effective_action_mask IS NULL AND
+      matched_directive_set_hash IS NULL AND
+      effect_authorization_mac_ref IS NULL AND
+      authorizes_effects = false
+    )
+  ),
+  CHECK (authorizes_effects = (decision = 'ALLOW'))
 );
 
 CREATE INDEX agent_containment_checkpoint_epoch_idx
@@ -1128,7 +1464,8 @@ CREATE TABLE agent_containment_safe_state_check (
   directive_revision bigint NOT NULL,
   check_code text NOT NULL,
   evaluator_version text NOT NULL,
-  source_watermark bigint NOT NULL CHECK (source_watermark >= 0),
+  evidence_compilation_epoch bigint NOT NULL
+    CHECK (evidence_compilation_epoch >= 0),
   passed boolean NOT NULL,
   evidence_set_hash bytea NOT NULL,
   check_hash bytea NOT NULL,
@@ -1146,6 +1483,84 @@ CREATE TABLE agent_containment_safe_state_check (
       directive_id,
       revision
     )
+);
+
+CREATE TABLE agent_containment_safe_state_stream (
+  account_id bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  check_code text NOT NULL,
+  stream_name text NOT NULL,
+  source_watermark bigint NOT NULL CHECK (source_watermark >= 0),
+  PRIMARY KEY (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code,
+    stream_name
+  ),
+  FOREIGN KEY (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code
+  ) REFERENCES agent_containment_safe_state_check (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code
+  )
+);
+
+CREATE TABLE agent_containment_safe_state_scope (
+  account_id bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  check_code text NOT NULL,
+  scope_type containment_scope_type NOT NULL,
+  scope_key_hash bytea NOT NULL,
+  canonical_scope_key text NOT NULL,
+  observed_counter_generation bigint NOT NULL
+    CHECK (observed_counter_generation >= 0),
+  observed_live_operation_count bigint NOT NULL
+    CHECK (observed_live_operation_count >= 0),
+  observed_unpublished_result_count bigint NOT NULL
+    CHECK (observed_unpublished_result_count >= 0),
+  observed_releasable_outbox_count bigint NOT NULL
+    CHECK (observed_releasable_outbox_count >= 0),
+  observed_dispatched_unresolved_count bigint NOT NULL
+    CHECK (observed_dispatched_unresolved_count >= 0),
+  PRIMARY KEY (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key
+  ),
+  FOREIGN KEY (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code
+  ) REFERENCES agent_containment_safe_state_check (
+    account_id,
+    directive_id,
+    directive_revision,
+    check_code
+  ),
+  FOREIGN KEY (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key
+  ) REFERENCES agent_containment_scope_open_counter (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key
+  )
 );
 
 CREATE TABLE agent_containment_external_effect (
@@ -1168,6 +1583,14 @@ CREATE TABLE agent_containment_external_effect (
     CHECK (release_generation >= 0),
   release_containment_epoch bigint
     CHECK (release_containment_epoch >= 0),
+  release_regional_leadership_epoch bigint
+    CHECK (release_regional_leadership_epoch >= 0),
+  release_token_expires_at timestamptz,
+  released_at timestamptz,
+  scope_vector_hash bytea NOT NULL,
+  dispatch_worker_generation bigint
+    CHECK (dispatch_worker_generation >= 0),
+  dispatch_claimed_at timestamptz,
   provider_idempotency_key text NOT NULL,
   provider_receipt_ref text,
   reconciliation_evidence_hash bytea,
@@ -1178,14 +1601,38 @@ CREATE TABLE agent_containment_external_effect (
   FOREIGN KEY (account_id, operation_id)
     REFERENCES agent_containment_operation (account_id, operation_id),
   CHECK (
-    (state IN (
-      'RELEASED',
-      'DISPATCH_STARTED',
-      'ACKNOWLEDGED',
-      'OUTCOME_UNKNOWN',
-      'COMPENSATION_PENDING',
-      'RECONCILED'
-    )) = (release_containment_epoch IS NOT NULL)
+    (
+      release_containment_epoch IS NULL AND
+      release_regional_leadership_epoch IS NULL AND
+      release_token_expires_at IS NULL AND
+      released_at IS NULL
+    )
+    OR
+    (
+      release_containment_epoch IS NOT NULL AND
+      release_regional_leadership_epoch IS NOT NULL AND
+      release_token_expires_at IS NOT NULL AND
+      released_at IS NOT NULL
+    )
+  ),
+  CHECK (
+    state IN ('PENDING', 'CANCELLED') OR
+    release_containment_epoch IS NOT NULL
+  ),
+  CHECK (
+    (
+      dispatch_worker_generation IS NULL AND
+      dispatch_claimed_at IS NULL
+    )
+    OR
+    (
+      dispatch_worker_generation IS NOT NULL AND
+      dispatch_claimed_at IS NOT NULL
+    )
+  ),
+  CHECK (
+    state IN ('PENDING', 'RELEASED', 'CANCELLED') OR
+    dispatch_claimed_at IS NOT NULL
   )
 );
 
@@ -1200,33 +1647,71 @@ CREATE INDEX agent_containment_external_effect_state_idx
 CREATE TABLE agent_containment_audit_event (
   account_id bigint NOT NULL,
   audit_sequence bigint NOT NULL CHECK (audit_sequence > 0),
-  incident_id uuid NOT NULL,
-  directive_id uuid,
-  directive_revision bigint,
   operation_id uuid,
   event_type text NOT NULL,
   actor_principal_id uuid NOT NULL,
   containment_epoch bigint NOT NULL CHECK (containment_epoch >= 0),
+  canonical_event_payload_ref text NOT NULL,
   canonical_event_hash bytea NOT NULL,
   previous_event_hash bytea NOT NULL,
   event_hash bytea NOT NULL,
   occurred_at timestamptz NOT NULL,
   PRIMARY KEY (account_id, audit_sequence),
   UNIQUE (account_id, event_hash),
-  FOREIGN KEY (account_id, incident_id)
-    REFERENCES agent_containment_incident (account_id, incident_id),
   FOREIGN KEY (account_id, operation_id)
-    REFERENCES agent_containment_operation (account_id, operation_id),
-  CHECK (
-    (directive_id IS NULL) =
-    (directive_revision IS NULL)
-  )
+    REFERENCES agent_containment_operation (account_id, operation_id)
+);
+
+CREATE TABLE agent_containment_audit_event_incident (
+  account_id bigint NOT NULL,
+  audit_sequence bigint NOT NULL,
+  incident_id uuid NOT NULL,
+  PRIMARY KEY (account_id, audit_sequence, incident_id),
+  FOREIGN KEY (account_id, audit_sequence)
+    REFERENCES agent_containment_audit_event (
+      account_id,
+      audit_sequence
+    ),
+  FOREIGN KEY (account_id, incident_id)
+    REFERENCES agent_containment_incident (account_id, incident_id)
 );
 
 CREATE INDEX agent_containment_audit_incident_idx
-  ON agent_containment_audit_event (
+  ON agent_containment_audit_event_incident (
     account_id,
     incident_id,
+    audit_sequence
+  );
+
+CREATE TABLE agent_containment_audit_event_directive (
+  account_id bigint NOT NULL,
+  audit_sequence bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    audit_sequence,
+    directive_id,
+    directive_revision
+  ),
+  FOREIGN KEY (account_id, audit_sequence)
+    REFERENCES agent_containment_audit_event (
+      account_id,
+      audit_sequence
+    ),
+  FOREIGN KEY (account_id, directive_id, directive_revision)
+    REFERENCES agent_containment_directive (
+      account_id,
+      directive_id,
+      revision
+    )
+);
+
+CREATE INDEX agent_containment_audit_directive_idx
+  ON agent_containment_audit_event_directive (
+    account_id,
+    directive_id,
+    directive_revision,
     audit_sequence
   );
 
@@ -1241,17 +1726,35 @@ CREATE INDEX agent_containment_audit_operation_idx
 
 ### 8.1 Tenant isolation
 
-Application SQL must bind tenant context before any query:
+Application SQL must bind tenant context inside the same explicit transaction
+as every query. The binding function is supplied by a trusted extension or
+gateway, validates a signed authentication-context token, and writes a context
+that application SQL cannot forge:
 
 ```sql
-SELECT set_config(
-  'monday.account_id',
-  :trusted_account_id,
-  true
-);
+BEGIN;
+SELECT monday_bind_trusted_account(:signed_auth_context_token);
+
+-- All tenant queries execute here.
+
+COMMIT;
+
+ALTER TABLE agent_containment_account_head ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_containment_account_head FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY containment_account_head_tenant_policy
+  ON agent_containment_account_head
+  USING (account_id = monday_trusted_account_id())
+  WITH CHECK (account_id = monday_trusted_account_id());
 ```
 
-Production tables require row-level security or the equivalent storage-layer tenant predicate. Foreign keys deliberately repeat `account_id`; an ID from one tenant cannot reference another tenant's proposal, directive, operation, incident, or evidence.
+The equivalent generated `ENABLE/FORCE ROW LEVEL SECURITY` policy is mandatory
+on every containment table. Application roles are not table owners, have no
+`BYPASSRLS`, cannot call an unsafe context setter, and cannot use a connection
+outside the bound transaction. DataLoader, prepared-statement, object, result,
+and negative-cache keys all begin with the trusted `account_id`. Foreign keys
+deliberately repeat `account_id`; an ID from one tenant cannot reference
+another tenant's proposal, directive, operation, incident, or evidence.
 
 ### 8.2 Activation transaction
 
@@ -1270,8 +1773,9 @@ FOR UPDATE;
 
 -- next_epoch is checked for signed bigint exhaustion.
 -- Insert the immutable directive revision and targets.
--- Lock affected effective-fence rows in canonical target order.
--- Recompute only those rows from active exact-target directives.
+-- Lock affected scope-action counters and effective-fence rows in
+-- canonical target/action order. Insert live contributions, increment
+-- reference counts, and compile masks only from positive counters.
 -- Insert bounded follow-up work items and the audit event.
 
 UPDATE agent_containment_account_head
@@ -1287,7 +1791,9 @@ WHERE account_id = :account_id
 COMMIT;
 ```
 
-No query in activation joins active operations, board rows, columnar segments, embeddings, or outbox history.
+Activation also proves the region's current consensus writer lease and term.
+No query in activation joins active operations, historical target revisions,
+board rows, columnar segments, embeddings, or outbox history.
 
 ### 8.3 Mutation commit predicate
 
@@ -1297,7 +1803,7 @@ The autonomous business mutation transaction must lock the account head and veri
 SELECT containment_epoch, regional_leadership_epoch, account_action_mask
 FROM agent_containment_account_head
 WHERE account_id = :account_id
-FOR KEY SHARE;
+FOR SHARE;
 
 SELECT scope_type, canonical_scope_key, action_mask, fence_generation
 FROM agent_containment_effective_fence
@@ -1322,9 +1828,80 @@ WHERE account_id = :account_id
 -- Persist the checkpoint and business mutation in the same transaction.
 ```
 
-Production code must not build unbounded `OR` expressions. It joins a server-owned bounded values relation to the full effective-fence primary key and rejects above the policy target ceiling.
+`FOR SHARE` intentionally conflicts with activation's account-head update.
+`FOR KEY SHARE` is insufficient because PostgreSQL permits a non-key `UPDATE`
+to proceed concurrently. The transaction also proves the current
+consensus-issued writer lease. Production code must not build unbounded `OR`
+expressions. It joins a server-owned bounded values relation to the full
+effective-fence primary key and rejects above the policy target ceiling.
 
-### 8.4 Physical layout
+### 8.4 Dispatch-start transaction
+
+Immediately before provider I/O, the worker performs a generation CAS:
+
+```sql
+BEGIN;
+
+SELECT containment_epoch, regional_leadership_epoch, account_action_mask
+FROM agent_containment_account_head
+WHERE account_id = :account_id
+FOR SHARE;
+
+-- Prove the consensus writer lease and evaluate the bounded exact
+-- operation scope vector against effective fences.
+
+UPDATE agent_containment_external_effect
+SET state = 'DISPATCH_STARTED',
+    dispatch_worker_generation = :next_worker_generation,
+    dispatch_claimed_at = clock_timestamp(),
+    updated_at = clock_timestamp()
+WHERE account_id = :account_id
+  AND outbox_id = :outbox_id
+  AND state = 'RELEASED'
+  AND release_generation = :expected_release_generation
+  AND release_containment_epoch <= :current_containment_epoch
+  AND release_regional_leadership_epoch = :leadership_epoch
+  AND release_token_expires_at > clock_timestamp();
+
+-- Require exactly one updated row, persist the DISPATCH_START checkpoint,
+-- and increment matching scope unresolved counters before commit.
+
+COMMIT;
+```
+
+A zero-row update cancels or retries without provider I/O. The worker begins
+I/O only after this commit and within the configured post-claim interval.
+
+### 8.5 Release transaction
+
+Release locks the same safety surfaces as effect producers:
+
+```sql
+BEGIN;
+
+SELECT containment_epoch, regional_leadership_epoch
+FROM agent_containment_account_head
+WHERE account_id = :account_id
+FOR UPDATE;
+
+-- Lock the release request and distinct, unexpired release approvals.
+-- Lock every affected scope_open_counter row in canonical scope order.
+-- Verify evidence-bound counter generations and required zero counts.
+-- Verify named stream watermarks and no unsealed producer delta.
+-- Remove live action contributions, decrement action reference counts,
+-- rebuild only affected effective masks, and advance the epoch.
+-- Persist the release revision and tenant control-chain audit event.
+
+COMMIT;
+```
+
+Every operation, outbox, dispatch, reconciliation, result-publication, and
+vector-publication transition locks and updates the same bounded scope-counter
+rows. A `DISPATCH_STARTED` effect already contributes to
+`dispatched_unresolved_count`, so release cannot race a provider call whose
+outcome may later become unknown.
+
+### 8.6 Physical layout
 
 - Hash-partition large tables by `account_id`; preserve `account_id` as the first logical key inside every partition.
 - Keep account heads and effective fences in the tenant's fenced write region.
@@ -1382,6 +1959,7 @@ enum ContainmentCheckpointKind {
   RESULT_PUBLISH
   VECTOR_PUBLISH
   TOOL_RELEASE
+  DISPATCH_START
   PROCEDURE_STEP
 }
 
@@ -1394,9 +1972,14 @@ enum ContainmentCheckpointDecision {
   UNVERIFIED_SAFE_READ
 }
 
+enum ContainmentVerificationStatus {
+  VERIFIED
+  UNVERIFIED_SAFE_READ
+}
+
 type ContainmentTarget {
   scopeType: ContainmentScopeType!
-  scopeKeyHash: SHA256!
+  opaqueScopeRef: ID!
   displayRef: String
 }
 
@@ -1431,18 +2014,29 @@ type ContainmentCheckpoint {
   accountId: ID!
   operationId: ID!
   checkpoint: ContainmentCheckpointKind!
+  verificationStatus: ContainmentVerificationStatus!
   decision: ContainmentCheckpointDecision!
   reasonCodes: [String!]!
   effectiveActions: [ContainmentAction!]!
-  containmentEpoch: LongString!
+  containmentEpoch: LongString
+  regionalLeadershipEpoch: LongString
   snapshotHash: SHA256!
   retryable: Boolean!
+  authorizesEffects: Boolean!
+  effectAuthorizationMacRef: String
+}
+
+type SafeStateStreamWatermark {
+  streamName: String!
+  sourceWatermark: LongString!
 }
 
 type SafeStateCheck {
   checkCode: String!
   evaluatorVersion: String!
-  sourceWatermark: LongString!
+  evidenceCompilationEpoch: LongString!
+  streamWatermarks: [SafeStateStreamWatermark!]!
+  scopeCounterGenerations: [LongString!]!
   passed: Boolean!
   evidenceRefs: [ID!]!
   checkHash: SHA256!
@@ -1453,6 +2047,14 @@ type ContainmentPerceptionCard {
   accountId: ID!
   incidentId: ID!
   containmentEpoch: LongString!
+  regionalLeadershipEpoch: LongString!
+  schemaVersion: String!
+  audiencePrincipalId: ID!
+  policyVersion: LongString!
+  generatedAt: DateTime!
+  expiresAt: DateTime!
+  sourceWatermark: LongString!
+  sourceLagMillis: LongString!
   status: String!
   effectiveActions: [ContainmentAction!]!
   blockedOperationCount: LongString!
@@ -1461,6 +2063,7 @@ type ContainmentPerceptionCard {
   reasonCodes: [String!]!
   nextAllowedActions: [String!]!
   cardHash: SHA256!
+  signatureRef: String!
 }
 
 type ContainmentDirectiveConnection {
@@ -1471,13 +2074,18 @@ type ContainmentDirectiveConnection {
 type ContainmentAuditEvent {
   sequence: LongString!
   eventType: String!
-  incidentId: ID!
-  directiveId: ID
+  incidentIds: [ID!]!
+  directiveRefs: [ContainmentAuditDirectiveRef!]!
   operationId: ID
   containmentEpoch: LongString!
   eventHash: SHA256!
   previousEventHash: SHA256!
   occurredAt: DateTime!
+}
+
+type ContainmentAuditDirectiveRef {
+  directiveId: ID!
+  revision: LongString!
 }
 
 type ContainmentAuditConnection {
@@ -1498,6 +2106,8 @@ input ProposeContainmentInput {
   reasonCode: String!
   evidenceRefs: [ID!]!
   requestedExpiresAt: DateTime
+  supersedesDirectiveId: ID
+  supersedesDirectiveRevision: LongString
   idempotencyKey: String!
 }
 
@@ -1525,14 +2135,55 @@ input EvaluateContainmentCheckpointInput {
   idempotencyKey: String!
 }
 
-input ReleaseContainmentInput {
+input RequestContainmentReleaseInput {
   accountId: ID!
   directiveId: ID!
   expectedRevision: LongString!
   expectedEpoch: LongString!
   evidenceRefs: [ID!]!
   reasonCode: String!
-  approvalSignatureRefs: [String!]!
+  idempotencyKey: String!
+}
+
+input ApproveContainmentReleaseInput {
+  accountId: ID!
+  releaseRequestId: ID!
+  canonicalReleaseHash: SHA256!
+  signatureRef: String!
+  idempotencyKey: String!
+}
+
+input ReleaseContainmentInput {
+  accountId: ID!
+  releaseRequestId: ID!
+  canonicalReleaseHash: SHA256!
+  idempotencyKey: String!
+}
+
+input RecordContainmentReconciliationInput {
+  accountId: ID!
+  outboxId: ID!
+  expectedEffectState: String!
+  disposition: String!
+  evidenceRefs: [ID!]!
+  idempotencyKey: String!
+}
+
+input DispositionContainmentQuarantineInput {
+  accountId: ID!
+  quarantineId: ID!
+  expectedState: String!
+  disposition: String!
+  evidenceRefs: [ID!]!
+  idempotencyKey: String!
+}
+
+input RequestContainmentCompensationInput {
+  accountId: ID!
+  outboxId: ID!
+  reconciliationEvidenceRefs: [ID!]!
+  procedureId: ID!
+  procedureVersion: LongString!
   idempotencyKey: String!
 }
 
@@ -1545,6 +2196,41 @@ type ProposeContainmentPayload {
 type ActivateContainmentPayload {
   directive: ContainmentDirective!
   perception: ContainmentPerceptionCard!
+}
+
+type ContainmentReleaseRequest {
+  accountId: ID!
+  releaseRequestId: ID!
+  directiveId: ID!
+  expectedDirectiveRevision: LongString!
+  expectedEpoch: LongString!
+  evidenceSetHash: SHA256!
+  reasonCode: String!
+  policyVersion: LongString!
+  canonicalReleaseHash: SHA256!
+  state: String!
+  approvalExpiresAt: DateTime!
+}
+
+type ExternalEffectDisposition {
+  outboxId: ID!
+  state: String!
+  receiptHash: SHA256!
+}
+
+type QuarantineDisposition {
+  quarantineId: ID!
+  state: String!
+  dispositionHash: SHA256!
+}
+
+type ContainmentCompensationIntent {
+  operationId: ID!
+  sourceOutboxId: ID!
+  procedureId: ID!
+  procedureVersion: LongString!
+  state: String!
+  intentHash: SHA256!
 }
 
 type ReleaseContainmentPayload {
@@ -1578,6 +2264,11 @@ type Query {
     revision: LongString!
   ): [SafeStateCheck!]!
 
+  containmentReleaseRequest(
+    accountId: ID!
+    releaseRequestId: ID!
+  ): ContainmentReleaseRequest
+
   containmentAudit(
     accountId: ID!
     incidentId: ID!
@@ -1603,9 +2294,29 @@ type Mutation {
     input: EvaluateContainmentCheckpointInput!
   ): ContainmentCheckpoint!
 
+  requestContainmentRelease(
+    input: RequestContainmentReleaseInput!
+  ): ContainmentReleaseRequest!
+
+  approveContainmentRelease(
+    input: ApproveContainmentReleaseInput!
+  ): ContainmentReleaseRequest!
+
   releaseContainment(
     input: ReleaseContainmentInput!
   ): ReleaseContainmentPayload!
+
+  recordContainmentReconciliation(
+    input: RecordContainmentReconciliationInput!
+  ): ExternalEffectDisposition!
+
+  dispositionContainmentQuarantine(
+    input: DispositionContainmentQuarantineInput!
+  ): QuarantineDisposition!
+
+  requestContainmentCompensation(
+    input: RequestContainmentCompensationInput!
+  ): ContainmentCompensationIntent!
 }
 ```
 
@@ -1618,31 +2329,102 @@ type Mutation {
 - list queries require account-leading indexed filters; no offset pagination.
 - checkpoint evaluation is for integration testing and orchestration. Internal mutation and tool paths invoke the same primitive transactionally and cannot trust a prior GraphQL result.
 - `scopeRef` is resolved through a trusted typed catalog and never accepted as an arbitrary canonical key.
+- evidence/signature arrays default to 20 and have a hard ceiling of 64; IDs,
+  reason codes, idempotency keys, and signature references have byte limits.
+- depth, alias, field-count, batch, and total complexity limits apply before
+  resolver execution; introspection follows the Open API security policy.
+- entitlements are operation-specific: `containment:propose`,
+  `containment:approve`, `containment:activate`,
+  `containment:checkpoint:trusted`, `containment:reconcile`,
+  `containment:quarantine:disposition`, `containment:release`,
+  `containment:evidence:read`, and `containment:audit:read`.
+- scope resolution returns uniform non-enumerating errors. Audit, evidence,
+  perception, and result fields apply object-level visibility and redaction.
+- `supersedesDirectiveId` plus revision is the API for extension,
+  target/action changes, and supersession; both fields must be present
+  together. Reconciliation, compensation evidence, and quarantine disposition
+  use the dedicated mutations above.
 
 ## 10. Procedural memory
 
 Containment procedures are reviewed, versioned instructions for operators and recovery agents:
 
 ```ts
+export interface ProcedurePredicate {
+  readonly predicateCode: string;
+  readonly expectedValueHash: Sha256;
+  readonly sourceSchemaHash: Sha256;
+}
+
+export type ContainmentProcedureStep =
+  | {
+      readonly ordinal: number;
+      readonly kind: "CHECK_EVIDENCE";
+      readonly checkCode: string;
+      readonly timeoutMillis: number;
+      readonly stopOnFailureReasonCode: string;
+    }
+  | {
+      readonly ordinal: number;
+      readonly kind: "RECONCILE_EFFECT";
+      readonly method: "PROVIDER_STATUS" | "IDEMPOTENCY_LOOKUP";
+      readonly maximumAttempts: number;
+      readonly timeoutMillis: number;
+    }
+  | {
+      readonly ordinal: number;
+      readonly kind: "REQUEST_TOOL";
+      readonly capabilityId: string;
+      readonly inputSchemaHash: Sha256;
+      readonly maximumAttempts: number;
+      readonly timeoutMillis: number;
+      readonly expectedEvidenceCode: string;
+    }
+  | {
+      readonly ordinal: number;
+      readonly kind: "HUMAN_GATE";
+      readonly approvalClass: "SINGLE_OPERATOR" | "TWO_PERSON";
+      readonly approvalPurpose: string;
+    }
+  | {
+      readonly ordinal: number;
+      readonly kind: "STOP";
+      readonly reasonCode: string;
+    };
+
 export interface ContainmentProcedureMemory {
   readonly accountId: AccountId;
   readonly procedureId: string;
   readonly version: NonNegativeInt64String;
+  readonly state: "DRAFT" | "APPROVED" | "REVOKED" | "RETIRED";
   readonly incidentClass: string;
   readonly allowedScopeTypes: readonly ContainmentScopeType[];
   readonly requiredActionMask: NonNegativeInt64String;
-  readonly preconditions: readonly string[];
+  readonly preconditions: readonly ProcedurePredicate[];
   readonly evidenceCheckCodes: readonly string[];
-  readonly reconciliationSteps: readonly string[];
+  readonly steps: readonly ContainmentProcedureStep[];
   readonly compensationCapabilityIds: readonly string[];
   readonly maximumToolCalls: number;
   readonly maximumDepth: number;
   readonly humanApprovalClass: "SINGLE_OPERATOR" | "TWO_PERSON";
+  readonly compatiblePolicyHashes: readonly Sha256[];
+  readonly approverHumanSubjectIds: readonly string[];
+  readonly approvalSignatureRefs: readonly string[];
+  readonly validFrom: DateTimeString;
+  readonly validUntil?: DateTimeString;
+  readonly revocationEpoch?: NonNegativeInt64String;
+  readonly executionIdempotencyNamespace: string;
   readonly contentHash: Sha256;
 }
 ```
 
-An LLM perceives a procedure as bounded typed steps, preconditions, permitted tools, expected evidence, and stop conditions. It does not receive executable SQL or authority to widen scope. Procedure execution still passes access, purpose, budget, containment, and tool-release checks at every side-effect step.
+An LLM perceives only an immutable `APPROVED`, signed, policy-compatible
+procedure as bounded typed steps, predicates, permitted tools, expected
+evidence, retry/time limits, human gates, and stop conditions. It does not
+receive executable SQL or authority to widen scope. Revocation is checked by
+exact procedure ID/version and epoch before each step. Procedure execution
+still passes access, purpose, budget, containment, idempotency, and tool-release
+checks at every side-effect step.
 
 ## 11. Semantic retrieval and HNSW compatibility
 
@@ -1658,7 +2440,8 @@ CREATE TABLE agent_containment_procedure_embedding (
   embedding_model_id text NOT NULL,
   embedding_dimensions integer NOT NULL
     CHECK (embedding_dimensions > 0),
-  embedding vector(1536) NOT NULL,
+  embedding vector NOT NULL,
+  approval_artifact_hash bytea NOT NULL,
   metadata_hash bytea NOT NULL,
   valid_from timestamptz NOT NULL,
   valid_until timestamptz,
@@ -1668,11 +2451,39 @@ CREATE TABLE agent_containment_procedure_embedding (
     procedure_version,
     embedding_model_id
   ),
+  CHECK (vector_dims(embedding) = embedding_dimensions),
   CHECK (valid_until IS NULL OR valid_until > valid_from)
+);
+
+CREATE TABLE agent_containment_hnsw_manifest (
+  account_id bigint NOT NULL,
+  manifest_id uuid NOT NULL,
+  embedding_model_id text NOT NULL,
+  embedding_dimensions integer NOT NULL
+    CHECK (embedding_dimensions > 0),
+  graph_storage_ref text NOT NULL,
+  procedure_watermark bigint NOT NULL CHECK (procedure_watermark >= 0),
+  state text NOT NULL CHECK (state IN ('BUILDING', 'ACTIVE', 'RETIRED')),
+  manifest_hash bytea NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, manifest_id),
+  UNIQUE (
+    account_id,
+    embedding_model_id,
+    embedding_dimensions,
+    manifest_id
+  )
 );
 ```
 
-Production vector indexes are physically owned by one account or by an account-hash partition with a mandatory exact `account_id` prefilter before graph traversal. Recommended HNSW search constraints:
+Each HNSW graph and manifest is physically owned by exactly one account.
+Manifest selection validates exact `account_id`, model, dimensions, state, and
+watermark **before graph traversal**. Account-hash SQL partitions may hold
+manifests or embedding rows, but tenants never share graph nodes or graph
+navigation. Filtering another tenant's candidates after traversal is not an
+isolation boundary. For each supported model/dimension, the build pipeline
+uses the corresponding fixed-dimension cast/index configuration and records
+it in the manifest. Recommended HNSW search constraints:
 
 - exact `account_id`, approved state, model ID, dimensions, and policy compatibility filters;
 - `topK <= 20`, `ef_search <= 128`, timeout, memory, and visited-node budgets;
@@ -1691,6 +2502,14 @@ Agents receive a small deterministic card rather than raw directive tables:
 {
   "incidentId": "inc_01",
   "containmentEpoch": "204",
+  "regionalLeadershipEpoch": "18",
+  "schemaVersion": "containment-card/v1",
+  "audiencePrincipalId": "principal_recovery_7",
+  "policyVersion": "12",
+  "generatedAt": "2026-07-23T00:00:00Z",
+  "expiresAt": "2026-07-23T00:00:30Z",
+  "sourceWatermark": "881",
+  "sourceLagMillis": "42",
   "status": "ACTIVE",
   "effectiveActions": [
     "DENY_MUTATION_COMMIT",
@@ -1714,7 +2533,8 @@ Agents receive a small deterministic card rather than raw directive tables:
     "RECONCILE_EFFECTS",
     "WAIT"
   ],
-  "cardHash": "sha256:..."
+  "cardHash": "sha256:...",
+  "signatureRef": "hsm-signature:..."
 }
 ```
 
@@ -1724,8 +2544,12 @@ Agent interpretation rules:
 - `ACTIVE` means stop matching side effects, not that every worker has terminated.
 - `OUTCOME_UNKNOWN > 0` means do not claim rollback or completion.
 - Only `nextAllowedActions` are valid transitions; generated prose has no authority.
-- Scope display references are visibility-filtered and may be hashes.
+- Scope display references are visibility-filtered tenant-keyed opaque tokens,
+  never unkeyed hashes of enumerable low-entropy IDs.
 - A card is advisory after its epoch or expiry; every effect rechecks durable state.
+- The audience, schema, policy, regional epoch, generation/expiry times,
+  watermark/lag, and content hash are covered by an HSM-backed signature or
+  service MAC. Consumers reject an invalid audience, signature, or expiry.
 
 ## 13. ACID and consistency
 
@@ -1816,9 +2640,11 @@ The following query shapes are prohibited:
 | current tenant epoch | account-head PK | `O(1)` |
 | exact scoped fence | effective-fence PK | `O(log tenant fences)` |
 | operation checkpoint | account head + bounded scope PK joins | `O(scope count)` |
-| activation | proposal PK + bounded target fence rows | `O(target count)` |
+| activation | proposal PK + bounded target/action counters | `O(target count × action bits)` |
+| account-wide active work | partial account/live-state index | bounded page |
 | affected principal/session work | account/principal or account/session index | bounded page |
 | affected resources | account/resource hash/key index | bounded page |
+| safe-state release | bounded scope-open-counter PK locks | `O(target count)` |
 | pending work | account/state/next-attempt index | bounded page |
 | external reconciliation | account/state/update index | bounded page |
 | incident audit | account/incident/sequence index | cursor page |
@@ -1847,9 +2673,8 @@ event_hash = SHA256(
   canonical_version ||
   account_id ||
   audit_sequence ||
-  incident_id ||
-  directive_id? ||
-  directive_revision? ||
+  canonical_incident_set_hash ||
+  canonical_directive_revision_set_hash ||
   operation_id? ||
   event_type ||
   actor_principal_id ||
@@ -1871,7 +2696,27 @@ The audit stream records:
 - external release, dispatch, acknowledgement, unknown outcome, reconciliation, and compensation;
 - safe-state evidence and release decisions.
 
-Replay uses immutable policy versions, canonicalization versions, target hashes, exact fence generations, scope-vector hashes, database timestamps, and source watermarks. Replay never reruns an LLM or vector search. Semantic procedure retrieval is recorded as evidence but is not required to reproduce the authorization result.
+The tenant control chain contains proposals, approvals, directive transitions,
+releases, regional terms, external-effect state transitions, worker terminal
+dispositions, and exceptional checkpoints. A checkpoint that matched multiple
+directives stores normalized event-to-incident and
+event-to-directive-revision membership rows; a set hash alone is not replay
+evidence. Canonical event payloads are retained by immutable content-addressed
+reference, not discarded after hashing.
+
+Ordinary `ALLOW` checkpoints append to the operation's
+`previous_checkpoint_hash` chain without locking the tenant control head.
+Fixed-size batches are sealed into Merkle trees; signed roots are periodically
+anchored in the tenant control chain and copied to retention-locked WORM
+storage. This avoids a tenant-wide hot row on every query while preserving
+tamper evidence.
+
+Replay uses immutable payloads, policy versions, canonicalization versions,
+target hashes, exact fence generations, scope-vector hashes, database
+timestamps, counter generations, regional lease terms, and named source
+watermarks. Replay never reruns an LLM or vector search. Semantic procedure
+retrieval is recorded as evidence but is not required to reproduce the
+authorization result.
 
 ## 17. Threat and failure analysis
 
@@ -1879,7 +2724,7 @@ Replay uses immutable policy versions, canonicalization versions, target hashes,
 |---|---|
 | Agent omits a dangerous resource | Server derives scopes from immutable intent; mismatch rejects |
 | Stale worker resumes after containment | Epoch mismatch forces exact reevaluation before effect |
-| Former region continues writes | Regional leadership epoch rejects stale commits/releases |
+| Former region continues writes | Consensus lease loss prevents storage, router, publisher, and dispatcher acceptance; the mirrored epoch alone is insufficient |
 | Cache misses an invalidation | Durable side-effect checkpoint still reads account head |
 | Activation response is lost | Idempotency ledger returns the committed directive and epoch |
 | Two operators activate overlapping directives | Canonical locks serialize; action masks union |
@@ -1888,7 +2733,8 @@ Replay uses immutable policy versions, canonicalization versions, target hashes,
 | Provider times out after receiving request | Mark `OUTCOME_UNKNOWN`; reconcile by stable idempotency key |
 | Malicious agent requests account shutdown | Proposal has no authority; approval policy rejects |
 | Compromised operator attempts release | Separate identity, approval, safe-state, and audit checks apply |
-| HNSW returns another tenant's procedure | Exact tenant ownership filter rejects before result exposure |
+| Released token races containment | Dispatch-start CAS rechecks epoch, exact scopes, writer term, generation, and token expiry |
+| HNSW returns another tenant's procedure | Account-owned manifest and graph are selected before traversal |
 | Board has millions of items | Board scope is one canonical resource; no item enumeration |
 | Epoch nears bigint exhaustion | Alert and stop before overflow; never wrap or reuse |
 
@@ -1955,14 +2801,23 @@ Containment effectiveness and asynchronous cleanup have separate SLOs. Reporting
 - SQL DDL executes on the supported PostgreSQL-compatible validation engine.
 - Every PK, FK, unique constraint, index, cursor, and queue starts with `account_id`.
 - Every mutable transition has idempotency and expected epoch/revision checks.
+- Every containment table has forced tenant RLS under a non-owner,
+  non-`BYPASSRLS` application role; cache and loader isolation tests pass.
+- HNSW manifests prove one account-owned graph selected before traversal.
 
 ### Behavioral validation
 
 - Activate overlapping directives and prove deterministic action union.
 - Prove an operation serialized before activation can be classified while one after activation is denied.
+- Race activation against mutation `FOR SHARE` acquisition and prove no mutation
+  can commit with a stale epoch after activation commits.
 - Resume a stale worker and prove it cannot commit or release a tool.
+- Release a tool token, activate containment, then prove dispatch-start CAS
+  prevents provider I/O.
 - Lose activation and release responses and prove idempotent replay.
 - Race activation, expiry, supersession, and release.
+- Race safe-state release against dispatch, unknown-outcome, result-publication,
+  and vector-publication transitions; prove scope counters prevent TOCTOU.
 - Prove quarantined output never enters caches, Change Watch context, memory, or HNSW.
 - Exercise provider acknowledgement, timeout, duplicate delivery, unknown outcome, reconciliation, and compensation.
 - Attempt cross-tenant IDs at every GraphQL and storage boundary.
@@ -1973,7 +2828,9 @@ Containment effectiveness and asynchronous cleanup have separate SLOs. Reporting
 - Verify activation touches only account head, bounded targets, work seeds, and audit rows.
 - Verify checkpoint cost scales with declared scopes, not board size.
 - Fail cache invalidation, cancellation workers, vector search, columnar replication, and one region independently.
-- Promote the write region and prove stale leadership epochs cannot publish effects.
+- Partition the old write region from consensus, promote a new writer, and
+  prove the old region cannot publish through storage, routers, result/vector
+  visibility paths, or tool dispatch despite its stale local epoch.
 - Demonstrate no unapproved sequential scan or brute-force vector fallback.
 
 ## 21. Product decision
