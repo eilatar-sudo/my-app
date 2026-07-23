@@ -8,3 +8,10 @@ evolving mondayDB into a deterministic, enterprise-grade agentic database.
 - [Agentic Emergency Containment Plane](docs/agentic-emergency-containment-plane.md) —
   tenant-scoped stop, drain, quarantine, reconciliation, and release controls
   for autonomous workloads.
+
+## Validation
+
+```sh
+npm install
+npm run validate
+```
