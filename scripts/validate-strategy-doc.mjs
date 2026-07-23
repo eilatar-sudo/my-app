@@ -1,6 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import process from "node:process";
-import * as ts from "typescript";
 import { buildSchema, validateSchema } from "graphql";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
@@ -20,53 +22,30 @@ function fencedBlocks(language) {
   return [...markdown.matchAll(expression)].map((match) => match[1]);
 }
 
-function formatDiagnostics(diagnostics) {
-  return diagnostics
-    .map((diagnostic) => {
-      const message = ts.flattenDiagnosticMessageText(
-        diagnostic.messageText,
-        "\n",
+async function validateTypeScript(source) {
+  const directory = await mkdtemp(join(tmpdir(), "strategy-contracts-"));
+  const fileName = join(directory, "contracts.ts");
+  try {
+    await writeFile(fileName, source, "utf8");
+    const compiler = spawnSync(
+      join(process.cwd(), "node_modules", ".bin", "tsc"),
+      [
+        fileName,
+        "--strict",
+        "--noEmit",
+        "--skipLibCheck",
+        "--target",
+        "ES2022",
+      ],
+      { encoding: "utf8" },
+    );
+    if (compiler.status !== 0) {
+      throw new Error(
+        `TypeScript validation failed:\n${compiler.stdout}${compiler.stderr}`,
       );
-      if (!diagnostic.file || diagnostic.start === undefined) {
-        return message;
-      }
-      const location = diagnostic.file.getLineAndCharacterOfPosition(
-        diagnostic.start,
-      );
-      return `${diagnostic.file.fileName}:${location.line + 1}:${
-        location.character + 1
-      } ${message}`;
-    })
-    .join("\n");
-}
-
-function validateTypeScript(source) {
-  const fileName = "/strategy-contracts.ts";
-  const options = {
-    strict: true,
-    noEmit: true,
-    skipLibCheck: true,
-    target: ts.ScriptTarget.ES2022,
-    module: ts.ModuleKind.ESNext,
-  };
-  const host = ts.createCompilerHost(options);
-  const originalFileExists = host.fileExists.bind(host);
-  const originalGetSourceFile = host.getSourceFile.bind(host);
-  const originalReadFile = host.readFile.bind(host);
-
-  host.fileExists = (candidate) =>
-    candidate === fileName || originalFileExists(candidate);
-  host.readFile = (candidate) =>
-    candidate === fileName ? source : originalReadFile(candidate);
-  host.getSourceFile = (candidate, languageVersion, ...rest) =>
-    candidate === fileName
-      ? ts.createSourceFile(candidate, source, languageVersion, true)
-      : originalGetSourceFile(candidate, languageVersion, ...rest);
-
-  const program = ts.createProgram([fileName], options, host);
-  const diagnostics = ts.getPreEmitDiagnostics(program);
-  if (diagnostics.length > 0) {
-    throw new Error(`TypeScript validation failed:\n${formatDiagnostics(diagnostics)}`);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -91,7 +70,7 @@ if (graphQLBlocks.length !== 1) {
   throw new Error(`expected one GraphQL block, found ${graphQLBlocks.length}`);
 }
 
-validateTypeScript(typeScriptBlocks.join("\n\n"));
+await validateTypeScript(typeScriptBlocks.join("\n\n"));
 
 const schema = buildSchema(graphQLBlocks[0]);
 const graphQLErrors = validateSchema(schema);
