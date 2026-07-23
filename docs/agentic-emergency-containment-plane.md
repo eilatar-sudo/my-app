@@ -161,13 +161,16 @@ requester/approver/releaser separation and, where required, distinct verified
 human subjects rather than merely different workload principal IDs.
 
 Safe-state checks bind named producer streams and their counter generations.
-The release transaction locks the account head and every bounded affected
-scope counter, verifies that required open counters are zero, verifies that no
-counter generation changed since evidence compilation, and advances the epoch
-before releasing the directive. Operation, publication, and external-effect
-transitions update the same counters under the same scope locks. This prevents
-a dispatcher from creating a new unresolved outcome between safe-state
-evaluation and release.
+Each scope has 64 fixed counter and release-barrier shards selected by
+operation ID hash, so an account-wide scope does not serialize normal tenant
+traffic. Transitions that increase open work take a shared lock on one matching
+barrier shard and update one counter shard; terminal decrements update the same
+counter shard. The release transaction freezes all 64 barrier shards for each
+bounded target, preventing new increments, aggregates the fixed counter set,
+verifies required counts are zero and evidence generations match, then
+advances the epoch. This prevents a dispatcher from creating a new unresolved
+outcome between safe-state evaluation and release without creating a
+tenant-wide counter or lock hot row.
 
 Expiry transitions a directive to `EXPIRED_PENDING_REVIEW`; it does not silently restore write or tool authority. Policy may allow low-risk observation-only directives to expire automatically, but deny directives default to explicit release.
 
@@ -199,9 +202,9 @@ Expiry transitions a directive to `EXPIRED_PENDING_REVIEW`; it does not silently
 11. **Idempotent transitions:** an operation key plus canonical request hash returns one durable result.
 12. **Current authorization:** containment release never bypasses access, consent, purpose, delegation, runtime, or identity checks.
 13. **No scan fallback:** missing indexes, stale snapshots, or exhausted budgets reject or queue; they never trigger a board scan.
-14. **Audited decision:** control transitions and exceptional checkpoint
-    results are hash chained in tenant order; ordinary allow receipts use
-    per-operation chains sealed into tenant Merkle roots.
+14. **Audited decision:** low-volume control transitions are hash chained in
+    tenant order; checkpoint and worker receipts use per-operation or
+    fixed-partition chains sealed into tenant Merkle roots.
 15. **Database determinism:** no LLM decides scope, action composition, activation, checkpoint outcome, safe state, or release.
 
 ## 5. Containment model
@@ -332,6 +335,14 @@ idempotency, status lookup, and reviewed compensation procedures resolve
 uncertainty; mondayDB never claims that revoking a token retracts bytes already
 received by a provider.
 
+All state changes use a server-owned transition function with expected state,
+release generation, and worker generation. The monotonic graph permits
+`PENDING → CANCELLED`, `RELEASED → CANCELLED`, and
+`RELEASED → DISPATCH_STARTED`; once `dispatch_claimed_at` exists, `CANCELLED`
+is impossible. Post-dispatch uncertainty ends only in `ACKNOWLEDGED`,
+`OUTCOME_UNKNOWN`, `COMPENSATION_PENDING`, or `RECONCILED`, preserving the
+point-of-no-return evidence.
+
 ### 5.7 Safe-state evidence
 
 Safe state is a deterministic conjunction of policy-required checks, such as:
@@ -363,7 +374,13 @@ Policy defines approval class by scope and action:
 - `TWO_PERSON`: account, principal, connector, or tool-capability containment.
 - `AUTOMATED_BREAK_GLASS`: a preauthorized detector may activate a fixed deny-only template; human review is immediately required.
 
-Approvers must be distinct verified identities where two-person approval is required. Approval signatures bind the exact canonical proposal hash and expire quickly.
+Approval signatures bind the exact canonical proposal hash and expire quickly.
+For broad activation, policy requires distinct verified human-subject IDs,
+not merely distinct principals, sessions, or API keys. The proposer cannot
+approve; neither proposer nor approver may execute activation when
+separation-of-duty policy requires an independent activator. Automated
+break-glass uses a named non-human detector subject and cannot satisfy a human
+approval slot.
 
 ### 6.3 Activate
 
@@ -476,6 +493,8 @@ export interface ContainmentProposal {
   readonly reasonCode: string;
   readonly evidenceRefs: readonly EvidenceId[];
   readonly requestedExpiresAt?: DateTimeString;
+  readonly proposerPrincipalId: PrincipalId;
+  readonly proposerHumanSubjectId?: string;
   readonly canonicalRequestHash: Sha256;
   readonly createdAt: DateTimeString;
 }
@@ -484,6 +503,7 @@ export interface ContainmentApproval {
   readonly accountId: AccountId;
   readonly proposalId: ProposalId;
   readonly approverPrincipalId: PrincipalId;
+  readonly approverHumanSubjectId: string;
   readonly approvalClass:
     | "SELF_OPERATION"
     | "SINGLE_OPERATOR"
@@ -547,7 +567,7 @@ export interface OperationScopeVector {
   readonly scopeVectorHash: Sha256;
 }
 
-export interface VerifiedContainmentSnapshot {
+export interface VerifiedSnapshotBase {
   readonly accountId: AccountId;
   readonly operationId: OperationId;
   readonly verificationStatus: "VERIFIED";
@@ -559,8 +579,15 @@ export interface VerifiedContainmentSnapshot {
   readonly evaluatedAt: DateTimeString;
   readonly expiresAt: DateTimeString;
   readonly snapshotHash: Sha256;
+}
+
+export interface VerifiedAllowSnapshot extends VerifiedSnapshotBase {
   readonly authorizesEffects: true;
   readonly effectAuthorizationMacRef: string;
+}
+
+export interface VerifiedNonAuthorizingSnapshot extends VerifiedSnapshotBase {
+  readonly authorizesEffects: false;
 }
 
 export interface UnverifiedSafeReadSnapshot {
@@ -575,7 +602,8 @@ export interface UnverifiedSafeReadSnapshot {
 }
 
 export type ContainmentSnapshot =
-  | VerifiedContainmentSnapshot
+  | VerifiedAllowSnapshot
+  | VerifiedNonAuthorizingSnapshot
   | UnverifiedSafeReadSnapshot;
 
 export interface CheckpointRequest {
@@ -593,7 +621,7 @@ export interface CheckpointResult {
   readonly checkpoint: CheckpointKind;
   readonly decision: CheckpointDecision;
   readonly reasonCodes: readonly string[];
-  readonly effectiveActions: readonly ContainmentAction[];
+  readonly effectiveActions?: readonly ContainmentAction[];
   readonly snapshot: ContainmentSnapshot;
   readonly quarantineRef?: string;
   readonly retryable: boolean;
@@ -679,6 +707,9 @@ export interface ContainmentPerceptionCard {
 ### Resolver requirements
 
 - Derive `accountId`, principal, session, canonical scope keys, and operation intents from trusted context.
+- Derive verified human-subject identity independently of workload principal
+  identity; enforce proposer/approver/activator and
+  requester/approver/releaser separation by policy.
 - Reject unknown action bits, duplicate targets, oversized target sets, and non-canonical keys.
 - Sort targets by `(scopeType, scopeKeyHash, canonicalScopeKey)` before locking.
 - Represent every `bigint` as a validated decimal string.
@@ -785,6 +816,7 @@ CREATE TABLE agent_containment_proposal (
   requested_expires_at timestamptz,
   canonical_request_hash bytea NOT NULL,
   proposer_principal_id uuid NOT NULL,
+  proposer_human_subject_id uuid,
   proposer_session_id uuid,
   state text NOT NULL CHECK (
     state IN ('PENDING', 'APPROVED', 'ACTIVATED', 'REJECTED', 'EXPIRED')
@@ -828,6 +860,7 @@ CREATE TABLE agent_containment_approval (
   account_id bigint NOT NULL,
   proposal_id uuid NOT NULL,
   approver_principal_id uuid NOT NULL,
+  approver_human_subject_id uuid NOT NULL,
   approval_class text NOT NULL CHECK (
     approval_class IN (
       'SELF_OPERATION',
@@ -841,7 +874,7 @@ CREATE TABLE agent_containment_approval (
   approved_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
   revoked_at timestamptz,
-  PRIMARY KEY (account_id, proposal_id, approver_principal_id),
+  PRIMARY KEY (account_id, proposal_id, approver_human_subject_id),
   FOREIGN KEY (account_id, proposal_id)
     REFERENCES agent_containment_proposal (account_id, proposal_id),
   CHECK (expires_at > approved_at)
@@ -852,7 +885,7 @@ CREATE INDEX agent_containment_approval_live_idx
     account_id,
     proposal_id,
     expires_at,
-    approver_principal_id
+    approver_human_subject_id
   )
   WHERE revoked_at IS NULL;
 
@@ -1120,6 +1153,7 @@ CREATE TABLE agent_containment_scope_open_counter (
   scope_type containment_scope_type NOT NULL,
   scope_key_hash bytea NOT NULL,
   canonical_scope_key text NOT NULL,
+  counter_shard smallint NOT NULL CHECK (counter_shard BETWEEN 0 AND 63),
   counter_generation bigint NOT NULL CHECK (counter_generation >= 0),
   live_operation_count bigint NOT NULL DEFAULT 0
     CHECK (live_operation_count >= 0),
@@ -1134,7 +1168,36 @@ CREATE TABLE agent_containment_scope_open_counter (
     account_id,
     scope_type,
     scope_key_hash,
-    canonical_scope_key
+    canonical_scope_key,
+    counter_shard
+  )
+);
+
+CREATE TABLE agent_containment_scope_release_barrier (
+  account_id bigint NOT NULL,
+  scope_type containment_scope_type NOT NULL,
+  scope_key_hash bytea NOT NULL,
+  canonical_scope_key text NOT NULL,
+  barrier_shard smallint NOT NULL CHECK (barrier_shard BETWEEN 0 AND 63),
+  freeze_generation bigint NOT NULL CHECK (freeze_generation >= 0),
+  state text NOT NULL CHECK (state IN ('OPEN', 'FROZEN_FOR_RELEASE')),
+  release_request_id uuid,
+  updated_at timestamptz NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    scope_type,
+    scope_key_hash,
+    canonical_scope_key,
+    barrier_shard
+  ),
+  FOREIGN KEY (account_id, release_request_id)
+    REFERENCES agent_containment_release_request (
+      account_id,
+      release_request_id
+    ),
+  CHECK (
+    (state = 'FROZEN_FOR_RELEASE') =
+    (release_request_id IS NOT NULL)
   )
 );
 
@@ -1299,8 +1362,7 @@ CREATE TABLE agent_containment_checkpoint (
       containment_epoch IS NOT NULL AND
       regional_leadership_epoch IS NOT NULL AND
       effective_action_mask IS NOT NULL AND
-      matched_directive_set_hash IS NOT NULL AND
-      effect_authorization_mac_ref IS NOT NULL
+      matched_directive_set_hash IS NOT NULL
     )
     OR
     (
@@ -1314,13 +1376,55 @@ CREATE TABLE agent_containment_checkpoint (
       authorizes_effects = false
     )
   ),
-  CHECK (authorizes_effects = (decision = 'ALLOW'))
+  CHECK (
+    authorizes_effects =
+    (verification_status = 'VERIFIED' AND decision = 'ALLOW')
+  ),
+  CHECK (
+    (effect_authorization_mac_ref IS NOT NULL) = authorizes_effects
+  )
 );
 
 CREATE INDEX agent_containment_checkpoint_epoch_idx
   ON agent_containment_checkpoint (
     account_id,
     containment_epoch,
+    operation_id,
+    checkpoint_sequence
+  );
+
+CREATE TABLE agent_containment_checkpoint_directive (
+  account_id bigint NOT NULL,
+  operation_id uuid NOT NULL,
+  checkpoint_sequence bigint NOT NULL,
+  directive_id uuid NOT NULL,
+  directive_revision bigint NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    operation_id,
+    checkpoint_sequence,
+    directive_id,
+    directive_revision
+  ),
+  FOREIGN KEY (account_id, operation_id, checkpoint_sequence)
+    REFERENCES agent_containment_checkpoint (
+      account_id,
+      operation_id,
+      checkpoint_sequence
+    ),
+  FOREIGN KEY (account_id, directive_id, directive_revision)
+    REFERENCES agent_containment_directive (
+      account_id,
+      directive_id,
+      revision
+    )
+);
+
+CREATE INDEX agent_containment_checkpoint_directive_reverse_idx
+  ON agent_containment_checkpoint_directive (
+    account_id,
+    directive_id,
+    directive_revision,
     operation_id,
     checkpoint_sequence
   );
@@ -1520,6 +1624,7 @@ CREATE TABLE agent_containment_safe_state_scope (
   scope_type containment_scope_type NOT NULL,
   scope_key_hash bytea NOT NULL,
   canonical_scope_key text NOT NULL,
+  counter_shard smallint NOT NULL CHECK (counter_shard BETWEEN 0 AND 63),
   observed_counter_generation bigint NOT NULL
     CHECK (observed_counter_generation >= 0),
   observed_live_operation_count bigint NOT NULL
@@ -1537,7 +1642,8 @@ CREATE TABLE agent_containment_safe_state_scope (
     check_code,
     scope_type,
     scope_key_hash,
-    canonical_scope_key
+    canonical_scope_key,
+    counter_shard
   ),
   FOREIGN KEY (
     account_id,
@@ -1554,12 +1660,14 @@ CREATE TABLE agent_containment_safe_state_scope (
     account_id,
     scope_type,
     scope_key_hash,
-    canonical_scope_key
+    canonical_scope_key,
+    counter_shard
   ) REFERENCES agent_containment_scope_open_counter (
     account_id,
     scope_type,
     scope_key_hash,
-    canonical_scope_key
+    canonical_scope_key,
+    counter_shard
   )
 );
 
@@ -1633,6 +1741,10 @@ CREATE TABLE agent_containment_external_effect (
   CHECK (
     state IN ('PENDING', 'RELEASED', 'CANCELLED') OR
     dispatch_claimed_at IS NOT NULL
+  ),
+  CHECK (
+    state <> 'CANCELLED' OR
+    dispatch_claimed_at IS NULL
   )
 );
 
@@ -1722,6 +1834,65 @@ CREATE INDEX agent_containment_audit_operation_idx
     audit_sequence
   )
   WHERE operation_id IS NOT NULL;
+
+CREATE TABLE agent_containment_operational_audit_event (
+  account_id bigint NOT NULL,
+  audit_partition smallint NOT NULL
+    CHECK (audit_partition BETWEEN 0 AND 63),
+  partition_sequence bigint NOT NULL CHECK (partition_sequence > 0),
+  operation_id uuid,
+  event_type text NOT NULL,
+  canonical_event_payload_ref text NOT NULL,
+  canonical_event_hash bytea NOT NULL,
+  previous_partition_event_hash bytea NOT NULL,
+  event_hash bytea NOT NULL,
+  occurred_at timestamptz NOT NULL,
+  PRIMARY KEY (
+    account_id,
+    audit_partition,
+    partition_sequence
+  ),
+  UNIQUE (account_id, event_hash),
+  FOREIGN KEY (account_id, operation_id)
+    REFERENCES agent_containment_operation (account_id, operation_id)
+);
+
+CREATE INDEX agent_containment_operational_audit_operation_idx
+  ON agent_containment_operational_audit_event (
+    account_id,
+    operation_id,
+    occurred_at,
+    audit_partition,
+    partition_sequence
+  )
+  WHERE operation_id IS NOT NULL;
+
+CREATE TABLE agent_containment_audit_merkle_anchor (
+  account_id bigint NOT NULL,
+  anchor_id uuid NOT NULL,
+  audit_partition smallint NOT NULL
+    CHECK (audit_partition BETWEEN 0 AND 63),
+  first_partition_sequence bigint NOT NULL
+    CHECK (first_partition_sequence > 0),
+  last_partition_sequence bigint NOT NULL
+    CHECK (last_partition_sequence >= first_partition_sequence),
+  merkle_root_hash bytea NOT NULL,
+  signature_ref text NOT NULL,
+  control_audit_sequence bigint NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (account_id, anchor_id),
+  UNIQUE (
+    account_id,
+    audit_partition,
+    first_partition_sequence,
+    last_partition_sequence
+  ),
+  FOREIGN KEY (account_id, control_audit_sequence)
+    REFERENCES agent_containment_audit_event (
+      account_id,
+      audit_sequence
+    )
+);
 ```
 
 ### 8.1 Tenant isolation
@@ -1885,8 +2056,9 @@ WHERE account_id = :account_id
 FOR UPDATE;
 
 -- Lock the release request and distinct, unexpired release approvals.
--- Lock every affected scope_open_counter row in canonical scope order.
--- Verify evidence-bound counter generations and required zero counts.
+-- Freeze all 64 affected scope_release_barrier shards in canonical order.
+-- Aggregate the fixed 64 scope_open_counter shards for each target.
+-- Verify evidence-bound shard generations and required zero counts.
 -- Verify named stream watermarks and no unsealed producer delta.
 -- Remove live action contributions, decrement action reference counts,
 -- rebuild only affected effective masks, and advance the epoch.
@@ -1896,8 +2068,11 @@ COMMIT;
 ```
 
 Every operation, outbox, dispatch, reconciliation, result-publication, and
-vector-publication transition locks and updates the same bounded scope-counter
-rows. A `DISPATCH_STARTED` effect already contributes to
+vector-publication transition that increases open work takes `FOR SHARE` on
+the operation-hash barrier shard and updates the matching counter shard.
+Concurrent producers spread across shards. A release freezes all barrier
+shards with conflicting updates; decrements remain allowed so draining can
+complete. A `DISPATCH_STARTED` effect already contributes to
 `dispatched_unresolved_count`, so release cannot race a provider call whose
 outcome may later become unknown.
 
@@ -2017,7 +2192,7 @@ type ContainmentCheckpoint {
   verificationStatus: ContainmentVerificationStatus!
   decision: ContainmentCheckpointDecision!
   reasonCodes: [String!]!
-  effectiveActions: [ContainmentAction!]!
+  effectiveActions: [ContainmentAction!]
   containmentEpoch: LongString
   regionalLeadershipEpoch: LongString
   snapshotHash: SHA256!
@@ -2593,6 +2768,7 @@ Recommended defaults:
 | operation resource scopes | 16 | 64 |
 | exact fence lookups/checkpoint | 24 | 72 |
 | cancellation worker batch | 100 | 500 |
+| open-counter shards/scope | 64 fixed | 64 |
 | safe-state checks/directive | 20 | 64 |
 | semantic `topK` | 10 | 20 |
 | procedure depth | 4 | 8 |
@@ -2644,7 +2820,7 @@ The following query shapes are prohibited:
 | account-wide active work | partial account/live-state index | bounded page |
 | affected principal/session work | account/principal or account/session index | bounded page |
 | affected resources | account/resource hash/key index | bounded page |
-| safe-state release | bounded scope-open-counter PK locks | `O(target count)` |
+| safe-state release | frozen barrier + 64 counter-shard PK rows/scope | `O(target count × 64)` |
 | pending work | account/state/next-attempt index | bounded page |
 | external reconciliation | account/state/update index | bounded page |
 | incident audit | account/incident/sequence index | cursor page |
@@ -2685,7 +2861,7 @@ event_hash = SHA256(
 )
 ```
 
-The audit stream records:
+The control and partitioned operational audit streams together record:
 
 - proposal, approval, rejection, activation, extension, supersession, expiry, and release;
 - exact target-set and action-mask hashes;
@@ -2696,19 +2872,26 @@ The audit stream records:
 - external release, dispatch, acknowledgement, unknown outcome, reconciliation, and compensation;
 - safe-state evidence and release decisions.
 
-The tenant control chain contains proposals, approvals, directive transitions,
-releases, regional terms, external-effect state transitions, worker terminal
-dispositions, and exceptional checkpoints. A checkpoint that matched multiple
-directives stores normalized event-to-incident and
-event-to-directive-revision membership rows; a set hash alone is not replay
-evidence. Canonical event payloads are retained by immutable content-addressed
-reference, not discarded after hashing.
+The tenant control chain contains only low-volume proposals, approvals,
+directive transitions, releases, regional terms, and signed Merkle-root
+anchors. It never receives one append per blocked checkpoint, external-effect
+transition, or worker disposition during an incident.
 
-Ordinary `ALLOW` checkpoints append to the operation's
+Checkpoint receipts use per-operation chains. External-effect transitions,
+worker events, and exceptional receipts without an operation use 64 fixed
+account-local audit partitions selected by stable event key. A checkpoint that
+matched multiple directives stores normalized
+checkpoint-to-directive-revision membership rows; control events store
+event-to-incident and event-to-directive-revision memberships. A set hash alone
+is not replay evidence. Canonical event payloads are retained by immutable
+content-addressed reference, not discarded after hashing.
+
+All operation checkpoints append to the operation's
 `previous_checkpoint_hash` chain without locking the tenant control head.
-Fixed-size batches are sealed into Merkle trees; signed roots are periodically
-anchored in the tenant control chain and copied to retention-locked WORM
-storage. This avoids a tenant-wide hot row on every query while preserving
+Operational partition events follow the same pattern. Fixed-size batches are
+sealed into Merkle trees; signed roots are periodically anchored in the tenant
+control chain and copied to retention-locked WORM storage. This avoids a
+tenant-wide hot row during normal traffic or an incident while preserving
 tamper evidence.
 
 Replay uses immutable payloads, policy versions, canonicalization versions,
