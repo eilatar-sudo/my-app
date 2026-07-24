@@ -164,7 +164,10 @@ uses a separate security-definer procedure unavailable to the draft-writer
 role. The trusted compiler recomputes the canonical hash, and the procedure
 locks the draft, requires that exact hash, recounts steps, rejects graph cycles
 or invalid compensation links, installs a transaction-local approval fence, and
-seals the row. Direct status-column updates are revoked.
+seals the row. Revocation uses a second fenced procedure. Both execute as a
+dedicated `NOLOGIN` database authority; compiler and runtime roles receive
+neither membership nor direct status-column updates. New rows are forced to
+`DRAFT`, so insert cannot bypass either procedure.
 
 ### 5.2 Ready-step calculation
 
@@ -270,10 +273,12 @@ compensation. The set and order are sealed into a
 compensation plan header and hash before execution. Every append-only plan row
 foreign-keys that header/hash and binds the original effect, reverse ordinal,
 approved compensation step, and one-time resulting compensation effect.
-Triggers freeze plan identity and permit only declared status transitions. The
-inverse request derives its target from the original tenant-HMAC alias; callers
-cannot redirect it. Failed or uncertain compensation follows the same receipt
-rules and requires privileged human resolution.
+Version one permits one plan per saga. Membership can be inserted only while
+the header is `PLANNED`; the transition to `RUNNING` seals the non-empty member
+set. Triggers freeze plan identity and permit only declared status transitions.
+The inverse request derives its target from the original tenant-HMAC alias;
+callers cannot redirect it. Failed or uncertain compensation follows the same
+receipt rules and requires privileged human resolution.
 
 ### 6.5 Complete
 
@@ -655,6 +660,8 @@ CREATE TYPE saga_consistency_mode AS ENUM (
   'LINEARIZABLE', 'SNAPSHOT', 'BOUNDED_STALENESS'
 );
 
+CREATE ROLE agent_saga_template_authority NOLOGIN;
+
 CREATE TABLE agent_saga_authorization_evidence (
   account_id BIGINT NOT NULL,
   evidence_id UUID NOT NULL,
@@ -696,6 +703,7 @@ CREATE TABLE agent_saga_template (
   created_at TIMESTAMPTZ NOT NULL,
   approved_by TEXT,
   approved_at TIMESTAMPTZ,
+  revoked_by TEXT,
   revoked_at TIMESTAMPTZ,
   PRIMARY KEY (account_id, template_id, template_version),
   UNIQUE (account_id, template_id, template_version, definition_hash),
@@ -706,6 +714,10 @@ CREATE TABLE agent_saga_template (
       AND approval_validation_hash IS NULL) OR
     (status IN ('APPROVED', 'REVOKED') AND approved_at IS NOT NULL
       AND approval_validation_hash IS NOT NULL)
+  ),
+  CHECK (
+    (status <> 'REVOKED' AND revoked_by IS NULL AND revoked_at IS NULL) OR
+    (status = 'REVOKED' AND revoked_by IS NOT NULL AND revoked_at IS NOT NULL)
   ),
   CHECK (length(authorization_snapshot_hash) = 64)
 );
@@ -991,6 +1003,7 @@ CREATE TABLE agent_saga_compensation_plan (
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, saga_id, plan_id),
+  UNIQUE (account_id, saga_id),
   UNIQUE (account_id, saga_id, plan_id, plan_hash),
   FOREIGN KEY (
     account_id, saga_id, template_id, template_version
@@ -1195,6 +1208,18 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $guard$
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'DRAFT'
+       OR NEW.approved_by IS NOT NULL
+       OR NEW.approved_at IS NOT NULL
+       OR NEW.approval_validation_hash IS NOT NULL
+       OR NEW.revoked_by IS NOT NULL
+       OR NEW.revoked_at IS NOT NULL THEN
+      RAISE EXCEPTION 'new saga templates must start as drafts';
+    END IF;
+    RETURN NEW;
+  END IF;
+
   IF TG_OP = 'DELETE' THEN
     IF OLD.status <> 'DRAFT' THEN
       RAISE EXCEPTION 'sealed saga templates are immutable';
@@ -1211,6 +1236,7 @@ BEGIN
        AND NEW.approved_at IS NOT NULL
        AND NEW.approval_validation_hash IS NOT NULL
        AND NEW.approval_validation_hash = NEW.definition_hash
+       AND current_user = 'agent_saga_template_authority'
        AND current_setting('app.saga_template_approval', true)
          = concat(
            NEW.template_id::TEXT, ':',
@@ -1234,8 +1260,16 @@ BEGIN
   IF OLD.status = 'APPROVED'
      AND NEW.status = 'REVOKED'
      AND NEW.revoked_at IS NOT NULL
-     AND (to_jsonb(NEW) - 'status' - 'revoked_at')
-       = (to_jsonb(OLD) - 'status' - 'revoked_at') THEN
+     AND NEW.revoked_by IS NOT NULL
+     AND current_user = 'agent_saga_template_authority'
+     AND current_setting('app.saga_template_revocation', true)
+       = concat(
+         NEW.template_id::TEXT, ':',
+         NEW.template_version::TEXT, ':',
+         NEW.definition_hash
+       )
+     AND (to_jsonb(NEW) - 'status' - 'revoked_by' - 'revoked_at')
+       = (to_jsonb(OLD) - 'status' - 'revoked_by' - 'revoked_at') THEN
     RETURN NEW;
   END IF;
 
@@ -1338,12 +1372,28 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $guard$
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.intent_status <> 'PREPARED' THEN
+      RAISE EXCEPTION 'new effect intents must start prepared';
+    END IF;
+    RETURN NEW;
+  END IF;
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'effect intents are immutable';
   END IF;
   IF (to_jsonb(NEW) - 'intent_status')
      <> (to_jsonb(OLD) - 'intent_status') THEN
     RAISE EXCEPTION 'effect intent identity is immutable';
+  END IF;
+  IF NEW.intent_status = 'OBSERVED'
+     AND NOT EXISTS (
+       SELECT 1
+       FROM agent_saga_effect_receipt
+       WHERE account_id = NEW.account_id
+         AND effect_id = NEW.effect_id
+         AND signature_verified
+     ) THEN
+    RAISE EXCEPTION 'observed effects require a trusted receipt';
   END IF;
   IF NEW.intent_status = OLD.intent_status
      OR (OLD.intent_status = 'PREPARED'
@@ -1365,6 +1415,12 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $guard$
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status <> 'PLANNED' THEN
+      RAISE EXCEPTION 'new compensation plans must start planned';
+    END IF;
+    RETURN NEW;
+  END IF;
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'compensation plans are immutable';
   END IF;
@@ -1377,6 +1433,17 @@ BEGIN
        AND NEW.status IN ('RUNNING', 'NEEDS_HUMAN'))
      OR (OLD.status = 'RUNNING'
        AND NEW.status IN ('SUCCEEDED', 'FAILED', 'NEEDS_HUMAN')) THEN
+    IF OLD.status = 'PLANNED'
+       AND NEW.status = 'RUNNING'
+       AND NOT EXISTS (
+         SELECT 1
+         FROM agent_saga_compensation_run
+         WHERE account_id = NEW.account_id
+           AND saga_id = NEW.saga_id
+           AND plan_id = NEW.plan_id
+       ) THEN
+      RAISE EXCEPTION 'cannot run an empty compensation plan';
+    END IF;
     RETURN NEW;
   END IF;
   RAISE EXCEPTION 'invalid compensation plan status transition';
@@ -1387,7 +1454,24 @@ CREATE FUNCTION agent_saga_guard_compensation_run()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $guard$
+DECLARE
+  parent_status TEXT;
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    SELECT status INTO parent_status
+    FROM agent_saga_compensation_plan
+    WHERE account_id = NEW.account_id
+      AND saga_id = NEW.saga_id
+      AND plan_id = NEW.plan_id
+      AND plan_hash = NEW.plan_hash
+    FOR UPDATE;
+    IF NEW.status <> 'PLANNED'
+       OR NEW.compensation_effect_id IS NOT NULL
+       OR parent_status IS DISTINCT FROM 'PLANNED' THEN
+      RAISE EXCEPTION 'compensation membership can only enter a planned plan';
+    END IF;
+    RETURN NEW;
+  END IF;
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'compensation plan rows are immutable';
   END IF;
@@ -1427,7 +1511,7 @@ END
 $guard$;
 
 CREATE TRIGGER agent_saga_template_immutable
-  BEFORE UPDATE OR DELETE ON agent_saga_template
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_saga_template
   FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_template_update();
 CREATE TRIGGER agent_saga_template_step_immutable
   BEFORE INSERT OR UPDATE OR DELETE ON agent_saga_template_step
@@ -1439,13 +1523,13 @@ CREATE TRIGGER agent_saga_compensation_plan_valid
   BEFORE INSERT OR UPDATE ON agent_saga_compensation_run
   FOR EACH ROW EXECUTE FUNCTION agent_saga_validate_compensation_plan();
 CREATE TRIGGER agent_saga_effect_intent_immutable
-  BEFORE UPDATE OR DELETE ON agent_saga_effect_intent
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_saga_effect_intent
   FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_effect_intent();
 CREATE TRIGGER agent_saga_compensation_plan_immutable
-  BEFORE UPDATE OR DELETE ON agent_saga_compensation_plan
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_saga_compensation_plan
   FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_compensation_plan();
 CREATE TRIGGER agent_saga_compensation_run_immutable
-  BEFORE UPDATE OR DELETE ON agent_saga_compensation_run
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_saga_compensation_run
   FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_compensation_run();
 CREATE TRIGGER agent_saga_authorization_evidence_immutable
   BEFORE UPDATE OR DELETE ON agent_saga_authorization_evidence
@@ -1560,11 +1644,84 @@ BEGIN
 END
 $approve$;
 
+CREATE FUNCTION revoke_agent_saga_template(
+  tenant_id BIGINT,
+  target_template_id UUID,
+  target_template_version INTEGER,
+  expected_definition_hash TEXT,
+  revoker_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $revoke$
+DECLARE
+  stored_hash CHAR(64);
+  stored_status saga_template_status;
+BEGIN
+  SELECT definition_hash, status
+    INTO stored_hash, stored_status
+  FROM agent_saga_template
+  WHERE account_id = tenant_id
+    AND template_id = target_template_id
+    AND template_version = target_template_version
+  FOR UPDATE;
+
+  IF length(expected_definition_hash) <> 64
+     OR stored_status IS DISTINCT FROM 'APPROVED'
+     OR stored_hash IS DISTINCT FROM expected_definition_hash THEN
+    RAISE EXCEPTION 'template revocation hash or state mismatch';
+  END IF;
+
+  PERFORM set_config(
+    'app.saga_template_revocation',
+    concat(
+      target_template_id::TEXT, ':',
+      target_template_version::TEXT, ':',
+      expected_definition_hash
+    ),
+    true
+  );
+
+  UPDATE agent_saga_template
+  SET status = 'REVOKED',
+      revoked_by = revoker_id,
+      revoked_at = clock_timestamp()
+  WHERE account_id = tenant_id
+    AND template_id = target_template_id
+    AND template_version = target_template_version;
+
+END
+$revoke$;
+
+ALTER FUNCTION approve_agent_saga_template(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) OWNER TO agent_saga_template_authority;
+ALTER FUNCTION revoke_agent_saga_template(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) OWNER TO agent_saga_template_authority;
+
+GRANT USAGE ON SCHEMA public TO agent_saga_template_authority;
+GRANT SELECT ON
+  agent_saga_template,
+  agent_saga_template_step,
+  agent_saga_template_edge
+TO agent_saga_template_authority;
+GRANT UPDATE (
+  status, approved_by, approved_at, approval_validation_hash,
+  revoked_by, revoked_at
+) ON agent_saga_template TO agent_saga_template_authority;
+
 REVOKE ALL ON FUNCTION approve_agent_saga_template(
   BIGINT, UUID, INTEGER, TEXT, TEXT
 ) FROM PUBLIC;
+REVOKE ALL ON FUNCTION revoke_agent_saga_template(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) FROM PUBLIC;
 REVOKE UPDATE (
-  status, approved_by, approved_at, approval_validation_hash
+  status, approved_by, approved_at, approval_validation_hash,
+  revoked_by, revoked_at
 ) ON agent_saga_template FROM PUBLIC;
 
 CREATE INDEX agent_saga_instance_work_idx ON agent_saga_instance (
@@ -1860,6 +2017,14 @@ type AgentSagaMutationResult {
   auditHash: SHA256
 }
 
+type AgentSagaTemplateMutationResult {
+  decision: String!
+  template: AgentSagaTemplate
+  code: String
+  reason: String
+  auditHash: SHA256
+}
+
 type AgentSagaStepClaim {
   stepId: ID!
   runNo: Int!
@@ -1963,6 +2128,16 @@ input RetryAgentSagaStepInput {
   reason: String!
 }
 
+input AgentSagaTemplateLifecycleInput {
+  accountId: ID!
+  templateId: ID!
+  templateVersion: Int!
+  expectedDefinitionHash: SHA256!
+  validationEvidenceRef: ID!
+  idempotencyKey: String!
+  reason: String!
+}
+
 type Query {
   agentSagaTemplate(
     accountId: ID!
@@ -1990,6 +2165,12 @@ type Query {
 }
 
 type Mutation {
+  approveAgentSagaTemplate(
+    input: AgentSagaTemplateLifecycleInput!
+  ): AgentSagaTemplateMutationResult!
+  revokeAgentSagaTemplate(
+    input: AgentSagaTemplateLifecycleInput!
+  ): AgentSagaTemplateMutationResult!
   startAgentSaga(input: StartAgentSagaInput!): AgentSagaMutationResult!
   claimAgentSagaStep(
     input: ClaimAgentSagaStepInput!
@@ -2038,6 +2219,10 @@ and ordinary saga reads. An idempotent replay by the same authenticated
 principal decrypts and returns the original claim capability from the encrypted
 command result; after lease expiry it remains historical evidence and a new
 claim requires a new idempotency key.
+Template lifecycle mutations require an administrative template scope. Their
+resolver verifies the immutable validation evidence, derives approver/revoker
+identity from authentication, and alone can call the no-login authority's
+approval or revocation procedure.
 
 ## 10. Procedural memory
 
@@ -2270,6 +2455,12 @@ result, adapter version, capability version, and point-of-no-return timestamp.
 Anchor workers periodically sign chain heads into a cross-region immutable
 archive and store the archive receipt. Deleting or recomputing database rows
 therefore cannot conceal divergence.
+
+Template approval and revocation emit the same canonical lifecycle body to the
+platform audit stream before the lifecycle mutation returns. The body binds
+tenant, template version/hash, validation-evidence hash, authenticated actor,
+reason, idempotency key, and resulting status; its immutable archive receipt is
+the GraphQL `auditHash`.
 
 Replay starts from the immutable template hash and start input hash, applies
 events in sequence, and must reproduce every revision, budget balance,

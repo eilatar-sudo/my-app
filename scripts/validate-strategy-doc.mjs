@@ -260,8 +260,27 @@ try {
       'ticket.create', repeat('2', 64), repeat('3', 64),
       'kms://request/fixture', 'provider-key-fixture', 'principal:test',
       '30000000-0000-0000-0000-000000000001', repeat('e', 64), 7, 11,
-      'OBSERVED', now()
+      'PREPARED', now()
     );
+
+    UPDATE agent_saga_effect_intent
+    SET intent_status = 'DISPATCHING'
+    WHERE account_id = 101
+      AND effect_id = '40000000-0000-0000-0000-000000000001';
+
+    INSERT INTO agent_saga_effect_receipt (
+      account_id, receipt_id, effect_id, provider_event_id, outcome,
+      receipt_hash, signature_verified, observed_at
+    ) VALUES (
+      101, '41000000-0000-0000-0000-000000000001',
+      '40000000-0000-0000-0000-000000000001', 'provider-event-fixture',
+      'SUCCEEDED', repeat('6', 64), true, now()
+    );
+
+    UPDATE agent_saga_effect_intent
+    SET intent_status = 'OBSERVED'
+    WHERE account_id = 101
+      AND effect_id = '40000000-0000-0000-0000-000000000001';
 
     INSERT INTO agent_saga_compensation_plan (
       account_id, saga_id, plan_id, template_id, template_version, plan_hash,
@@ -365,6 +384,105 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
+        INSERT INTO agent_saga_template (
+          account_id, template_id, template_version, name, status,
+          definition_hash, canonicalization_version, compiler_version,
+          approval_validation_hash, authorization_evidence_id,
+          authorization_snapshot_hash, revocation_policy, input_schema,
+          semantic_tags, max_steps, max_parallelism, created_by, created_at,
+          approved_by, approved_at
+        ) VALUES (
+          101, '10000000-0000-0000-0000-000000000002', 1,
+          'Bypass approval', 'APPROVED', repeat('a', 64), 'jcs-v1',
+          'saga-compiler-1', repeat('a', 64),
+          '30000000-0000-0000-0000-000000000001', repeat('d', 64),
+          'STOP_BEFORE_NEXT_EFFECT', '{"type":"object"}', ARRAY['unsafe'],
+          1, 1, 'principal:test', now(), 'principal:test', now()
+        );
+      `),
+    "insertion of a pre-approved template",
+    "P0001",
+  );
+
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
+        INSERT INTO agent_saga_effect_intent (
+          account_id, effect_id, saga_id, step_id, run_no, capability,
+          target_ref_hmac, canonical_request_hash, encrypted_request_ref,
+          provider_idempotency_key, principal_id, authorization_evidence_id,
+          delegated_scope_hash, authorization_revision, resource_acl_revision,
+          intent_status, created_at
+        ) VALUES (
+          101, '40000000-0000-0000-0000-000000000002',
+          '20000000-0000-0000-0000-000000000001', 'open_ticket', 1,
+          'ticket.create', repeat('2', 64), repeat('3', 64),
+          'kms://request/bypass', 'provider-key-bypass', 'principal:test',
+          '30000000-0000-0000-0000-000000000001', repeat('e', 64), 7, 11,
+          'OBSERVED', now()
+        );
+      `),
+    "insertion of an already-observed effect",
+    "P0001",
+  );
+
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
+        UPDATE agent_saga_template
+        SET status = 'REVOKED',
+            revoked_by = 'principal:unauthorized',
+            revoked_at = now()
+        WHERE account_id = 101
+          AND template_id = '10000000-0000-0000-0000-000000000001'
+          AND template_version = 1;
+      `),
+    "direct template revocation",
+    "P0001",
+  );
+
+  await database.exec(`
+    SELECT set_config('app.account_id', '101', true);
+
+    UPDATE agent_saga_compensation_plan
+    SET status = 'RUNNING', updated_at = now()
+    WHERE account_id = 101
+      AND saga_id = '20000000-0000-0000-0000-000000000001'
+      AND plan_id = '50000000-0000-0000-0000-000000000001';
+  `);
+
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
+        INSERT INTO agent_saga_compensation_run (
+          account_id, compensation_id, saga_id, plan_id, template_id,
+          template_version, original_effect_id, compensation_effect_id,
+          compensation_step_id, reverse_ordinal, status, plan_hash,
+          created_at, updated_at
+        ) VALUES (
+          101, '60000000-0000-0000-0000-000000000002',
+          '20000000-0000-0000-0000-000000000001',
+          '50000000-0000-0000-0000-000000000001',
+          '10000000-0000-0000-0000-000000000001', 1,
+          '40000000-0000-0000-0000-000000000001', NULL, 'close_ticket', 2,
+          'PLANNED', repeat('4', 64), now(), now()
+        );
+      `),
+    "adding compensation membership after plan start",
+    "P0001",
+  );
+
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
         UPDATE agent_saga_effect_intent
         SET canonical_request_hash = repeat('7', 64)
         WHERE account_id = 101
@@ -425,7 +543,7 @@ console.log(
       sql: {
         tables: tableCount + 1,
         indexes: indexCount,
-        executableConstraintChecks: 5,
+        executableConstraintChecks: 9,
         tenantPoliciesChecked: tableCount + 1,
       },
       status: "ok",
