@@ -208,14 +208,13 @@ try {
       '{"action":"create_ticket"}', '{"approved":true}', 1, 1, 1
     );
 
-    UPDATE agent_saga_template
-    SET status = 'APPROVED',
-        approved_by = 'principal:approver',
-        approved_at = now(),
-        approval_validation_hash = repeat('9', 64)
-    WHERE account_id = 101
-      AND template_id = '10000000-0000-0000-0000-000000000001'
-      AND template_version = 1;
+    SELECT approve_agent_saga_template(
+      101,
+      '10000000-0000-0000-0000-000000000001',
+      1,
+      repeat('a', 64),
+      'principal:approver'
+    );
 
     INSERT INTO agent_saga_instance (
       account_id, saga_id, template_id, template_version, status,

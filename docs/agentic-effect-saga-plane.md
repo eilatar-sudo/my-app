@@ -160,7 +160,11 @@ snapshot. The runtime does not reinterpret free-form instructions.
 Draft rows are writable only through the compiler role. Database triggers make
 approved/revoked template, step, and edge records immutable, except the single
 `APPROVED -> REVOKED` transition with unchanged definition bytes. Approval
-recomputes the canonical hash in the database transaction before sealing.
+uses a separate security-definer procedure unavailable to the draft-writer
+role. The trusted compiler recomputes the canonical hash, and the procedure
+locks the draft, requires that exact hash, recounts steps, rejects graph cycles
+or invalid compensation links, installs a transaction-local approval fence, and
+seals the row. Direct status-column updates are revoked.
 
 ### 5.2 Ready-step calculation
 
@@ -263,11 +267,13 @@ tool units.
 A terminal forward failure computes the reverse topological set of
 known-applied effects—both `SUCCEEDED` and `FAILED_AFTER_EFFECT`—that declare
 compensation. The set and order are sealed into a
-compensation plan hash before execution. Each plan row binds the original
-effect, reverse ordinal, approved compensation step, and resulting compensation
-effect. The inverse request derives its target from the original tenant-HMAC
-alias; callers cannot redirect it. Failed or uncertain compensation follows the
-same receipt rules and requires privileged human resolution.
+compensation plan header and hash before execution. Every append-only plan row
+foreign-keys that header/hash and binds the original effect, reverse ordinal,
+approved compensation step, and one-time resulting compensation effect.
+Triggers freeze plan identity and permit only declared status transitions. The
+inverse request derives its target from the original tenant-HMAC alias; callers
+cannot redirect it. Failed or uncertain compensation follows the same receipt
+rules and requires privileged human resolution.
 
 ### 6.5 Complete
 
@@ -545,6 +551,14 @@ interface RetryStepCommand {
   readonly reason: string;
 }
 
+interface StepClaimCapability {
+  readonly stepId: StepId;
+  readonly runNo: number;
+  readonly claimToken: string;
+  readonly leaseGeneration: bigint;
+  readonly leaseExpiresAt: Timestamp;
+}
+
 type TransitionDecision =
   | {
       readonly decision: "COMMITTED";
@@ -555,12 +569,8 @@ type TransitionDecision =
   | {
       readonly decision: "CLAIMED";
       readonly sagaId: SagaId;
-      readonly stepId: StepId;
-      readonly runNo: number;
       readonly newRevision: bigint;
-      readonly claimToken: string;
-      readonly leaseGeneration: bigint;
-      readonly leaseExpiresAt: Timestamp;
+      readonly claim: StepClaimCapability;
       readonly auditHash: Sha256;
     }
   | {
@@ -568,6 +578,8 @@ type TransitionDecision =
       readonly sagaId: SagaId;
       readonly currentRevision: bigint;
       readonly originalRequestId: string;
+      readonly originalDecision: "COMMITTED" | "CLAIMED";
+      readonly claim: StepClaimCapability | null;
     }
   | {
       readonly decision: "REJECTED";
@@ -965,10 +977,36 @@ CREATE TABLE agent_saga_effect_receipt (
   CHECK (signature_verified)
 );
 
+CREATE TABLE agent_saga_compensation_plan (
+  account_id BIGINT NOT NULL,
+  saga_id UUID NOT NULL,
+  plan_id UUID NOT NULL,
+  template_id UUID NOT NULL,
+  template_version INTEGER NOT NULL,
+  plan_hash CHAR(64) NOT NULL,
+  authorization_evidence_id UUID NOT NULL,
+  status TEXT NOT NULL CHECK (
+    status IN ('PLANNED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'NEEDS_HUMAN')
+  ),
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, saga_id, plan_id),
+  UNIQUE (account_id, saga_id, plan_id, plan_hash),
+  FOREIGN KEY (
+    account_id, saga_id, template_id, template_version
+  ) REFERENCES agent_saga_instance (
+    account_id, saga_id, template_id, template_version
+  ),
+  FOREIGN KEY (account_id, authorization_evidence_id)
+    REFERENCES agent_saga_authorization_evidence (account_id, evidence_id),
+  CHECK (length(plan_hash) = 64)
+);
+
 CREATE TABLE agent_saga_compensation_run (
   account_id BIGINT NOT NULL,
   compensation_id UUID NOT NULL,
   saga_id UUID NOT NULL,
+  plan_id UUID NOT NULL,
   template_id UUID NOT NULL,
   template_version INTEGER NOT NULL,
   original_effect_id UUID NOT NULL,
@@ -988,6 +1026,10 @@ CREATE TABLE agent_saga_compensation_run (
   UNIQUE (account_id, saga_id, original_effect_id),
   UNIQUE (account_id, saga_id, reverse_ordinal),
   UNIQUE (account_id, compensation_effect_id),
+  FOREIGN KEY (account_id, saga_id, plan_id, plan_hash)
+    REFERENCES agent_saga_compensation_plan (
+      account_id, saga_id, plan_id, plan_hash
+    ),
   FOREIGN KEY (
     account_id, saga_id, template_id, template_version
   ) REFERENCES agent_saga_instance (
@@ -1168,6 +1210,13 @@ BEGIN
        AND NEW.approved_by IS NOT NULL
        AND NEW.approved_at IS NOT NULL
        AND NEW.approval_validation_hash IS NOT NULL
+       AND NEW.approval_validation_hash = NEW.definition_hash
+       AND current_setting('app.saga_template_approval', true)
+         = concat(
+           NEW.template_id::TEXT, ':',
+           NEW.template_version::TEXT, ':',
+           NEW.definition_hash
+         )
        AND (
          to_jsonb(NEW)
            - 'status' - 'approved_by' - 'approved_at'
@@ -1284,6 +1333,90 @@ BEGIN
 END
 $guard$;
 
+CREATE FUNCTION agent_saga_guard_effect_intent()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $guard$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'effect intents are immutable';
+  END IF;
+  IF (to_jsonb(NEW) - 'intent_status')
+     <> (to_jsonb(OLD) - 'intent_status') THEN
+    RAISE EXCEPTION 'effect intent identity is immutable';
+  END IF;
+  IF NEW.intent_status = OLD.intent_status
+     OR (OLD.intent_status = 'PREPARED'
+       AND NEW.intent_status = 'DISPATCHING')
+     OR (OLD.intent_status = 'DISPATCHING'
+       AND NEW.intent_status IN ('OBSERVED', 'UNKNOWN_EFFECT'))
+     OR (OLD.intent_status = 'UNKNOWN_EFFECT'
+       AND NEW.intent_status IN ('DISPATCHING', 'OBSERVED', 'RESOLVED'))
+     OR (OLD.intent_status = 'OBSERVED'
+       AND NEW.intent_status = 'RESOLVED') THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'invalid effect intent status transition';
+END
+$guard$;
+
+CREATE FUNCTION agent_saga_guard_compensation_plan()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $guard$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'compensation plans are immutable';
+  END IF;
+  IF (to_jsonb(NEW) - 'status' - 'updated_at')
+     <> (to_jsonb(OLD) - 'status' - 'updated_at') THEN
+    RAISE EXCEPTION 'compensation plan identity is immutable';
+  END IF;
+  IF NEW.status = OLD.status
+     OR (OLD.status = 'PLANNED'
+       AND NEW.status IN ('RUNNING', 'NEEDS_HUMAN'))
+     OR (OLD.status = 'RUNNING'
+       AND NEW.status IN ('SUCCEEDED', 'FAILED', 'NEEDS_HUMAN')) THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'invalid compensation plan status transition';
+END
+$guard$;
+
+CREATE FUNCTION agent_saga_guard_compensation_run()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $guard$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'compensation plan rows are immutable';
+  END IF;
+  IF (
+    to_jsonb(NEW) - 'status' - 'updated_at' - 'compensation_effect_id'
+  ) <> (
+    to_jsonb(OLD) - 'status' - 'updated_at' - 'compensation_effect_id'
+  ) THEN
+    RAISE EXCEPTION 'compensation plan row identity is immutable';
+  END IF;
+  IF OLD.compensation_effect_id IS NOT NULL
+     AND NEW.compensation_effect_id IS DISTINCT FROM OLD.compensation_effect_id THEN
+    RAISE EXCEPTION 'compensation effect binding is immutable';
+  END IF;
+  IF NEW.status = OLD.status
+     OR (OLD.status = 'PLANNED'
+       AND NEW.status IN ('RUNNING', 'NEEDS_HUMAN'))
+     OR (OLD.status = 'RUNNING'
+       AND NEW.status IN (
+         'SUCCEEDED', 'FAILED', 'UNKNOWN_EFFECT', 'NEEDS_HUMAN'
+       ))
+     OR (OLD.status = 'UNKNOWN_EFFECT'
+       AND NEW.status IN ('RUNNING', 'NEEDS_HUMAN')) THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'invalid compensation row status transition';
+END
+$guard$;
+
 CREATE FUNCTION agent_saga_reject_evidence_mutation()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -1305,6 +1438,15 @@ CREATE TRIGGER agent_saga_template_edge_immutable
 CREATE TRIGGER agent_saga_compensation_plan_valid
   BEFORE INSERT OR UPDATE ON agent_saga_compensation_run
   FOR EACH ROW EXECUTE FUNCTION agent_saga_validate_compensation_plan();
+CREATE TRIGGER agent_saga_effect_intent_immutable
+  BEFORE UPDATE OR DELETE ON agent_saga_effect_intent
+  FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_effect_intent();
+CREATE TRIGGER agent_saga_compensation_plan_immutable
+  BEFORE UPDATE OR DELETE ON agent_saga_compensation_plan
+  FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_compensation_plan();
+CREATE TRIGGER agent_saga_compensation_run_immutable
+  BEFORE UPDATE OR DELETE ON agent_saga_compensation_run
+  FOR EACH ROW EXECUTE FUNCTION agent_saga_guard_compensation_run();
 CREATE TRIGGER agent_saga_authorization_evidence_immutable
   BEFORE UPDATE OR DELETE ON agent_saga_authorization_evidence
   FOR EACH ROW EXECUTE FUNCTION agent_saga_reject_evidence_mutation();
@@ -1317,6 +1459,113 @@ CREATE TRIGGER agent_saga_audit_event_immutable
 CREATE TRIGGER agent_saga_audit_anchor_immutable
   BEFORE UPDATE OR DELETE ON agent_saga_audit_anchor
   FOR EACH ROW EXECUTE FUNCTION agent_saga_reject_evidence_mutation();
+
+CREATE FUNCTION approve_agent_saga_template(
+  tenant_id BIGINT,
+  target_template_id UUID,
+  target_template_version INTEGER,
+  validated_definition_hash TEXT,
+  approver_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $approve$
+DECLARE
+  stored_hash CHAR(64);
+  stored_status saga_template_status;
+  configured_max_steps SMALLINT;
+  actual_steps INTEGER;
+BEGIN
+  SELECT definition_hash, status, max_steps
+    INTO stored_hash, stored_status, configured_max_steps
+  FROM agent_saga_template
+  WHERE account_id = tenant_id
+    AND template_id = target_template_id
+    AND template_version = target_template_version
+  FOR UPDATE;
+
+  IF length(validated_definition_hash) <> 64
+     OR stored_status IS DISTINCT FROM 'DRAFT'
+     OR stored_hash IS DISTINCT FROM validated_definition_hash THEN
+    RAISE EXCEPTION 'template approval hash or state mismatch';
+  END IF;
+
+  SELECT count(*)::INTEGER INTO actual_steps
+  FROM agent_saga_template_step
+  WHERE account_id = tenant_id
+    AND template_id = target_template_id
+    AND template_version = target_template_version;
+  IF actual_steps NOT BETWEEN 1 AND configured_max_steps THEN
+    RAISE EXCEPTION 'template step count is outside sealed bounds';
+  END IF;
+
+  IF EXISTS (
+    WITH RECURSIVE reachable(from_step_id, to_step_id) AS (
+      SELECT from_step_id, to_step_id
+      FROM agent_saga_template_edge
+      WHERE account_id = tenant_id
+        AND template_id = target_template_id
+        AND template_version = target_template_version
+      UNION
+      SELECT reachable.from_step_id, edge.to_step_id
+      FROM reachable
+      JOIN agent_saga_template_edge AS edge
+        ON edge.account_id = tenant_id
+       AND edge.template_id = target_template_id
+       AND edge.template_version = target_template_version
+       AND edge.from_step_id = reachable.to_step_id
+    )
+    SELECT 1 FROM reachable WHERE from_step_id = to_step_id
+  ) THEN
+    RAISE EXCEPTION 'template graph must be acyclic';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM agent_saga_template_step AS forward_step
+    LEFT JOIN agent_saga_template_step AS compensation_step
+      ON compensation_step.account_id = forward_step.account_id
+     AND compensation_step.template_id = forward_step.template_id
+     AND compensation_step.template_version = forward_step.template_version
+     AND compensation_step.step_id = forward_step.compensation_step_id
+    WHERE forward_step.account_id = tenant_id
+      AND forward_step.template_id = target_template_id
+      AND forward_step.template_version = target_template_version
+      AND forward_step.compensation_step_id IS NOT NULL
+      AND compensation_step.step_kind IS DISTINCT FROM 'COMPENSATION'
+  ) THEN
+    RAISE EXCEPTION 'declared compensation step is invalid';
+  END IF;
+
+  PERFORM set_config(
+    'app.saga_template_approval',
+    concat(
+      target_template_id::TEXT, ':',
+      target_template_version::TEXT, ':',
+      validated_definition_hash
+    ),
+    true
+  );
+
+  UPDATE agent_saga_template
+  SET status = 'APPROVED',
+      approved_by = approver_id,
+      approved_at = clock_timestamp(),
+      approval_validation_hash = validated_definition_hash
+  WHERE account_id = tenant_id
+    AND template_id = target_template_id
+    AND template_version = target_template_version;
+END
+$approve$;
+
+REVOKE ALL ON FUNCTION approve_agent_saga_template(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) FROM PUBLIC;
+REVOKE UPDATE (
+  status, approved_by, approved_at, approval_validation_hash
+) ON agent_saga_template FROM PUBLIC;
 
 CREATE INDEX agent_saga_instance_work_idx ON agent_saga_instance (
   account_id, status, updated_at, saga_id
@@ -1345,6 +1594,10 @@ CREATE INDEX agent_saga_receipt_effect_idx ON agent_saga_effect_receipt (
 CREATE INDEX agent_saga_compensation_work_idx ON agent_saga_compensation_run (
   account_id, status, updated_at, saga_id
 ) WHERE status IN ('PLANNED', 'RUNNING', 'UNKNOWN_EFFECT', 'NEEDS_HUMAN');
+CREATE INDEX agent_saga_compensation_plan_work_idx
+  ON agent_saga_compensation_plan (
+  account_id, status, updated_at, saga_id, plan_id
+) WHERE status IN ('PLANNED', 'RUNNING', 'NEEDS_HUMAN');
 CREATE INDEX agent_saga_audit_time_idx ON agent_saga_audit_event (
   account_id, occurred_at, saga_id, event_sequence
 );
@@ -1372,6 +1625,7 @@ BEGIN
     'agent_saga_dispatch_outbox',
     'agent_saga_effect_attempt',
     'agent_saga_effect_receipt',
+    'agent_saga_compensation_plan',
     'agent_saga_compensation_run',
     'agent_saga_human_resolution',
     'agent_saga_inbox_dedupe',
@@ -1780,7 +2034,10 @@ board, template, target, and audit scopes in addition to account membership.
 does not let a GraphQL caller submit a receipt or choose an outcome.
 Claim fields are returned only to principals with the worker-execution scope;
 tokens are short-lived, single-step capabilities and are redacted from audit
-and ordinary saga reads.
+and ordinary saga reads. An idempotent replay by the same authenticated
+principal decrypts and returns the original claim capability from the encrypted
+command result; after lease expiry it remains historical evidence and a new
+claim requires a new idempotency key.
 
 ## 10. Procedural memory
 
