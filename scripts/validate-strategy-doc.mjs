@@ -204,8 +204,12 @@ try {
       estimated_tool_units
     ) VALUES (
       101, '10000000-0000-0000-0000-000000000001', 1, 'open_ticket', 1,
-      'EXTERNAL_EFFECT', 'ticket.create', 5000, 2, true, NULL,
+      'EXTERNAL_EFFECT', 'ticket.create', 5000, 2, true, 'close_ticket',
       '{"action":"create_ticket"}', '{"approved":true}', 1, 1, 1
+    ), (
+      101, '10000000-0000-0000-0000-000000000001', 1, 'close_ticket', 2,
+      'COMPENSATION', 'ticket.close', 5000, 2, true, NULL,
+      '{"action":"close_ticket"}', '{"ticket_created":true}', 1, 1, 1
     );
 
     SELECT approve_agent_saga_template(
@@ -233,6 +237,54 @@ try {
       'BOUNDED_STALENESS', 'principal:test', 'principal:test',
       '30000000-0000-0000-0000-000000000001',
       repeat('e', 64), 7, repeat('f', 64), now(), now()
+    );
+
+    INSERT INTO agent_saga_step_run (
+      account_id, saga_id, template_id, template_version, step_id, run_no,
+      status, planned_input_hash
+    ) VALUES (
+      101, '20000000-0000-0000-0000-000000000001',
+      '10000000-0000-0000-0000-000000000001', 1, 'open_ticket', 1,
+      'SUCCEEDED', repeat('1', 64)
+    );
+
+    INSERT INTO agent_saga_effect_intent (
+      account_id, effect_id, saga_id, step_id, run_no, capability,
+      target_ref_hmac, canonical_request_hash, encrypted_request_ref,
+      provider_idempotency_key, principal_id, authorization_evidence_id,
+      delegated_scope_hash, authorization_revision, resource_acl_revision,
+      intent_status, created_at
+    ) VALUES (
+      101, '40000000-0000-0000-0000-000000000001',
+      '20000000-0000-0000-0000-000000000001', 'open_ticket', 1,
+      'ticket.create', repeat('2', 64), repeat('3', 64),
+      'kms://request/fixture', 'provider-key-fixture', 'principal:test',
+      '30000000-0000-0000-0000-000000000001', repeat('e', 64), 7, 11,
+      'OBSERVED', now()
+    );
+
+    INSERT INTO agent_saga_compensation_plan (
+      account_id, saga_id, plan_id, template_id, template_version, plan_hash,
+      authorization_evidence_id, status, created_at, updated_at
+    ) VALUES (
+      101, '20000000-0000-0000-0000-000000000001',
+      '50000000-0000-0000-0000-000000000001',
+      '10000000-0000-0000-0000-000000000001', 1, repeat('4', 64),
+      '30000000-0000-0000-0000-000000000001', 'PLANNED', now(), now()
+    );
+
+    INSERT INTO agent_saga_compensation_run (
+      account_id, compensation_id, saga_id, plan_id, template_id,
+      template_version, original_effect_id, compensation_effect_id,
+      compensation_step_id, reverse_ordinal, status, plan_hash,
+      created_at, updated_at
+    ) VALUES (
+      101, '60000000-0000-0000-0000-000000000001',
+      '20000000-0000-0000-0000-000000000001',
+      '50000000-0000-0000-0000-000000000001',
+      '10000000-0000-0000-0000-000000000001', 1,
+      '40000000-0000-0000-0000-000000000001', NULL, 'close_ticket', 1,
+      'PLANNED', repeat('4', 64), now(), now()
     );
   `);
 
@@ -308,6 +360,34 @@ try {
     "P0001",
   );
 
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
+        UPDATE agent_saga_effect_intent
+        SET canonical_request_hash = repeat('7', 64)
+        WHERE account_id = 101
+          AND effect_id = '40000000-0000-0000-0000-000000000001';
+      `),
+    "mutation of a prepared effect identity",
+    "P0001",
+  );
+
+  await expectDatabaseRejection(
+    () =>
+      database.exec(`
+        SELECT set_config('app.account_id', '101', true);
+
+        UPDATE agent_saga_compensation_run
+        SET plan_hash = repeat('7', 64)
+        WHERE account_id = 101
+          AND compensation_id = '60000000-0000-0000-0000-000000000001';
+      `),
+    "mutation of a sealed compensation plan row",
+    "P0001",
+  );
+
   const tenantCount = await database.query(
     "SELECT count(*)::int AS count FROM agent_saga_instance WHERE account_id = 101",
   );
@@ -345,7 +425,7 @@ console.log(
       sql: {
         tables: tableCount + 1,
         indexes: indexCount,
-        executableConstraintChecks: 3,
+        executableConstraintChecks: 5,
         tenantPoliciesChecked: tableCount + 1,
       },
       status: "ok",
