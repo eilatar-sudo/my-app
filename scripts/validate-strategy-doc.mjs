@@ -176,7 +176,7 @@ try {
       encrypted_evidence_ref, evidence_hash, immutable_archive_ref, created_at
     ) VALUES (
       101, '30000000-0000-0000-0000-000000000001', 'principal:test', 7, 11,
-      '{"scopes":["grant.visibility"]}', 'kms://evidence/fixture',
+      '{"scopes":["split.resolution"]}', 'kms://evidence/fixture',
       repeat('8', 64), 'worm://evidence/fixture', now()
     );
 
@@ -194,13 +194,13 @@ try {
       NULL, '30000000-0000-0000-0000-000000000001',
       repeat('d', 64), 3, 32,
       ARRAY['incident', 'split-resolution'], 'proc:split-resolution-incident',
-      'STOP_BEFORE_BALLOT', 'principal:test', now()
+      'STOP_BEFORE_ASSENT', 'principal:test', now()
     );
 
     INSERT INTO agent_sr_profile_resolution_rule (
       account_id, profile_id, profile_version, rule_id, ordinal,
       allowed_candidate_kinds, dual_control_threshold, require_refresh,
-      conflict_instruction
+      dual_control_instruction
     ) VALUES (
       101, '10000000-0000-0000-0000-000000000001', 1, 'split-candidate', 1,
       ARRAY['SPLIT_CANDIDATE_FACT', 'SUPERSEDED_CANDIDATE_FACT'], 3, true,
@@ -359,7 +359,7 @@ try {
           'Bypass approval', 'APPROVED', repeat('a', 64), 'jcs-v1',
           'sr-compiler-1', repeat('a', 64),
           '30000000-0000-0000-0000-000000000001', repeat('d', 64),
-          2, 16, ARRAY['unsafe'], 'STOP_BEFORE_BALLOT',
+          2, 16, ARRAY['unsafe'], 'STOP_BEFORE_ASSENT',
           'principal:test', now(), 'principal:test', now()
         );
       `),
