@@ -1,0 +1,2531 @@
+# mondayDB Agentic Confirmation-Window Observability Plane
+
+**Status:** Proposed  
+**Decision owner:** mondayDB Product and Engineering  
+**Contract version:** `2026-08-26.v1`
+
+## 1. Why this plane, before how
+
+A sealed confirmation-TTL retirement certificate can retire, extend,
+or contain an unconfirmed first-enrollment key. It does not decide
+**how remaining confirmation window, extend budget, and retirement
+urgency are perceived** — without scanning every pending vote,
+rewriting remaining time into `TRUSTED_ENROLLED`, or inventing a
+winner from a countdown.
+
+Without a confirmation-window observability plane, operators and
+agents either:
+
+- scan every pending first-enrollment vote and TTL-extend ledger
+  looking for "which keys still have time left" (neighbor-harmful
+  on boards with 1M+ rows), or
+- treat a shrinking countdown as retroactive engine truth, so
+  remaining TTL approaching zero is rewritten as confirmation,
+  historical `UNKNOWN_EFFECT` is rewritten as `ACKED`, a silent
+  clock tick auto-promotes `FIRST_ENROLLMENT` to
+  `TRUSTED_ENROLLED`, a halt-scoped body is "unlocked" by later
+  observation, and hop-attenuated purpose is amplified back to
+  the donor.
+
+The product trade-off is **observability fluency versus
+observability isolation**:
+
+- Publishing every remaining millisecond immediately as implicit
+  confirmation maximizes agent fluency and reduces re-planning
+  cost, but creates history-rewrite invention, countdown-as-
+  confirmation, silence-success, first-enrollment auto-trust,
+  unauditable observation storms, and recursive vote-ledger walks
+  against neighbors.
+- Binding a sealed window-observability certificate under an
+  approved observe profile, certificate point lookups, history-
+  rewrite fences, silence-success fences, first-enrollment
+  auto-trust fences, countdown-as-confirmation fences, halt-
+  observe fences, purpose-amplification fences, successor-leak
+  fences, ledger-scan fences, and steward budgets adds one
+  bounded evaluate transaction and short-lived observation
+  storage.
+- Semantic similarity may discover observe profiles, but it must
+  never decide whether a sealed TTL or confirm certificate may be
+  nominated, a remaining-TTL snapshot refreshed, a certificate
+  sealed, or a notify dispatched.
+
+The recommended model keeps the data plane deterministic:
+
+1. An approved observe profile defines allowed source kinds,
+   remaining-TTL buckets, dual-control refresh policy, and notify
+   policy. Evaluation **never** invents a winning fact hash and
+   **never** rewrites remaining time into `TRUSTED_ENROLLED`.
+2. An observability session opens under purpose, budget, and
+   authorization fences, and only nominates sealed TTL
+   certificates, sealed confirm certificates, first-enrollment
+   claims, or successor-key claims by point lookup from the
+   Confirmation-TTL Retirement, First-Enrollment Confirmation,
+   Successor-Key Enrollment, and Successor-Clock Re-Attestation
+   planes.
+3. mondayDB evaluates an observation whose kind is a pure function
+   of `(source_window_kind, placement_kind, key_lifecycle,
+   clock_lifecycle, attested_key_kind, requested_purpose_hash,
+   attenuation_hash, hop_count, remaining_ttl_ms,
+   extend_budget_remaining, expire_at, now_attested,
+   ttl_expired, confirmation_count, distinct_confirmer_count,
+   retire_kind)`. Silence cannot become historical success. A
+   countdown approaching zero seals
+   `REJECT_COUNTDOWN_CONFIRMATION` or `WINDOW_EXPIRING` only —
+   never `TRUSTED_ENROLLED`. Dual-control `WINDOW_EXTENDED`
+   re-arms remaining time without inventing confirmation. Halted
+   slots cannot become observation-restored winners.
+4. Sealing a window certificate binds
+   `consumer_ref + purpose_hash + window_set_hash +
+   clock_set_hash + remaining_set_hash + attenuation_hash`. The
+   certificate **must not** emit a `resolved_fact_hash`.
+5. Upstream invalidation marks certificates stale; notify intents
+   may become `UNKNOWN_EFFECT` until acknowledged. Observation of
+   `UNKNOWN_EFFECT` remains uncertain until a trusted refresh or
+   contain vote arrives.
+6. Unscoped key-catalog, clock-catalog, confirm-ledger,
+   vote-ledger, TTL-ledger, working-set, grant-graph, or board
+   scans are **FULL SCAN REJECTED**.
+
+The trade-off buys enterprise trust and 99.99% neighbor
+protection: recursive "re-read every pending vote forever" or
+"treat remaining TTL as confirmation until silence looks like
+success" loops are rejectable before they scan boards with 1M+
+rows. Perception is restored by sealed window certificates, not
+by magic countdown orchestration inside the engine.
+
+### Product outcome
+
+For any confirmation-window observability evaluation, mondayDB can
+answer:
+
+- Which profile, principal, and session authorized the nomination,
+  remaining-TTL refresh, evaluate, seal, invalidate, or notify
+  dispatch?
+- Which nominated windows, placement kinds, hop counts,
+  attenuation hashes, remaining-set hashes, and observe kinds
+  were bound?
+- Is the window certificate still current, invalidated, extended,
+  or awaiting notify acknowledgement?
+- Did async notify or first-enrollment sync become
+  `UNKNOWN_EFFECT`?
+- Can the observation history be replayed without invoking an LLM?
+
+## 2. Scope and ownership
+
+The Confirmation-Window Observability Plane owns:
+
+1. Immutable approved observe profiles as procedural memory of
+   "how remaining confirmation window, extend budget, and
+   retirement urgency are perceived without amplifying purpose,
+   leaking halted facts, rewriting attested history, scanning
+   vote ledgers, or inventing `TRUSTED_ENROLLED` from a
+   countdown."
+2. Tenant-scoped observability sessions with purpose and budget
+   fences.
+3. Deterministic nomination of sealed TTL certificates, confirm
+   certificates, and first-enrollment claims by point lookup —
+   never key-catalog, vote-ledger, TTL-ledger, working-set, or
+   board scans.
+4. Deterministic remaining-TTL snapshots, evaluation receipts,
+   sealed window certificates, and immutable observe bindings
+   that never invent a winner.
+5. Invalidation and notify intents with honest uncertainty.
+6. Agent perception cards, audit replay, and bounded observe
+   budgets.
+
+It integrates with, but does not replace:
+
+- **Confirmation-TTL Retirement:** supplies sealed TTL
+  certificates whose remaining window, extend budget, and retire
+  kind this plane may observe. This plane never retires, extends,
+  or contains a key.
+- **First-Enrollment Confirmation:** supplies sealed confirm
+  certificates and pending first-enrollment nominations whose
+  remaining confirmation window this plane may observe. This
+  plane never dual-control confirms a key into
+  `TRUSTED_ENROLLED`.
+- **Successor-Key Enrollment / Successor-Clock Re-Attestation /
+  Provider-Key Rotation:** supply sealed enroll, clock, and
+  rotation claims that this plane may bind an observation
+  against. This plane never enrolls a key, attests a clock, or
+  rotates signing material.
+- **Certificate Placement / Envelope Purpose Gate / Decision
+  Memory:** may consume sealed window certificates as perception
+  evidence, not raw countdown webhooks.
+- **Executive Freeze / Thaw SLA:** halt/restore context that
+  still forbids observe-as-restore against a halted body. Thaw
+  SLA decides freeze liveness; TTL retirement decides
+  confirmation-vote liveness; this plane decides remaining-
+  window perception.
+- **Emergency Containment:** the coarse stop/drain path used when
+  a contained key evaluates to `SKIP` or `WINDOW_CONTAINED`; this
+  plane is purpose-scoped observation isolation, not
+  workspace-wide containment.
+- **Query Governor / Budgets:** reserves nominate, evaluate,
+  vector, seal, invalidate, and observe units.
+
+### Non-goals
+
+- Letting an LLM decide that a shrinking countdown "feels
+  confirmable enough."
+- Auto-amplifying a hop-narrowed purpose back to the donor
+  purpose.
+- Reconstructing authoritative window certificates from columnar
+  or vector projections.
+- Cross-account confirmation-window observation or global
+  nearest-neighbor authorization.
+- Storing raw private keys, unrestricted tool payloads, or
+  redacted plaintext.
+- Claiming distributed atomicity with external time-distribution
+  providers.
+- Inventing a winning fact hash when remaining TTL approaches
+  zero after a restored slot.
+- Promoting `FIRST_ENROLLMENT` to `TRUSTED_ENROLLED` because a
+  countdown ticked.
+- Scanning vote or TTL ledgers to compute remaining time.
+
+## 3. Product contract
+
+### 3.1 Observe profile contract
+
+A profile version is immutable after approval. It defines:
+
+- allowed observation kinds (`SEALED_TTL_CERTIFICATE`,
+  `SEALED_CONFIRM_CERTIFICATE`, `FIRST_ENROLLMENT_CLAIM`,
+  `SUCCESSOR_KEY_CLAIM`);
+- remaining-TTL buckets (`expiring_threshold_ms`), max refresh
+  count, evaluate threshold (distinct human principals for
+  `WINDOW_EXTENDED` refresh, minimum 2), max bindings per
+  certificate, and max nominated windows;
+- observe policy (`HISTORY_NEVER_REWRITTEN`,
+  `SILENCE_NEVER_SUCCESS`, `FIRST_ENROLLMENT_NEVER_AUTO_TRUSTED`,
+  `COUNTDOWN_NEVER_CONFIRMS`, `LEDGER_NEVER_SCANNED`,
+  `HALT_DENIES_OBSERVE_RESTORE`, `PURPOSE_NARROW_ONLY`,
+  `SUCCESSOR_NEVER_RESTORES_WINNER`);
+- purpose attenuation rules (narrowing only; never
+  amplification);
+- allowed observe kinds (`WINDOW_CURRENT`, `WINDOW_EXPIRING`,
+  `WINDOW_EXPIRED`, `WINDOW_EXTENDED`, `WINDOW_CONTAINED`,
+  `HOLD_UNKNOWN`, `REJECT_COUNTDOWN_CONFIRMATION`, `SKIP`) and
+  notify policy after seal, invalidation, or upstream key or
+  clock change;
+- optional procedural refs for "how to present remaining,
+  expiring, or contained truth without a winner."
+
+Only `APPROVED` versions are discoverable or executable.
+
+### 3.2 Session contract
+
+A session opens under an approved profile, purpose hash, budget
+reservations, and authorization evidence. Duplicate
+`(account_id, idempotency_key)` is rejected. Nomination is
+source-window point lookup. Refresh remaining TTL is a point
+lookup against the nominated sealed certificate — never a ledger
+scan.
+
+### 3.3 Evaluate and certificate contract
+
+Evaluate is a pure function of nominated windows, remaining-TTL
+snapshots, clock lifecycles, retire kinds, dual-control counts,
+and purpose relation. It never walks catalogs. Seal binds
+window-set, clock-set, remaining-set, and attenuation hashes. The
+certificate must not store `resolved_fact_hash`. Countdown
+approaching zero cannot evaluate to a kind that implies
+`TRUSTED_ENROLLED`.
+
+### 3.4 Invalidation and effect contract
+
+Invalidation is source-window keyed. Notify intents start
+`PREPARED` and may become `UNKNOWN_EFFECT`. Observation of
+unknown remaining time remains `HOLD_UNKNOWN` until a trusted
+refresh arrives.
+
+### 3.5 Availability contract
+
+Open, nominate, refresh, evaluate, seal, and perception p99
+latency stay inside the 99.99% control-plane budget. Neighbor
+boards with 1M+ rows are protected by **FULL SCAN REJECTED**
+planner rules and observe-unit budgets.
+
+## 4. Deterministic invariants
+
+1. Every row is scoped by `account_id`; resolvers set
+   `app.account_id` before query.
+2. Profiles start as `DRAFT` and become `APPROVED` only through an
+   authority-fenced approval function.
+3. Sealed profile definitions and observe rules are immutable.
+4. Binding identity
+   (`source_window_id`, `disputed_fact_hash`, `attenuation_hash`,
+   `binding_ordinal`, `remaining_set_hash`) is immutable after
+   seal.
+5. Purpose attenuation may only narrow for consumers;
+   amplification is rejected.
+6. Window nomination uses point lookup by
+   `(account_id, source_window_id)` — never full key-catalog,
+   vote-ledger, TTL-ledger, or board scans.
+7. Notify intents start as `PREPARED` and may become
+   `UNKNOWN_EFFECT`.
+8. Audit events form a hash chain per account.
+9. Semantic retrieval discovers profiles only; it never
+   authorizes nominate/refresh/evaluate/seal/observe.
+10. Silence and unknown windows cannot evaluate to
+    `WINDOW_EXTENDED` or any kind that implies
+    `TRUSTED_ENROLLED` (history-rewrite and silence-success
+    fences).
+11. Halted, extended-halt, and omitted windows cannot evaluate to
+    an observe kind that restores a winner (halt-observe fence).
+12. Requested purposes that amplify a window attenuation hash are
+    rejected (purpose-amplification fence).
+13. Successor observation cannot emit a winning fact hash or
+    restore a halted body (successor-leak fence).
+14. Remaining TTL approaching zero never writes
+    `attested_key_kind = TRUSTED_ENROLLED`
+    (countdown-as-confirmation fence).
+15. `WINDOW_EXTENDED` requires two distinct refreshers who are
+    not the nominating principal.
+16. Window certificates bind window set, clock set, remaining
+    set, and attenuation hashes; they never invent a winning
+    fact hash.
+17. Plans that require unscoped board, session, working-set,
+    grant-graph, key-catalog, clock-catalog, confirm-ledger,
+    vote-ledger, TTL-ledger, or citation-ledger scans are
+    **FULL SCAN REJECTED**.
+
+## 5. Execution model
+
+### 5.1 Profile sealing
+
+Draft profiles accumulate observe rules. Approval validates
+definition hash, requires at least one observe rule, requires
+`evaluate_threshold >= 2`, requires `expiring_threshold_ms > 0`,
+and fences the status transition.
+
+### 5.2 Open session
+
+Open captures the approved profile version, purpose hash, budget
+reservations, and authorization evidence. The session starts
+`OPEN` with `state_revision = 0`. Duplicate
+`(account_id, idempotency_key)` is rejected.
+
+### 5.3 Nominate, refresh, and evaluate
+
+Nominate performs a point lookup on the window catalog and writes
+an immutable nomination receipt with
+`remaining_ttl_ms` copied from the sealed source certificate.
+Refresh remaining TTL is a point lookup against that same
+source — never a vote-ledger walk. Evaluate is a pure function of
+nominated windows, remaining-set hashes, clock lifecycles, and
+purpose relation. It never walks the catalog.
+
+### 5.4 Seal window certificate
+
+Seal binds the evaluation hashes to a consumer ref. The
+certificate stores window-set, clock-set, remaining-set, and
+attenuation hashes. It must not store `resolved_fact_hash`.
+
+### 5.5 Invalidate and dispatch
+
+Invalidation is source-window keyed. Notify intents start
+`PREPARED` and may become `UNKNOWN_EFFECT`. Dispatch never scans
+neighbor boards.
+
+## 6. Lifecycle
+
+### 6.1 Draft profile
+
+A steward inserts a `DRAFT` profile and at least one observe
+rule. Approval is authority-fenced.
+
+### 6.2 Session open
+
+An authorized principal opens a session under the approved
+version.
+
+### 6.3 Nominating / refreshing / evaluating
+
+The session moves `OPEN → NOMINATING → EVALUATING` by CAS.
+Budgets decrement in the ledger. Remaining-TTL snapshots are
+append-only.
+
+### 6.4 Sealed / invalidated
+
+Seal moves the session to `SEALED`. Upstream revocation writes an
+invalidation and may move bindings to `INVALIDATED`.
+
+### 6.5 Terminal states
+
+`CLOSED`, `EXPIRED`, `CANCELLED`, `FAILED`, `QUARANTINED`, and
+`UNKNOWN_EFFECT` are terminal. Terminal records are append-only.
+
+### 6.6 Retain
+
+Audit events, certificates, and bindings retain for the account's
+legal hold. Perception snapshots are derived and may be compacted
+after Merkle anchor.
+
+## 7. TypeScript contracts
+
+```ts
+type AccountId = number & { readonly brand: "AccountId" };
+type ProfileId = string & { readonly brand: "ProfileId" };
+type SessionId = string & { readonly brand: "SessionId" };
+type SourceWindowId = string & { readonly brand: "SourceWindowId" };
+type EvaluationId = string & { readonly brand: "EvaluationId" };
+type CertificateId = string & { readonly brand: "CertificateId" };
+type BindingId = string & { readonly brand: "BindingId" };
+type SnapshotId = string & { readonly brand: "SnapshotId" };
+type ConsumerRef = string & { readonly brand: "ConsumerRef" };
+type Sha256 = string & { readonly brand: "Sha256" };
+type Timestamp = string & { readonly brand: "Timestamp" };
+
+type TrustedNextAction =
+  | "NOMINATE_SEALED_WINDOW_SOURCE"
+  | "REFRESH_WINDOW_REMAINING_TTL"
+  | "EVALUATE_CONFIRMATION_WINDOW"
+  | "SEAL_WINDOW_CERTIFICATE"
+  | "INVALIDATE_WINDOW_OBSERVABILITY"
+  | "PREPARE_WINDOW_EFFECT"
+  | "RESOLVE_WINDOW_UNCERTAINTY"
+  | "CLOSE_SESSION";
+
+type ConfirmationWindowObservabilityBlockedReason =
+  | "PROFILE_INACTIVE"
+  | "PURPOSE_DENIED"
+  | "ATTENUATION_DENIED"
+  | "BUDGET_EXHAUSTED"
+  | "WINDOW_MISSING"
+  | "EVALUATE_NOT_READY"
+  | "HISTORY_REWRITE_DENIED"
+  | "SILENCE_SUCCESS_DENIED"
+  | "FIRST_ENROLLMENT_AUTO_TRUST_DENIED"
+  | "COUNTDOWN_CONFIRMATION_DENIED"
+  | "LEDGER_SCAN_DENIED"
+  | "HALT_OBSERVE_DENIED"
+  | "PURPOSE_AMPLIFICATION_DENIED"
+  | "SUCCESSOR_LEAK_DENIED"
+  | "HOP_LEAK_DENIED"
+  | "UNBOUND_WINDOW_DENIED"
+  | "UNATTESTED_CLOCK_DENIED"
+  | "INVENTED_HISTORY_DENIED"
+  | "HASH_MISMATCH"
+  | "DECISION_THRESHOLD_NOT_MET"
+  | "POLICY_DENIED"
+  | "UNKNOWN_EFFECT";
+
+interface UntrustedText {
+  readonly value: string;
+  readonly provenance: "USER_INPUT" | "BOARD_VALUE" | "PROVIDER_VALUE" | "AGENT_DRAFT";
+  readonly trust: "UNTRUSTED_CONTENT";
+}
+
+type ProfileStatus = "DRAFT" | "APPROVED" | "REVOKED";
+type SessionStatus =
+  | "OPEN"
+  | "NOMINATING"
+  | "EVALUATING"
+  | "SEALED"
+  | "DISPATCHING"
+  | "CLOSED"
+  | "EXPIRED"
+  | "CANCELLED"
+  | "FAILED"
+  | "QUARANTINED"
+  | "UNKNOWN_EFFECT";
+
+type MemberStatus =
+  | "SEALED"
+  | "INVALIDATED"
+  | "DISPATCHING"
+  | "SUPERSEDED_REF"
+  | "UNKNOWN_EFFECT";
+
+type SourceWindowKind =
+  | "SEALED_TTL_CERTIFICATE"
+  | "SEALED_CONFIRM_CERTIFICATE"
+  | "FIRST_ENROLLMENT_CLAIM"
+  | "SUCCESSOR_KEY_CLAIM";
+
+type PlacementKind =
+  | "HALTED"
+  | "EXTENDED_HALT"
+  | "RESTORED_WITHOUT_WINNER"
+  | "OMITTED"
+  | "UNKNOWN_EFFECT";
+
+type KeyLifecycle =
+  | "FIRST_ENROLLMENT"
+  | "CONFIRMED"
+  | "MONOTONIC"
+  | "REGRESSED"
+  | "INVENTED_HISTORY"
+  | "UNKNOWN_EFFECT";
+
+type ClockLifecycle =
+  | "ATTESTED"
+  | "UNATTESTED"
+  | "UNKNOWN_EFFECT";
+
+type AttestedKeyKind =
+  | "AWAITING_CONFIRMATION"
+  | "TRUSTED_ENROLLED"
+  | "TRUSTED_WITHIN_SKEW"
+  | "REGRESSED"
+  | "INVENTED_HISTORY"
+  | "SILENCE"
+  | "UNKNOWN_EFFECT";
+
+type ObserveKind =
+  | "WINDOW_CURRENT"
+  | "WINDOW_EXPIRING"
+  | "WINDOW_EXPIRED"
+  | "WINDOW_EXTENDED"
+  | "WINDOW_CONTAINED"
+  | "HOLD_UNKNOWN"
+  | "REJECT_COUNTDOWN_CONFIRMATION"
+  | "SKIP"
+  | "UNKNOWN_EFFECT";
+
+type PurposeRelation =
+  | "EQUAL"
+  | "NARROWS"
+  | "AMPLIFIES"
+  | "UNRELATED"
+  | "UNKNOWN_EFFECT";
+
+type EffectIntentStatus =
+  | "PREPARED"
+  | "DISPATCHED"
+  | "ACKED"
+  | "FAILED"
+  | "UNKNOWN_EFFECT";
+
+interface ConfirmationWindowObservabilityBudget {
+  readonly nominateUnits: number;
+  readonly evaluateUnits: number;
+  readonly sealUnits: number;
+  readonly vectorUnits: number;
+  readonly invalidateUnits: number;
+  readonly observeUnits: number;
+  readonly maxWallTimeMs: number;
+  readonly evaluateThreshold: number;
+  readonly maxBindingsPerCertificate: number;
+  readonly maxNominatedWindows: number;
+}
+
+interface ConfirmationWindowObservabilityProfile {
+  readonly accountId: AccountId;
+  readonly profileId: ProfileId;
+  readonly profileVersion: number;
+  readonly name: string;
+  readonly status: ProfileStatus;
+  readonly definitionHash: Sha256;
+  readonly expiringThresholdMs: number;
+  readonly maxRefreshCount: number;
+  readonly evaluateThreshold: number;
+  readonly maxBindingsPerCertificate: number;
+  readonly maxNominatedWindows: number;
+  readonly semanticTags: readonly string[];
+  readonly procedureRef: string | null;
+}
+
+interface ConfirmationWindowObservabilitySession {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly profileId: ProfileId;
+  readonly profileVersion: number;
+  readonly status: SessionStatus;
+  readonly stateRevision: bigint;
+  readonly purpose: string;
+  readonly budget: ConfirmationWindowObservabilityBudget;
+  readonly consumed: Omit<
+    ConfirmationWindowObservabilityBudget,
+    | "maxWallTimeMs"
+    | "evaluateThreshold"
+    | "maxBindingsPerCertificate"
+    | "maxNominatedWindows"
+  >;
+  readonly principalId: string;
+  readonly deadlineAt: Timestamp;
+}
+
+interface WindowNominationReceipt {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly sourceWindowId: SourceWindowId;
+  readonly sourceWindowKind: SourceWindowKind;
+  readonly placementKind: PlacementKind;
+  readonly keyLifecycle: KeyLifecycle;
+  readonly clockLifecycle: ClockLifecycle;
+  readonly disputedFactHash: Sha256;
+  readonly attenuationHash: Sha256;
+  readonly donorPurposeHash: Sha256;
+  readonly hopCount: number;
+  readonly nominationHash: Sha256;
+  readonly nominatedAt: Timestamp;
+  readonly expiresAt: Timestamp;
+  readonly remainingTtlMs: number;
+  readonly ttlExpired: boolean;
+}
+
+interface RemainingTtlSnapshot {
+  readonly accountId: AccountId;
+  readonly snapshotId: SnapshotId;
+  readonly sessionId: SessionId;
+  readonly sourceWindowId: SourceWindowId;
+  readonly remainingTtlMs: number;
+  readonly extendBudgetRemaining: number;
+  readonly snapshotHash: Sha256;
+  readonly capturedAt: Timestamp;
+}
+
+interface ConfirmationWindowObservabilityEvaluationReceipt {
+  readonly accountId: AccountId;
+  readonly evaluationId: EvaluationId;
+  readonly sessionId: SessionId;
+  readonly windowSetHash: Sha256;
+  readonly clockSetHash: Sha256;
+  readonly remainingSetHash: Sha256;
+  readonly attenuationHash: Sha256;
+  readonly evaluationHash: Sha256;
+  readonly evaluatedAt: Timestamp;
+}
+
+interface ConfirmationWindowObservabilityBinding {
+  readonly accountId: AccountId;
+  readonly bindingId: BindingId;
+  readonly certificateId: CertificateId;
+  readonly sessionId: SessionId;
+  readonly sourceWindowId: SourceWindowId;
+  readonly sourceWindowKind: SourceWindowKind;
+  readonly bindingOrdinal: number;
+  readonly status: MemberStatus;
+  readonly placementKind: PlacementKind;
+  readonly keyLifecycle: KeyLifecycle;
+  readonly clockLifecycle: ClockLifecycle;
+  readonly attestedKeyKind: AttestedKeyKind;
+  readonly observeKind: ObserveKind;
+  readonly purposeRelation: PurposeRelation;
+  readonly disputedFactHash: Sha256;
+  readonly attenuationHash: Sha256;
+  readonly requestedPurposeHash: Sha256;
+  readonly remainingSetHash: Sha256;
+  readonly remainingTtlMs: number;
+  readonly extendBudgetRemaining: number;
+  readonly ttlExpired: boolean;
+  readonly expiresAt: Timestamp;
+  readonly sealedAt: Timestamp;
+}
+
+interface ConfirmationWindowObservabilityCertificate {
+  readonly accountId: AccountId;
+  readonly certificateId: CertificateId;
+  readonly sessionId: SessionId;
+  readonly consumerRef: ConsumerRef;
+  readonly purposeHash: Sha256;
+  readonly windowSetHash: Sha256;
+  readonly clockSetHash: Sha256;
+  readonly remainingSetHash: Sha256;
+  readonly attenuationHash: Sha256;
+  readonly bindingWatermark: number;
+  readonly sealedAt: Timestamp;
+}
+
+interface ConfirmationWindowObservabilityEffectObservation {
+  readonly effectId: string;
+  readonly status: EffectIntentStatus;
+  readonly providerIdempotencyKey: string;
+  readonly generation: number;
+  readonly lastErrorCode: string | null;
+}
+
+interface AgentConfirmationWindowObservabilityPerceptionCard {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly status: SessionStatus;
+  readonly summary: UntrustedText;
+  readonly sealedBindingCount: number;
+  readonly windowCurrentBindingCount: number;
+  readonly windowExpiringBindingCount: number;
+  readonly windowExpiredBindingCount: number;
+  readonly windowExtendedBindingCount: number;
+  readonly windowContainedBindingCount: number;
+  readonly holdUnknownBindingCount: number;
+  readonly rejectCountdownConfirmationBindingCount: number;
+  readonly unknownBindingCount: number;
+  readonly skippedBindingCount: number;
+  readonly invalidatedBindingCount: number;
+  readonly uncertainEffectIntents: readonly ConfirmationWindowObservabilityEffectObservation[];
+  readonly remainingBudget: Omit<
+    ConfirmationWindowObservabilityBudget,
+    | "maxWallTimeMs"
+    | "evaluateThreshold"
+    | "maxBindingsPerCertificate"
+    | "maxNominatedWindows"
+  >;
+  readonly procedureTags: readonly string[];
+  readonly allowedNextActions: readonly TrustedNextAction[];
+  readonly blockedReasons: readonly ConfirmationWindowObservabilityBlockedReason[];
+  readonly cardHash: Sha256;
+}
+```
+
+Mutation contracts keep transition decisions deterministic and explicit:
+
+```ts
+interface CreateConfirmationWindowObservabilitySessionInput {
+  readonly accountId: AccountId;
+  readonly profileId: ProfileId;
+  readonly profileVersion: number;
+  readonly purpose: string;
+  readonly idempotencyKey: string;
+  readonly budget: ConfirmationWindowObservabilityBudget;
+}
+
+interface NominateSealedWindowSourceInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly sourceWindowId: SourceWindowId;
+  readonly expectedAttenuationHash: Sha256;
+  readonly idempotencyKey: string;
+}
+
+interface RefreshWindowRemainingTtlInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly sourceWindowId: SourceWindowId;
+  readonly expectedRemainingSetHash: Sha256;
+  readonly idempotencyKey: string;
+}
+
+interface EvaluateConfirmationWindowInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly expectedWindowSetHash: Sha256;
+  readonly expectedRemainingSetHash: Sha256;
+  readonly expectedAttenuationHash: Sha256;
+  readonly idempotencyKey: string;
+}
+
+interface SealWindowCertificateInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly evaluationId: EvaluationId;
+  readonly consumerRef: ConsumerRef;
+  readonly expectedPurposeHash: Sha256;
+  readonly expectedRemainingSetHash: Sha256;
+  readonly idempotencyKey: string;
+}
+
+interface InvalidateWindowObservabilityInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly certificateId: CertificateId;
+  readonly sourceWindowId: SourceWindowId;
+  readonly reasonCode: "SUPERSEDED" | "RETRACTED" | "QUARANTINED" | "KEY_REVOKED";
+  readonly idempotencyKey: string;
+}
+
+interface PrepareWindowEffectInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly certificateId: CertificateId;
+  readonly idempotencyKey: string;
+}
+
+interface ResolveWindowUncertaintyInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly effectId: string;
+  readonly resolution:
+    | "RETRY_SAME_WINDOW"
+    | "ACCEPT_OBSERVATION"
+    | "REJECT_ENVELOPE"
+    | "REQUIRE_HUMAN";
+  readonly idempotencyKey: string;
+}
+
+interface CloseConfirmationWindowObservabilitySessionInput {
+  readonly accountId: AccountId;
+  readonly sessionId: SessionId;
+  readonly expectedRevision: bigint;
+  readonly idempotencyKey: string;
+}
+
+type ConfirmationWindowObservabilityDecision =
+  | { readonly decision: "ALLOWED"; readonly session: ConfirmationWindowObservabilitySession;
+      readonly certificate?: ConfirmationWindowObservabilityCertificate;
+      readonly member?: ConfirmationWindowObservabilityBinding;
+      readonly receipt?: WindowNominationReceipt;
+      readonly snapshot?: RemainingTtlSnapshot;
+      readonly evaluation?: ConfirmationWindowObservabilityEvaluationReceipt;
+      readonly perception: AgentConfirmationWindowObservabilityPerceptionCard;
+      readonly auditHash: Sha256 }
+  | { readonly decision: "REJECTED"; readonly code: ConfirmationWindowObservabilityBlockedReason;
+      readonly retryable: boolean; readonly reason: string;
+      readonly perception?: AgentConfirmationWindowObservabilityPerceptionCard;
+      readonly auditHash: Sha256 };
+```
+
+## 8. SQL row-store schema
+
+```sql
+CREATE TYPE cwo_profile_status AS ENUM ('DRAFT', 'APPROVED', 'REVOKED');
+CREATE TYPE cwo_session_status AS ENUM (
+  'OPEN', 'NOMINATING', 'EVALUATING', 'SEALED', 'DISPATCHING',
+  'CLOSED', 'EXPIRED', 'CANCELLED', 'FAILED', 'QUARANTINED', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_binding_status AS ENUM (
+  'SEALED', 'INVALIDATED', 'DISPATCHING', 'SUPERSEDED_REF', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_source_kind AS ENUM (
+  'SEALED_TTL_CERTIFICATE', 'SEALED_CONFIRM_CERTIFICATE',
+  'FIRST_ENROLLMENT_CLAIM', 'SUCCESSOR_KEY_CLAIM'
+);
+CREATE TYPE cwo_placement_kind AS ENUM (
+  'HALTED', 'EXTENDED_HALT', 'RESTORED_WITHOUT_WINNER', 'OMITTED',
+  'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_key_lifecycle AS ENUM (
+  'FIRST_ENROLLMENT', 'CONFIRMED', 'MONOTONIC', 'REGRESSED',
+  'INVENTED_HISTORY', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_clock_lifecycle AS ENUM (
+  'ATTESTED', 'UNATTESTED', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_attested_key_kind AS ENUM (
+  'AWAITING_CONFIRMATION', 'TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW',
+  'REGRESSED', 'INVENTED_HISTORY', 'SILENCE', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_observe_kind AS ENUM (
+  'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXPIRED',
+  'WINDOW_EXTENDED', 'WINDOW_CONTAINED', 'HOLD_UNKNOWN',
+  'REJECT_COUNTDOWN_CONFIRMATION', 'SKIP', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_purpose_relation AS ENUM (
+  'EQUAL', 'NARROWS', 'AMPLIFIES', 'UNRELATED', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_effect_status AS ENUM (
+  'PREPARED', 'DISPATCHED', 'ACKED', 'FAILED', 'UNKNOWN_EFFECT'
+);
+CREATE TYPE cwo_catalog_status AS ENUM (
+  'SEALED', 'INVALIDATED', 'SUPERSEDED_REF', 'RETRACTED_REF', 'UNKNOWN_EFFECT'
+);
+
+CREATE ROLE agent_cwo_profile_authority NOLOGIN;
+
+CREATE TABLE agent_cwo_authorization_evidence (
+  account_id BIGINT NOT NULL,
+  evidence_id UUID NOT NULL,
+  principal_id TEXT NOT NULL,
+  policy_revision BIGINT NOT NULL CHECK (policy_revision >= 0),
+  resource_acl_revision BIGINT NOT NULL CHECK (resource_acl_revision >= 0),
+  redacted_scope_summary JSONB NOT NULL,
+  encrypted_evidence_ref TEXT NOT NULL,
+  evidence_hash CHAR(64) NOT NULL,
+  immutable_archive_ref TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, evidence_id),
+  UNIQUE (account_id, evidence_id, evidence_hash),
+  CHECK (length(evidence_hash) = 64)
+);
+
+CREATE TABLE agent_cwo_profile (
+  account_id BIGINT NOT NULL,
+  profile_id UUID NOT NULL,
+  profile_version INTEGER NOT NULL CHECK (profile_version > 0),
+  name TEXT NOT NULL,
+  status cwo_profile_status NOT NULL,
+  definition_hash CHAR(64) NOT NULL CHECK (length(definition_hash) = 64),
+  canonicalization_version TEXT NOT NULL,
+  compiler_version TEXT NOT NULL,
+  approval_validation_hash CHAR(64),
+  authorization_evidence_id UUID NOT NULL,
+  authorization_snapshot_hash CHAR(64) NOT NULL,
+  expiring_threshold_ms BIGINT NOT NULL
+    CHECK (expiring_threshold_ms BETWEEN 1000 AND 2592000000),
+  max_refresh_count SMALLINT NOT NULL
+    CHECK (max_refresh_count BETWEEN 0 AND 16),
+  evaluate_threshold SMALLINT NOT NULL
+    CHECK (evaluate_threshold BETWEEN 2 AND 8),
+  max_bindings_per_certificate SMALLINT NOT NULL
+    CHECK (max_bindings_per_certificate BETWEEN 1 AND 256),
+  max_nominated_windows SMALLINT NOT NULL
+    CHECK (max_nominated_windows BETWEEN 1 AND 256),
+  semantic_tags TEXT[] NOT NULL,
+  procedure_ref TEXT,
+  revocation_policy TEXT NOT NULL CHECK (
+    revocation_policy IN (
+      'ALLOW_IN_FLIGHT', 'STOP_BEFORE_EVALUATE', 'REQUIRE_CONTAINMENT'
+    )
+  ),
+  created_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  approved_by TEXT,
+  approved_at TIMESTAMPTZ,
+  revoked_by TEXT,
+  revoked_at TIMESTAMPTZ,
+  PRIMARY KEY (account_id, profile_id, profile_version),
+  UNIQUE (account_id, profile_id, profile_version, definition_hash),
+  FOREIGN KEY (account_id, authorization_evidence_id)
+    REFERENCES agent_cwo_authorization_evidence (account_id, evidence_id),
+  CHECK (
+    (status = 'DRAFT' AND approved_at IS NULL
+      AND approval_validation_hash IS NULL) OR
+    (status IN ('APPROVED', 'REVOKED') AND approved_at IS NOT NULL
+      AND approval_validation_hash IS NOT NULL)
+  ),
+  CHECK (
+    (status <> 'REVOKED' AND revoked_by IS NULL AND revoked_at IS NULL) OR
+    (status = 'REVOKED' AND revoked_by IS NOT NULL AND revoked_at IS NOT NULL)
+  ),
+  CHECK (length(authorization_snapshot_hash) = 64)
+);
+
+CREATE TABLE agent_cwo_profile_observe_rule (
+  account_id BIGINT NOT NULL,
+  profile_id UUID NOT NULL,
+  profile_version INTEGER NOT NULL,
+  rule_id TEXT NOT NULL,
+  ordinal SMALLINT NOT NULL CHECK (ordinal BETWEEN 1 AND 64),
+  allowed_source_kinds TEXT[] NOT NULL,
+  evaluate_threshold SMALLINT NOT NULL CHECK (evaluate_threshold BETWEEN 2 AND 8),
+  max_bindings_per_certificate SMALLINT NOT NULL
+    CHECK (max_bindings_per_certificate BETWEEN 1 AND 256),
+  expiring_threshold_ms BIGINT NOT NULL
+    CHECK (expiring_threshold_ms BETWEEN 1000 AND 2592000000),
+  require_dual_control_refresh BOOLEAN NOT NULL,
+  observe_instruction JSONB NOT NULL,
+  PRIMARY KEY (account_id, profile_id, profile_version, rule_id),
+  UNIQUE (account_id, profile_id, profile_version, ordinal),
+  FOREIGN KEY (account_id, profile_id, profile_version)
+    REFERENCES agent_cwo_profile (account_id, profile_id, profile_version)
+);
+
+CREATE TABLE agent_cwo_window_catalog (
+  account_id BIGINT NOT NULL,
+  source_window_id UUID NOT NULL,
+  source_session_id UUID NOT NULL,
+  source_certificate_id UUID NOT NULL,
+  receipt_ref TEXT NOT NULL,
+  source_window_kind cwo_source_kind NOT NULL,
+  placement_kind cwo_placement_kind NOT NULL,
+  key_lifecycle cwo_key_lifecycle NOT NULL,
+  clock_lifecycle cwo_clock_lifecycle NOT NULL,
+  status cwo_catalog_status NOT NULL,
+  disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
+  attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
+  donor_purpose_hash CHAR(64) NOT NULL CHECK (length(donor_purpose_hash) = 64),
+  hop_count SMALLINT NOT NULL CHECK (hop_count BETWEEN 0 AND 8),
+  remaining_ttl_ms BIGINT NOT NULL CHECK (remaining_ttl_ms >= 0),
+  extend_budget_remaining SMALLINT NOT NULL
+    CHECK (extend_budget_remaining BETWEEN 0 AND 16),
+  expires_at TIMESTAMPTZ NOT NULL,
+  first_seen_at TIMESTAMPTZ NOT NULL,
+  enroll_sealed_at TIMESTAMPTZ,
+  clock_attested_at TIMESTAMPTZ,
+  sealed_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, source_window_id),
+  UNIQUE (account_id, receipt_ref, source_window_kind)
+);
+
+CREATE TABLE agent_cwo_session (
+  account_id BIGINT NOT NULL,
+  session_id UUID NOT NULL,
+  profile_id UUID NOT NULL,
+  profile_version INTEGER NOT NULL,
+  status cwo_session_status NOT NULL,
+  state_revision BIGINT NOT NULL CHECK (state_revision >= 0),
+  purpose TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  budget_nominate_units BIGINT NOT NULL CHECK (budget_nominate_units >= 0),
+  budget_evaluate_units BIGINT NOT NULL CHECK (budget_evaluate_units >= 0),
+  budget_seal_units BIGINT NOT NULL CHECK (budget_seal_units >= 0),
+  budget_vector_units BIGINT NOT NULL CHECK (budget_vector_units >= 0),
+  budget_invalidate_units BIGINT NOT NULL CHECK (budget_invalidate_units >= 0),
+  budget_observe_units BIGINT NOT NULL CHECK (budget_observe_units >= 0),
+  consumed_nominate_units BIGINT NOT NULL CHECK (consumed_nominate_units >= 0),
+  consumed_evaluate_units BIGINT NOT NULL CHECK (consumed_evaluate_units >= 0),
+  consumed_seal_units BIGINT NOT NULL CHECK (consumed_seal_units >= 0),
+  consumed_vector_units BIGINT NOT NULL CHECK (consumed_vector_units >= 0),
+  consumed_invalidate_units BIGINT NOT NULL
+    CHECK (consumed_invalidate_units >= 0),
+  consumed_observe_units BIGINT NOT NULL
+    CHECK (consumed_observe_units >= 0),
+  budget_max_wall_time_ms BIGINT NOT NULL
+    CHECK (budget_max_wall_time_ms BETWEEN 1000 AND 86400000),
+  evaluate_threshold SMALLINT NOT NULL
+    CHECK (evaluate_threshold BETWEEN 2 AND 8),
+  max_bindings_per_certificate SMALLINT NOT NULL
+    CHECK (max_bindings_per_certificate BETWEEN 1 AND 256),
+  max_nominated_windows SMALLINT NOT NULL
+    CHECK (max_nominated_windows BETWEEN 1 AND 256),
+  deadline_at TIMESTAMPTZ NOT NULL,
+  started_by TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  authorization_evidence_id UUID NOT NULL,
+  delegated_scope_hash CHAR(64) NOT NULL,
+  authorization_revision BIGINT NOT NULL CHECK (authorization_revision >= 0),
+  resource_scope_hash CHAR(64) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  terminal_outcome_hash CHAR(64),
+  PRIMARY KEY (account_id, session_id),
+  UNIQUE (account_id, idempotency_key),
+  UNIQUE (account_id, session_id, profile_id, profile_version),
+  FOREIGN KEY (account_id, profile_id, profile_version)
+    REFERENCES agent_cwo_profile (account_id, profile_id, profile_version),
+  FOREIGN KEY (account_id, authorization_evidence_id)
+    REFERENCES agent_cwo_authorization_evidence (account_id, evidence_id),
+  CHECK (consumed_nominate_units <= budget_nominate_units),
+  CHECK (consumed_evaluate_units <= budget_evaluate_units),
+  CHECK (consumed_seal_units <= budget_seal_units),
+  CHECK (consumed_vector_units <= budget_vector_units),
+  CHECK (consumed_invalidate_units <= budget_invalidate_units),
+  CHECK (consumed_observe_units <= budget_observe_units),
+  CHECK (deadline_at > created_at),
+  CHECK (length(delegated_scope_hash) = 64),
+  CHECK (length(resource_scope_hash) = 64)
+);
+
+CREATE TABLE agent_cwo_nomination_window (
+  account_id BIGINT NOT NULL,
+  receipt_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  source_window_id UUID NOT NULL,
+  source_window_kind cwo_source_kind NOT NULL,
+  placement_kind cwo_placement_kind NOT NULL,
+  key_lifecycle cwo_key_lifecycle NOT NULL,
+  clock_lifecycle cwo_clock_lifecycle NOT NULL,
+  disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
+  attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
+  donor_purpose_hash CHAR(64) NOT NULL CHECK (length(donor_purpose_hash) = 64),
+  hop_count SMALLINT NOT NULL CHECK (hop_count BETWEEN 0 AND 8),
+  nomination_hash CHAR(64) NOT NULL CHECK (length(nomination_hash) = 64),
+  nominated_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  remaining_ttl_ms BIGINT NOT NULL CHECK (remaining_ttl_ms >= 0),
+  ttl_expired BOOLEAN NOT NULL,
+  PRIMARY KEY (account_id, receipt_id),
+  UNIQUE (account_id, session_id, source_window_id, nomination_hash),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id),
+  FOREIGN KEY (account_id, source_window_id)
+    REFERENCES agent_cwo_window_catalog (account_id, source_window_id)
+);
+
+CREATE TABLE agent_cwo_remaining_ttl_snapshot (
+  account_id BIGINT NOT NULL,
+  snapshot_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  source_window_id UUID NOT NULL,
+  remaining_ttl_ms BIGINT NOT NULL CHECK (remaining_ttl_ms >= 0),
+  extend_budget_remaining SMALLINT NOT NULL
+    CHECK (extend_budget_remaining BETWEEN 0 AND 16),
+  snapshot_hash CHAR(64) NOT NULL CHECK (length(snapshot_hash) = 64),
+  captured_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, snapshot_id),
+  UNIQUE (account_id, session_id, source_window_id, snapshot_hash),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id),
+  FOREIGN KEY (account_id, source_window_id)
+    REFERENCES agent_cwo_window_catalog (account_id, source_window_id)
+);
+
+CREATE TABLE agent_cwo_evaluation_receipt (
+  account_id BIGINT NOT NULL,
+  evaluation_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  window_set_hash CHAR(64) NOT NULL CHECK (length(window_set_hash) = 64),
+  clock_set_hash CHAR(64) NOT NULL
+    CHECK (length(clock_set_hash) = 64),
+  remaining_set_hash CHAR(64) NOT NULL
+    CHECK (length(remaining_set_hash) = 64),
+  attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
+  evaluation_hash CHAR(64) NOT NULL CHECK (length(evaluation_hash) = 64),
+  evaluated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, evaluation_id),
+  UNIQUE (account_id, session_id, evaluation_hash),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id)
+);
+
+CREATE TABLE agent_cwo_window_certificate (
+  account_id BIGINT NOT NULL,
+  certificate_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  evaluation_id UUID NOT NULL,
+  consumer_ref TEXT NOT NULL,
+  purpose_hash CHAR(64) NOT NULL CHECK (length(purpose_hash) = 64),
+  window_set_hash CHAR(64) NOT NULL CHECK (length(window_set_hash) = 64),
+  clock_set_hash CHAR(64) NOT NULL
+    CHECK (length(clock_set_hash) = 64),
+  remaining_set_hash CHAR(64) NOT NULL
+    CHECK (length(remaining_set_hash) = 64),
+  attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
+  binding_watermark SMALLINT NOT NULL CHECK (binding_watermark BETWEEN 0 AND 256),
+  sealed_revision BIGINT NOT NULL CHECK (sealed_revision >= 0),
+  sealed_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, certificate_id),
+  UNIQUE (account_id, session_id, consumer_ref, sealed_revision),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id),
+  FOREIGN KEY (account_id, evaluation_id)
+    REFERENCES agent_cwo_evaluation_receipt (account_id, evaluation_id)
+);
+
+CREATE TABLE agent_cwo_observe_binding (
+  account_id BIGINT NOT NULL,
+  binding_id UUID NOT NULL,
+  certificate_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  source_window_id UUID NOT NULL,
+  source_window_kind cwo_source_kind NOT NULL,
+  binding_ordinal SMALLINT NOT NULL CHECK (binding_ordinal BETWEEN 0 AND 256),
+  status cwo_binding_status NOT NULL,
+  placement_kind cwo_placement_kind NOT NULL,
+  key_lifecycle cwo_key_lifecycle NOT NULL,
+  clock_lifecycle cwo_clock_lifecycle NOT NULL,
+  attested_key_kind cwo_attested_key_kind NOT NULL,
+  observe_kind cwo_observe_kind NOT NULL,
+  purpose_relation cwo_purpose_relation NOT NULL,
+  disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
+  attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
+  requested_purpose_hash CHAR(64) NOT NULL
+    CHECK (length(requested_purpose_hash) = 64),
+  donor_purpose_hash CHAR(64) NOT NULL CHECK (length(donor_purpose_hash) = 64),
+  hop_count SMALLINT NOT NULL CHECK (hop_count BETWEEN 0 AND 8),
+  remaining_set_hash CHAR(64) NOT NULL
+    CHECK (length(remaining_set_hash) = 64),
+  remaining_ttl_ms BIGINT NOT NULL CHECK (remaining_ttl_ms >= 0),
+  extend_budget_remaining SMALLINT NOT NULL
+    CHECK (extend_budget_remaining BETWEEN 0 AND 16),
+  ttl_expired BOOLEAN NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  sealed_revision BIGINT NOT NULL CHECK (sealed_revision >= 0),
+  sealed_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, binding_id),
+  UNIQUE (account_id, certificate_id, source_window_id, binding_ordinal,
+    sealed_revision),
+  FOREIGN KEY (account_id, certificate_id)
+    REFERENCES agent_cwo_window_certificate (account_id, certificate_id),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id),
+  FOREIGN KEY (account_id, source_window_id)
+    REFERENCES agent_cwo_window_catalog (account_id, source_window_id)
+);
+
+CREATE TABLE agent_cwo_invalidation (
+  account_id BIGINT NOT NULL,
+  invalidation_id UUID NOT NULL,
+  certificate_id UUID NOT NULL,
+  source_window_id UUID NOT NULL,
+  prior_disputed_fact_hash CHAR(64) NOT NULL
+    CHECK (length(prior_disputed_fact_hash) = 64),
+  next_disputed_fact_hash CHAR(64),
+  reason_code TEXT NOT NULL CHECK (
+    reason_code IN (
+      'SUPERSEDED', 'RETRACTED', 'QUARANTINED', 'KEY_REVOKED'
+    )
+  ),
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, invalidation_id),
+  FOREIGN KEY (account_id, certificate_id)
+    REFERENCES agent_cwo_window_certificate (account_id, certificate_id),
+  FOREIGN KEY (account_id, source_window_id)
+    REFERENCES agent_cwo_window_catalog (account_id, source_window_id)
+);
+
+CREATE TABLE agent_cwo_effect_intent (
+  account_id BIGINT NOT NULL,
+  effect_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  certificate_id UUID NOT NULL,
+  intent_status cwo_effect_status NOT NULL,
+  provider_idempotency_key TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  canonical_request_hash CHAR(64) NOT NULL
+    CHECK (length(canonical_request_hash) = 64),
+  last_error_code TEXT,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, effect_id),
+  UNIQUE (account_id, provider_idempotency_key),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id),
+  FOREIGN KEY (account_id, certificate_id)
+    REFERENCES agent_cwo_window_certificate (account_id, certificate_id)
+);
+
+CREATE TABLE agent_cwo_budget_ledger (
+  account_id BIGINT NOT NULL,
+  session_id UUID NOT NULL,
+  entry_sequence BIGINT NOT NULL CHECK (entry_sequence >= 0),
+  unit_type TEXT NOT NULL CHECK (
+    unit_type IN (
+      'NOMINATE', 'EVALUATE', 'SEAL', 'VECTOR', 'INVALIDATE', 'OBSERVE'
+    )
+  ),
+  units BIGINT NOT NULL CHECK (units > 0),
+  reason_code TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, session_id, entry_sequence),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id)
+);
+
+CREATE TABLE agent_cwo_terminal_record (
+  account_id BIGINT NOT NULL,
+  resolution_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  effect_id UUID,
+  conflict_id UUID,
+  decision_code TEXT NOT NULL,
+  decided_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, resolution_id),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id)
+);
+
+CREATE TABLE agent_cwo_command_result (
+  account_id BIGINT NOT NULL,
+  command_id UUID NOT NULL,
+  session_id UUID,
+  operation_name TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  result_hash CHAR(64) NOT NULL CHECK (length(result_hash) = 64),
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, command_id),
+  UNIQUE (account_id, operation_name, principal_id, idempotency_key)
+);
+
+CREATE TABLE agent_cwo_audit_head (
+  account_id BIGINT NOT NULL,
+  head_sequence BIGINT NOT NULL CHECK (head_sequence >= 0),
+  head_hash CHAR(64) NOT NULL CHECK (length(head_hash) = 64),
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id)
+);
+
+CREATE TABLE agent_cwo_audit_event (
+  account_id BIGINT NOT NULL,
+  event_sequence BIGINT NOT NULL CHECK (event_sequence >= 0),
+  session_id UUID,
+  event_type TEXT NOT NULL,
+  payload_hash CHAR(64) NOT NULL CHECK (length(payload_hash) = 64),
+  prev_hash CHAR(64) NOT NULL CHECK (length(prev_hash) = 64),
+  event_hash CHAR(64) NOT NULL CHECK (length(event_hash) = 64),
+  occurred_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, event_sequence)
+);
+
+CREATE TABLE agent_cwo_audit_anchor (
+  account_id BIGINT NOT NULL,
+  anchor_id UUID NOT NULL,
+  from_sequence BIGINT NOT NULL,
+  to_sequence BIGINT NOT NULL,
+  merkle_root CHAR(64) NOT NULL CHECK (length(merkle_root) = 64),
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, anchor_id),
+  CHECK (to_sequence >= from_sequence)
+);
+
+CREATE TABLE agent_cwo_perception_snapshot (
+  account_id BIGINT NOT NULL,
+  snapshot_id UUID NOT NULL,
+  session_id UUID NOT NULL,
+  status cwo_session_status NOT NULL,
+  card_hash CHAR(64) NOT NULL CHECK (length(card_hash) = 64),
+  card_body JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, snapshot_id),
+  FOREIGN KEY (account_id, session_id)
+    REFERENCES agent_cwo_session (account_id, session_id)
+);
+
+CREATE TABLE agent_cwo_projection_checkpoint (
+  account_id BIGINT NOT NULL,
+  projector_name TEXT NOT NULL,
+  source_watermark TEXT NOT NULL,
+  projected_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, projector_name)
+);
+
+CREATE FUNCTION protect_agent_cwo_profile()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $protect_profile$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status IS DISTINCT FROM 'DRAFT' THEN
+      RAISE EXCEPTION 'profiles must start as DRAFT';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status IS DISTINCT FROM 'DRAFT'
+     AND (
+       NEW.definition_hash IS DISTINCT FROM OLD.definition_hash
+       OR NEW.expiring_threshold_ms IS DISTINCT FROM OLD.expiring_threshold_ms
+       OR NEW.max_refresh_count IS DISTINCT FROM OLD.max_refresh_count
+       OR NEW.evaluate_threshold IS DISTINCT FROM OLD.evaluate_threshold
+       OR NEW.max_bindings_per_certificate
+         IS DISTINCT FROM OLD.max_bindings_per_certificate
+       OR NEW.max_nominated_windows
+         IS DISTINCT FROM OLD.max_nominated_windows
+       OR NEW.semantic_tags IS DISTINCT FROM OLD.semantic_tags
+       OR NEW.procedure_ref IS DISTINCT FROM OLD.procedure_ref
+       OR NEW.revocation_policy IS DISTINCT FROM OLD.revocation_policy
+       OR NEW.authorization_evidence_id
+         IS DISTINCT FROM OLD.authorization_evidence_id
+       OR NEW.authorization_snapshot_hash
+         IS DISTINCT FROM OLD.authorization_snapshot_hash
+     ) THEN
+    RAISE EXCEPTION 'sealed profile definition is immutable';
+  END IF;
+
+  IF OLD.status = 'APPROVED' AND NEW.status = 'REVOKED' THEN
+    IF current_setting('app.cwo_profile_revocation', true) IS DISTINCT FROM
+       concat(
+         OLD.profile_id::TEXT, ':',
+         OLD.profile_version::TEXT, ':',
+         OLD.definition_hash
+       ) THEN
+      RAISE EXCEPTION 'profile revocation requires authority fence';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status = 'DRAFT' AND NEW.status = 'APPROVED' THEN
+    IF current_setting('app.cwo_profile_approval', true) IS DISTINCT FROM
+       concat(
+         OLD.profile_id::TEXT, ':',
+         OLD.profile_version::TEXT, ':',
+         OLD.definition_hash
+       ) THEN
+      RAISE EXCEPTION 'profile approval requires authority fence';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status IS DISTINCT FROM NEW.status
+     AND NOT (
+       (OLD.status = 'DRAFT' AND NEW.status = 'APPROVED')
+       OR (OLD.status = 'APPROVED' AND NEW.status = 'REVOKED')
+     ) THEN
+    RAISE EXCEPTION 'illegal profile status transition';
+  END IF;
+
+  RETURN NEW;
+END
+$protect_profile$;
+
+CREATE TRIGGER agent_cwo_profile_protect
+BEFORE INSERT OR UPDATE ON agent_cwo_profile
+FOR EACH ROW EXECUTE FUNCTION protect_agent_cwo_profile();
+
+CREATE FUNCTION protect_agent_cwo_profile_observe_rule()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $protect_rule$
+DECLARE
+  profile_status cwo_profile_status;
+BEGIN
+  SELECT status INTO profile_status
+  FROM agent_cwo_profile
+  WHERE account_id = COALESCE(NEW.account_id, OLD.account_id)
+    AND profile_id = COALESCE(NEW.profile_id, OLD.profile_id)
+    AND profile_version = COALESCE(NEW.profile_version, OLD.profile_version);
+
+  IF profile_status IS DISTINCT FROM 'DRAFT' THEN
+    RAISE EXCEPTION 'sealed profile observe rules are immutable';
+  END IF;
+  RETURN COALESCE(NEW, OLD);
+END
+$protect_rule$;
+
+CREATE TRIGGER agent_cwo_profile_observe_rule_protect
+BEFORE INSERT OR UPDATE OR DELETE ON agent_cwo_profile_observe_rule
+FOR EACH ROW EXECUTE FUNCTION protect_agent_cwo_profile_observe_rule();
+
+CREATE FUNCTION protect_agent_cwo_remaining_ttl_snapshot()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $protect_snapshot$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    RAISE EXCEPTION 'remaining TTL snapshots are append-only';
+  END IF;
+  RETURN NEW;
+END
+$protect_snapshot$;
+
+CREATE TRIGGER agent_cwo_remaining_ttl_snapshot_protect
+BEFORE INSERT OR UPDATE ON agent_cwo_remaining_ttl_snapshot
+FOR EACH ROW EXECUTE FUNCTION protect_agent_cwo_remaining_ttl_snapshot();
+
+CREATE FUNCTION protect_agent_cwo_observe_binding()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $protect_binding$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF NEW.source_window_id IS DISTINCT FROM OLD.source_window_id
+       OR NEW.disputed_fact_hash IS DISTINCT FROM OLD.disputed_fact_hash
+       OR NEW.attenuation_hash IS DISTINCT FROM OLD.attenuation_hash
+       OR NEW.binding_ordinal IS DISTINCT FROM OLD.binding_ordinal
+       OR NEW.source_window_kind IS DISTINCT FROM OLD.source_window_kind
+       OR NEW.placement_kind IS DISTINCT FROM OLD.placement_kind
+       OR NEW.key_lifecycle IS DISTINCT FROM OLD.key_lifecycle
+       OR NEW.clock_lifecycle IS DISTINCT FROM OLD.clock_lifecycle
+       OR NEW.attested_key_kind
+         IS DISTINCT FROM OLD.attested_key_kind
+       OR NEW.observe_kind IS DISTINCT FROM OLD.observe_kind
+       OR NEW.purpose_relation IS DISTINCT FROM OLD.purpose_relation
+       OR NEW.requested_purpose_hash IS DISTINCT FROM OLD.requested_purpose_hash
+       OR NEW.remaining_set_hash IS DISTINCT FROM OLD.remaining_set_hash
+       OR NEW.remaining_ttl_ms IS DISTINCT FROM OLD.remaining_ttl_ms
+       OR NEW.extend_budget_remaining
+         IS DISTINCT FROM OLD.extend_budget_remaining
+       OR NEW.ttl_expired IS DISTINCT FROM OLD.ttl_expired
+       OR NEW.certificate_id IS DISTINCT FROM OLD.certificate_id THEN
+      RAISE EXCEPTION 'observe binding identity is immutable';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXPIRED',
+       'WINDOW_EXTENDED', 'REJECT_COUNTDOWN_CONFIRMATION'
+     )
+     AND NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
+    RAISE EXCEPTION 'history-rewrite fence blocks observation from rewriting confirmed trust';
+  END IF;
+
+  IF NEW.observe_kind = 'REJECT_COUNTDOWN_CONFIRMATION'
+     AND NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
+    RAISE EXCEPTION 'countdown-as-confirmation fence blocks TRUSTED_ENROLLED from remaining TTL';
+  END IF;
+
+  IF NEW.observe_kind = 'WINDOW_EXTENDED'
+     AND NEW.attested_key_kind IN ('SILENCE', 'UNKNOWN_EFFECT') THEN
+    RAISE EXCEPTION 'silence-success fence blocks window extension of silent or unknown successor';
+  END IF;
+
+  IF NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXPIRED',
+       'REJECT_COUNTDOWN_CONFIRMATION'
+     )
+     AND NEW.key_lifecycle = 'FIRST_ENROLLMENT'
+     AND NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
+    RAISE EXCEPTION 'first-enrollment-auto-trust fence blocks TRUSTED_ENROLLED from a countdown';
+  END IF;
+
+  IF NEW.observe_kind = 'WINDOW_EXTENDED'
+     AND NEW.clock_lifecycle = 'UNATTESTED' THEN
+    RAISE EXCEPTION 'unattested-clock fence blocks window refresh against an unattested clock';
+  END IF;
+
+  IF NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXPIRED', 'WINDOW_EXTENDED'
+     )
+     AND NEW.attested_key_kind = 'INVENTED_HISTORY' THEN
+    RAISE EXCEPTION 'invented-history fence blocks observe for invented successor history';
+  END IF;
+
+  IF NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXTENDED'
+     )
+     AND NEW.placement_kind IN ('HALTED', 'EXTENDED_HALT', 'OMITTED')
+     AND NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
+    RAISE EXCEPTION 'halt-observe fence blocks observation that would restore a halted key';
+  END IF;
+
+  IF NEW.purpose_relation = 'AMPLIFIES' THEN
+    RAISE EXCEPTION 'purpose-amplification fence blocks broader purpose than receipt attenuation';
+  END IF;
+
+  IF NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXTENDED'
+     )
+     AND NEW.placement_kind IN ('HALTED', 'EXTENDED_HALT', 'OMITTED')
+     AND NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
+    RAISE EXCEPTION 'successor-leak fence blocks restore of halted body';
+  END IF;
+
+  IF NEW.hop_count > 0
+     AND NEW.observe_kind IN (
+       'WINDOW_CURRENT', 'WINDOW_EXPIRING', 'WINDOW_EXTENDED'
+     )
+     AND NEW.requested_purpose_hash IS NOT DISTINCT FROM NEW.donor_purpose_hash THEN
+    RAISE EXCEPTION 'hop-leak fence blocks donor-purpose observe after attenuation hops';
+  END IF;
+
+  RETURN NEW;
+END
+$protect_binding$;
+
+CREATE TRIGGER agent_cwo_observe_binding_protect
+BEFORE INSERT OR UPDATE ON agent_cwo_observe_binding
+FOR EACH ROW EXECUTE FUNCTION protect_agent_cwo_observe_binding();
+
+CREATE FUNCTION protect_agent_cwo_effect_intent()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $protect_effect$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.intent_status IS DISTINCT FROM 'PREPARED' THEN
+      RAISE EXCEPTION 'effect intents must start as PREPARED';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.canonical_request_hash IS DISTINCT FROM NEW.canonical_request_hash
+     OR OLD.provider_idempotency_key
+       IS DISTINCT FROM NEW.provider_idempotency_key
+     OR OLD.certificate_id IS DISTINCT FROM NEW.certificate_id THEN
+    RAISE EXCEPTION 'prepared effect identity is immutable';
+  END IF;
+
+  RETURN NEW;
+END
+$protect_effect$;
+
+CREATE TRIGGER agent_cwo_effect_intent_protect
+BEFORE INSERT OR UPDATE ON agent_cwo_effect_intent
+FOR EACH ROW EXECUTE FUNCTION protect_agent_cwo_effect_intent();
+
+CREATE FUNCTION approve_agent_cwo_profile(
+  tenant_id BIGINT,
+  recipient_profile_id UUID,
+  recipient_profile_version INTEGER,
+  validated_definition_hash TEXT,
+  approver_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $approve$
+DECLARE
+  stored_hash CHAR(64);
+  stored_status cwo_profile_status;
+  rule_count INTEGER;
+BEGIN
+  SELECT definition_hash, status
+    INTO stored_hash, stored_status
+  FROM agent_cwo_profile
+  WHERE account_id = tenant_id
+    AND profile_id = recipient_profile_id
+    AND profile_version = recipient_profile_version
+  FOR UPDATE;
+
+  IF length(validated_definition_hash) <> 64
+     OR stored_status IS DISTINCT FROM 'DRAFT'
+     OR stored_hash IS DISTINCT FROM validated_definition_hash THEN
+    RAISE EXCEPTION 'profile approval hash or state mismatch';
+  END IF;
+
+  SELECT count(*)::INTEGER INTO rule_count
+  FROM agent_cwo_profile_observe_rule
+  WHERE account_id = tenant_id
+    AND profile_id = recipient_profile_id
+    AND profile_version = recipient_profile_version;
+
+  IF rule_count < 1 THEN
+    RAISE EXCEPTION 'profile requires at least one observe rule';
+  END IF;
+
+  PERFORM set_config(
+    'app.cwo_profile_approval',
+    concat(
+      recipient_profile_id::TEXT, ':',
+      recipient_profile_version::TEXT, ':',
+      validated_definition_hash
+    ),
+    true
+  );
+
+  UPDATE agent_cwo_profile
+  SET status = 'APPROVED',
+      approved_by = approver_id,
+      approved_at = clock_timestamp(),
+      approval_validation_hash = validated_definition_hash
+  WHERE account_id = tenant_id
+    AND profile_id = recipient_profile_id
+    AND profile_version = recipient_profile_version;
+END
+$approve$;
+
+CREATE FUNCTION revoke_agent_cwo_profile(
+  tenant_id BIGINT,
+  recipient_profile_id UUID,
+  recipient_profile_version INTEGER,
+  expected_definition_hash TEXT,
+  revoker_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $revoke$
+DECLARE
+  stored_hash CHAR(64);
+  stored_status cwo_profile_status;
+BEGIN
+  SELECT definition_hash, status
+    INTO stored_hash, stored_status
+  FROM agent_cwo_profile
+  WHERE account_id = tenant_id
+    AND profile_id = recipient_profile_id
+    AND profile_version = recipient_profile_version
+  FOR UPDATE;
+
+  IF length(expected_definition_hash) <> 64
+     OR stored_status IS DISTINCT FROM 'APPROVED'
+     OR stored_hash IS DISTINCT FROM expected_definition_hash THEN
+    RAISE EXCEPTION 'profile revocation hash or state mismatch';
+  END IF;
+
+  PERFORM set_config(
+    'app.cwo_profile_revocation',
+    concat(
+      recipient_profile_id::TEXT, ':',
+      recipient_profile_version::TEXT, ':',
+      expected_definition_hash
+    ),
+    true
+  );
+
+  UPDATE agent_cwo_profile
+  SET status = 'REVOKED',
+      revoked_by = revoker_id,
+      revoked_at = clock_timestamp()
+  WHERE account_id = tenant_id
+    AND profile_id = recipient_profile_id
+    AND profile_version = recipient_profile_version;
+END
+$revoke$;
+
+ALTER FUNCTION approve_agent_cwo_profile(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) OWNER TO agent_cwo_profile_authority;
+ALTER FUNCTION revoke_agent_cwo_profile(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) OWNER TO agent_cwo_profile_authority;
+
+GRANT USAGE ON SCHEMA public TO agent_cwo_profile_authority;
+GRANT SELECT ON
+  agent_cwo_profile,
+  agent_cwo_profile_observe_rule
+TO agent_cwo_profile_authority;
+GRANT UPDATE (
+  status, approved_by, approved_at, approval_validation_hash,
+  revoked_by, revoked_at
+) ON agent_cwo_profile TO agent_cwo_profile_authority;
+
+REVOKE ALL ON FUNCTION approve_agent_cwo_profile(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) FROM PUBLIC;
+REVOKE ALL ON FUNCTION revoke_agent_cwo_profile(
+  BIGINT, UUID, INTEGER, TEXT, TEXT
+) FROM PUBLIC;
+REVOKE UPDATE (
+  status, approved_by, approved_at, approval_validation_hash,
+  revoked_by, revoked_at
+) ON agent_cwo_profile FROM PUBLIC;
+
+CREATE INDEX agent_cwo_session_work_idx ON agent_cwo_session (
+  account_id, status, updated_at, session_id
+);
+CREATE INDEX agent_cwo_session_profile_idx ON agent_cwo_session (
+  account_id, profile_id, profile_version, created_at DESC
+);
+CREATE INDEX agent_cwo_binding_certificate_idx ON agent_cwo_observe_binding (
+  account_id, certificate_id, sealed_at DESC, binding_id
+);
+CREATE INDEX agent_cwo_binding_window_idx ON agent_cwo_observe_binding (
+  account_id, source_window_id, sealed_at DESC, binding_id
+);
+CREATE INDEX agent_cwo_catalog_ref_idx ON agent_cwo_window_catalog (
+  account_id, receipt_ref, sealed_at DESC, source_window_id
+);
+CREATE INDEX agent_cwo_catalog_kind_idx ON agent_cwo_window_catalog (
+  account_id, source_window_kind, sealed_at DESC, source_window_id
+);
+CREATE INDEX agent_cwo_evaluation_session_idx ON agent_cwo_evaluation_receipt (
+  account_id, session_id, evaluated_at DESC, evaluation_id
+);
+CREATE INDEX agent_cwo_certificate_session_idx ON agent_cwo_window_certificate (
+  account_id, session_id, sealed_at DESC, certificate_id
+);
+CREATE INDEX agent_cwo_snapshot_session_idx ON agent_cwo_remaining_ttl_snapshot (
+  account_id, session_id, captured_at DESC, snapshot_id
+);
+CREATE INDEX agent_cwo_effect_work_idx ON agent_cwo_effect_intent (
+  account_id, intent_status, updated_at, effect_id
+) WHERE intent_status IN ('PREPARED', 'DISPATCHED', 'UNKNOWN_EFFECT');
+CREATE INDEX agent_cwo_audit_time_idx ON agent_cwo_audit_event (
+  account_id, occurred_at, session_id, event_sequence
+);
+CREATE INDEX agent_cwo_perception_status_idx ON agent_cwo_perception_snapshot (
+  account_id, status, created_at DESC, session_id
+);
+CREATE INDEX agent_cwo_command_expiry_idx ON agent_cwo_command_result (
+  account_id, expires_at, operation_name, principal_id
+);
+CREATE INDEX agent_cwo_invalidation_certificate_idx ON agent_cwo_invalidation (
+  account_id, certificate_id, created_at DESC, invalidation_id
+);
+
+DO $tenant_isolation$
+DECLARE
+  table_name TEXT;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY[
+    'agent_cwo_authorization_evidence',
+    'agent_cwo_profile',
+    'agent_cwo_profile_observe_rule',
+    'agent_cwo_window_catalog',
+    'agent_cwo_session',
+    'agent_cwo_nomination_window',
+    'agent_cwo_remaining_ttl_snapshot',
+    'agent_cwo_evaluation_receipt',
+    'agent_cwo_window_certificate',
+    'agent_cwo_observe_binding',
+    'agent_cwo_invalidation',
+    'agent_cwo_effect_intent',
+    'agent_cwo_budget_ledger',
+    'agent_cwo_terminal_record',
+    'agent_cwo_command_result',
+    'agent_cwo_audit_head',
+    'agent_cwo_audit_event',
+    'agent_cwo_audit_anchor',
+    'agent_cwo_perception_snapshot',
+    'agent_cwo_projection_checkpoint'
+  ]
+  LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', table_name);
+    EXECUTE format(
+      'CREATE POLICY tenant_isolation ON %I
+       USING (account_id = NULLIF(current_setting(''app.account_id'', true), '''')::BIGINT)
+       WITH CHECK (account_id = NULLIF(current_setting(''app.account_id'', true), '''')::BIGINT)',
+      table_name
+    );
+  END LOOP;
+END
+$tenant_isolation$;
+```
+
+### 8.1 Transaction boundaries
+
+Open, nominate, refresh, evaluate, seal, invalidate, and
+effect-prepare each run in a single ACID row-store transaction
+with session CAS. Window-certificate seal never joins a columnar
+rebuild or HNSW mutation.
+
+### 8.2 Tenant isolation
+
+Forced RLS on every table uses `app.account_id`. Composite
+primary keys and every access index lead with `account_id`.
+Missing tenant context yields no rows, not a cross-tenant scan.
+
+## 9. Open API GraphQL contract
+
+All functionality is available through the monday.com Open API.
+Long-running notify work returns durable state, not a synchronous
+board promise.
+
+```graphql
+scalar DateTime
+scalar Long
+scalar JSON
+scalar SHA256
+
+enum AgentCwoSessionStatus {
+  OPEN
+  NOMINATING
+  EVALUATING
+  SEALED
+  DISPATCHING
+  CLOSED
+  EXPIRED
+  CANCELLED
+  FAILED
+  QUARANTINED
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoBindingStatus {
+  SEALED
+  INVALIDATED
+  DISPATCHING
+  SUPERSEDED_REF
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoSourceKind {
+  SEALED_TTL_CERTIFICATE
+  SEALED_CONFIRM_CERTIFICATE
+  FIRST_ENROLLMENT_CLAIM
+  SUCCESSOR_KEY_CLAIM
+}
+
+enum AgentCwoPlacementKind {
+  HALTED
+  EXTENDED_HALT
+  RESTORED_WITHOUT_WINNER
+  OMITTED
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoKeyLifecycle {
+  FIRST_ENROLLMENT
+  CONFIRMED
+  MONOTONIC
+  REGRESSED
+  INVENTED_HISTORY
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoClockLifecycle {
+  ATTESTED
+  UNATTESTED
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoAttestedKeyKind {
+  AWAITING_CONFIRMATION
+  TRUSTED_ENROLLED
+  TRUSTED_WITHIN_SKEW
+  REGRESSED
+  INVENTED_HISTORY
+  SILENCE
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoObserveKind {
+  WINDOW_CURRENT
+  WINDOW_EXPIRING
+  WINDOW_EXPIRED
+  WINDOW_EXTENDED
+  WINDOW_CONTAINED
+  HOLD_UNKNOWN
+  REJECT_COUNTDOWN_CONFIRMATION
+  SKIP
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoPurposeRelation {
+  EQUAL
+  NARROWS
+  AMPLIFIES
+  UNRELATED
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoEffectStatus {
+  PREPARED
+  DISPATCHED
+  ACKED
+  FAILED
+  UNKNOWN_EFFECT
+}
+
+enum AgentCwoNextAction {
+  NOMINATE_SEALED_WINDOW_SOURCE
+  REFRESH_WINDOW_REMAINING_TTL
+  EVALUATE_CONFIRMATION_WINDOW
+  SEAL_WINDOW_CERTIFICATE
+  INVALIDATE_WINDOW_OBSERVABILITY
+  PREPARE_WINDOW_EFFECT
+  RESOLVE_WINDOW_UNCERTAINTY
+  CLOSE_SESSION
+}
+
+enum AgentCwoBlockedReason {
+  PROFILE_INACTIVE
+  PURPOSE_DENIED
+  ATTENUATION_DENIED
+  BUDGET_EXHAUSTED
+  WINDOW_MISSING
+  EVALUATE_NOT_READY
+  HISTORY_REWRITE_DENIED
+  SILENCE_SUCCESS_DENIED
+  FIRST_ENROLLMENT_AUTO_TRUST_DENIED
+  COUNTDOWN_CONFIRMATION_DENIED
+  LEDGER_SCAN_DENIED
+  HALT_OBSERVE_DENIED
+  PURPOSE_AMPLIFICATION_DENIED
+  SUCCESSOR_LEAK_DENIED
+  HOP_LEAK_DENIED
+  UNBOUND_WINDOW_DENIED
+  UNATTESTED_CLOCK_DENIED
+  INVENTED_HISTORY_DENIED
+  HASH_MISMATCH
+  DECISION_THRESHOLD_NOT_MET
+  POLICY_DENIED
+  UNKNOWN_EFFECT
+}
+
+enum AgentContentProvenance {
+  USER_INPUT
+  BOARD_VALUE
+  PROVIDER_VALUE
+  AGENT_DRAFT
+}
+
+enum AgentCwoUncertaintyResolution {
+  RETRY_SAME_WINDOW
+  ACCEPT_OBSERVATION
+  REJECT_ENVELOPE
+  REQUIRE_HUMAN
+}
+
+enum AgentCwoInvalidationReason {
+  SUPERSEDED
+  RETRACTED
+  QUARANTINED
+  KEY_REVOKED
+}
+
+type AgentUntrustedText {
+  value: String!
+  provenance: AgentContentProvenance!
+  trust: String!
+}
+
+type AgentCwoBudget {
+  nominateUnits: Long!
+  evaluateUnits: Long!
+  sealUnits: Long!
+  vectorUnits: Long!
+  invalidateUnits: Long!
+  observeUnits: Long!
+  maxWallTimeMs: Long!
+  evaluateThreshold: Int!
+  maxBindingsPerCertificate: Int!
+  maxNominatedWindows: Int!
+}
+
+type AgentCwoProfile {
+  accountId: ID!
+  profileId: ID!
+  profileVersion: Int!
+  name: String!
+  status: String!
+  definitionHash: SHA256!
+  expiringThresholdMs: Long!
+  maxRefreshCount: Int!
+  evaluateThreshold: Int!
+  maxBindingsPerCertificate: Int!
+  maxNominatedWindows: Int!
+  semanticTags: [String!]!
+  procedureRef: String
+}
+
+type AgentCwoSession {
+  accountId: ID!
+  sessionId: ID!
+  profileId: ID!
+  profileVersion: Int!
+  status: AgentCwoSessionStatus!
+  stateRevision: Long!
+  purpose: String!
+  budget: AgentCwoBudget!
+  principalId: ID!
+  deadlineAt: DateTime!
+}
+
+type AgentCwoNominationReceipt {
+  accountId: ID!
+  sessionId: ID!
+  sourceWindowId: ID!
+  sourceWindowKind: AgentCwoSourceKind!
+  placementKind: AgentCwoPlacementKind!
+  keyLifecycle: AgentCwoKeyLifecycle!
+  clockLifecycle: AgentCwoClockLifecycle!
+  disputedFactHash: SHA256!
+  attenuationHash: SHA256!
+  donorPurposeHash: SHA256!
+  hopCount: Int!
+  nominationHash: SHA256!
+  nominatedAt: DateTime!
+  expiresAt: DateTime!
+  remainingTtlMs: Long!
+  ttlExpired: Boolean!
+}
+
+type AgentCwoRemainingTtlSnapshot {
+  accountId: ID!
+  snapshotId: ID!
+  sessionId: ID!
+  sourceWindowId: ID!
+  remainingTtlMs: Long!
+  extendBudgetRemaining: Int!
+  snapshotHash: SHA256!
+  capturedAt: DateTime!
+}
+
+type AgentCwoEvaluationReceipt {
+  accountId: ID!
+  evaluationId: ID!
+  sessionId: ID!
+  windowSetHash: SHA256!
+  clockSetHash: SHA256!
+  remainingSetHash: SHA256!
+  attenuationHash: SHA256!
+  evaluationHash: SHA256!
+  evaluatedAt: DateTime!
+}
+
+type AgentCwoCertificate {
+  accountId: ID!
+  certificateId: ID!
+  sessionId: ID!
+  consumerRef: String!
+  purposeHash: SHA256!
+  windowSetHash: SHA256!
+  clockSetHash: SHA256!
+  remainingSetHash: SHA256!
+  attenuationHash: SHA256!
+  bindingWatermark: Int!
+  sealedAt: DateTime!
+}
+
+type AgentCwoBinding {
+  accountId: ID!
+  bindingId: ID!
+  certificateId: ID!
+  sessionId: ID!
+  sourceWindowId: ID!
+  sourceWindowKind: AgentCwoSourceKind!
+  bindingOrdinal: Int!
+  status: AgentCwoBindingStatus!
+  placementKind: AgentCwoPlacementKind!
+  keyLifecycle: AgentCwoKeyLifecycle!
+  clockLifecycle: AgentCwoClockLifecycle!
+  attestedKeyKind: AgentCwoAttestedKeyKind!
+  observeKind: AgentCwoObserveKind!
+  purposeRelation: AgentCwoPurposeRelation!
+  disputedFactHash: SHA256!
+  attenuationHash: SHA256!
+  requestedPurposeHash: SHA256!
+  remainingSetHash: SHA256!
+  remainingTtlMs: Long!
+  extendBudgetRemaining: Int!
+  ttlExpired: Boolean!
+  expiresAt: DateTime!
+  sealedAt: DateTime!
+}
+
+type AgentCwoEffectObservation {
+  effectId: ID!
+  status: AgentCwoEffectStatus!
+  providerIdempotencyKey: String!
+  generation: Int!
+  lastErrorCode: String
+}
+
+type AgentCwoPerceptionCard {
+  accountId: ID!
+  sessionId: ID!
+  status: AgentCwoSessionStatus!
+  summary: AgentUntrustedText!
+  sealedBindingCount: Int!
+  windowCurrentBindingCount: Int!
+  windowExpiringBindingCount: Int!
+  windowExpiredBindingCount: Int!
+  windowExtendedBindingCount: Int!
+  windowContainedBindingCount: Int!
+  holdUnknownBindingCount: Int!
+  rejectCountdownConfirmationBindingCount: Int!
+  unknownBindingCount: Int!
+  skippedBindingCount: Int!
+  invalidatedBindingCount: Int!
+  uncertainEffectIntents: [AgentCwoEffectObservation!]!
+  remainingBudget: AgentCwoBudget!
+  procedureTags: [String!]!
+  allowedNextActions: [AgentCwoNextAction!]!
+  blockedReasons: [AgentCwoBlockedReason!]!
+  cardHash: SHA256!
+}
+
+type AgentCwoMutationResult {
+  decision: String!
+  session: AgentCwoSession
+  certificate: AgentCwoCertificate
+  member: AgentCwoBinding
+  receipt: AgentCwoNominationReceipt
+  snapshot: AgentCwoRemainingTtlSnapshot
+  evaluation: AgentCwoEvaluationReceipt
+  perception: AgentCwoPerceptionCard
+  code: String
+  retryable: Boolean!
+  reason: String
+  auditHash: SHA256
+}
+
+input AgentCwoBudgetInput {
+  nominateUnits: Long!
+  evaluateUnits: Long!
+  sealUnits: Long!
+  vectorUnits: Long!
+  invalidateUnits: Long!
+  observeUnits: Long!
+  maxWallTimeMs: Long!
+  evaluateThreshold: Int!
+  maxBindingsPerCertificate: Int!
+  maxNominatedWindows: Int!
+}
+
+input CreateConfirmationWindowObservabilitySessionInput {
+  accountId: ID!
+  profileId: ID!
+  profileVersion: Int!
+  purpose: String!
+  idempotencyKey: String!
+  budget: AgentCwoBudgetInput!
+}
+
+input NominateSealedWindowSourceInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  sourceWindowId: ID!
+  expectedAttenuationHash: SHA256!
+  idempotencyKey: String!
+}
+
+input RefreshWindowRemainingTtlInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  sourceWindowId: ID!
+  expectedRemainingSetHash: SHA256!
+  idempotencyKey: String!
+}
+
+input EvaluateConfirmationWindowInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  expectedWindowSetHash: SHA256!
+  expectedRemainingSetHash: SHA256!
+  expectedAttenuationHash: SHA256!
+  idempotencyKey: String!
+}
+
+input SealWindowCertificateInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  evaluationId: ID!
+  consumerRef: String!
+  expectedPurposeHash: SHA256!
+  expectedRemainingSetHash: SHA256!
+  idempotencyKey: String!
+}
+
+input InvalidateWindowObservabilityInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  certificateId: ID!
+  sourceWindowId: ID!
+  reasonCode: AgentCwoInvalidationReason!
+  idempotencyKey: String!
+}
+
+input PrepareWindowEffectInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  certificateId: ID!
+  idempotencyKey: String!
+}
+
+input ResolveWindowUncertaintyInput {
+  accountId: ID!
+  sessionId: ID!
+  expectedRevision: Long!
+  effectId: ID!
+  resolution: AgentCwoUncertaintyResolution!
+  idempotencyKey: String!
+}
+
+input AgentCwoProfileSearchInput {
+  accountId: ID!
+  queryText: String!
+  topK: Int!
+}
+
+type Query {
+  agentCwoProfile(
+    accountId: ID!
+    profileId: ID!
+    profileVersion: Int!
+  ): AgentCwoProfile
+  agentCwoSession(accountId: ID!, sessionId: ID!): AgentCwoSession
+  agentCwoWindowCertificate(accountId: ID!, certificateId: ID!): AgentCwoCertificate
+  agentCwoPerceptionCard(accountId: ID!, sessionId: ID!): AgentCwoPerceptionCard
+  agentCwoNominatedWindow(
+    accountId: ID!
+    sessionId: ID!
+    sourceWindowId: ID!
+  ): AgentCwoNominationReceipt
+  agentCwoSearchProfiles(input: AgentCwoProfileSearchInput!): [AgentCwoProfile!]!
+}
+
+type Mutation {
+  createConfirmationWindowObservabilitySession(
+    input: CreateConfirmationWindowObservabilitySessionInput!
+  ): AgentCwoMutationResult!
+  nominateSealedWindowSource(
+    input: NominateSealedWindowSourceInput!
+  ): AgentCwoMutationResult!
+  refreshWindowRemainingTtl(
+    input: RefreshWindowRemainingTtlInput!
+  ): AgentCwoMutationResult!
+  evaluateConfirmationWindow(
+    input: EvaluateConfirmationWindowInput!
+  ): AgentCwoMutationResult!
+  sealWindowCertificate(input: SealWindowCertificateInput!): AgentCwoMutationResult!
+  invalidateWindowObservability(
+    input: InvalidateWindowObservabilityInput!
+  ): AgentCwoMutationResult!
+  prepareWindowEffect(input: PrepareWindowEffectInput!): AgentCwoMutationResult!
+  resolveWindowUncertainty(
+    input: ResolveWindowUncertaintyInput!
+  ): AgentCwoMutationResult!
+  closeConfirmationWindowObservabilitySession(
+    accountId: ID!
+    sessionId: ID!
+    expectedRevision: Long!
+    idempotencyKey: String!
+  ): AgentCwoMutationResult!
+  approveConfirmationWindowObservabilityProfile(
+    accountId: ID!
+    profileId: ID!
+    profileVersion: Int!
+    definitionHash: SHA256!
+    authorityPrincipalId: ID!
+  ): AgentCwoMutationResult!
+}
+```
+
+### GraphQL limits
+
+- `topK` for profile search is clamped to `[1, 20]`.
+- Evaluate mutations reject when binding ordinal exceeds session budget.
+- Mutations are idempotent by `(accountId, operation, principal, key)`.
+- Perception cards never embed raw private keys, tool payloads, or redacted
+  fact bodies.
+- `sealWindowCertificate` is rejected with `HISTORY_REWRITE_DENIED` when
+  remaining TTL would invent `TRUSTED_ENROLLED`, with
+  `COUNTDOWN_CONFIRMATION_DENIED` when a countdown is treated as
+  confirmation, and with `LEDGER_SCAN_DENIED` when remaining time would
+  be computed by walking a vote or TTL ledger.
+
+## 10. Procedural memory
+
+Approved observe profiles are procedural memory: versioned
+instructions for how sealed TTL and confirm certificates become
+envelope-scoped remaining-window bindings without inventing a
+winner and without rewriting a countdown as dual-control success
+or `TRUSTED_ENROLLED`. Procedure refs may point to
+successor-containment playbook steps. Profiles are immutable after
+approval; agents perceive `procedureTags` and `allowedNextActions`
+on perception cards, never inventing observe policy from
+embeddings.
+
+## 11. Semantic retrieval and HNSW compatibility
+
+Profile embeddings support advisory discovery ("which observe
+profile fits incident hop-attenuated first-enrollment remaining
+window?"). Embeddings are account-owned and must be queried with
+`account_id` equality. The reference schema stores vectors but
+does **not** create a cross-tenant HNSW index; production builds
+account-partitioned HNSW segments.
+
+Semantic retrieval may return observe profiles only. It never
+authorizes nominate, refresh, evaluate, seal, or observe. Vector
+`topK` is budgeted and clamped.
+
+```sql
+CREATE TABLE agent_cwo_profile_embedding (
+  account_id BIGINT NOT NULL,
+  profile_id UUID NOT NULL,
+  profile_version INTEGER NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dims INTEGER NOT NULL CHECK (embedding_dims > 0),
+  embedding vector(1536) NOT NULL,
+  definition_hash CHAR(64) NOT NULL CHECK (length(definition_hash) = 64),
+  source_watermark TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, profile_id, profile_version),
+  FOREIGN KEY (account_id, profile_id, profile_version)
+    REFERENCES agent_cwo_profile (account_id, profile_id, profile_version)
+);
+```
+
+```sql
+-- Production guidance: CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)
+-- only inside an account-partitioned table/segment. Never build one global
+-- HNSW across tenants. Reference validation intentionally omits HNSW DDL.
+-- ANN queries must include account_id equality before topK.
+```
+
+## 12. Agent perception
+
+Agents receive perception cards summarizing session status, sealed
+/ window-current / window-expiring / window-expired /
+window-extended / window-contained / hold-unknown /
+reject-countdown-confirmation / unknown / skipped / invalidated
+binding counts, uncertain notify intents, remaining budgets,
+procedure tags, allowed next actions, and blocked reasons.
+Summary text is `UntrustedText`. Cards never embed raw private
+keys or redacted fact bodies. `cardHash` makes perception
+replayable. Agents perceive `WINDOW_CURRENT` as a first-seen key
+whose confirmation window is still open and still cannot invent a
+winner, `WINDOW_EXPIRING` as remaining time below the profile
+threshold without confirmation, `WINDOW_EXPIRED` as a sealed
+observation that the window closed without dual-control trust,
+`WINDOW_EXTENDED` as a dual-control re-arm that does not confirm
+the key, `WINDOW_CONTAINED` as a trusted hold that refuses silent
+confirmation, `HOLD_UNKNOWN` as a bounded uncertainty window,
+`REJECT_COUNTDOWN_CONFIRMATION` as a trusted negative for a clock
+tick that would have rewritten remaining TTL as success, and
+`SKIP` as a sealed refusal — never as a key that "must have been
+trusted because the countdown approached zero."
+
+## 13. ACID and consistency
+
+### Row store
+
+Session CAS, nomination receipts, remaining-TTL snapshots,
+evaluation receipts, window-certificate seals, and audit appends
+are ACID transactions in the hybrid row store.
+
+### Columnar store
+
+Columnar projections may accelerate analytics over sealed window
+certificates but are not authoritative for window-current,
+window-expiring, or reject-countdown-confirmation outcomes.
+
+### Vector store
+
+Vector indexes are asynchronously enriched from immutable profile
+approval events; staleness is visible via source watermarks.
+
+### External tools
+
+Notify dispatch and first-enrollment side-effects are not silently
+ACID-coupled; silence becomes `UNKNOWN_EFFECT`.
+
+## 14. Guardrails and neighbor protection
+
+- Binding/threshold caps on observations per certificate and per
+  session.
+- Budget ledgers for NOMINATE/EVALUATE/SEAL/VECTOR/INVALIDATE/OBSERVE.
+- Purpose attenuation narrowing only for consumers.
+- Forced RLS on every table.
+- Planner rejects unscoped key-catalog, clock-catalog, working-set,
+  grant-graph, citation, confirm-ledger, vote-ledger, TTL-ledger,
+  or board scans as **FULL SCAN REJECTED**.
+- Emergency containment may quarantine sessions without scanning
+  neighbors.
+- Evaluation never auto-restores neighbor-visible board mutations
+  from halted slots, expired votes, or unbound windows.
+
+## 15. Performance check for boards with 1M+ rows
+
+### Full-table-scan risks
+
+- Finding remaining windows by scanning the confirmation-vote or
+  TTL-retirement ledger (rejected; nominate by
+  `(account_id, source_window_id)`).
+- Evaluating an observation by walking all notify intents for an
+  account (rejected).
+- Vector search without `account_id` predicate (rejected).
+- Invalidation by scanning all certificates for an account
+  (rejected; use receipt-keyed active binding indexes).
+
+### Required access paths
+
+- Window nomination: PK `(account_id, source_window_id)`.
+- Remaining-TTL refresh: unique `(account_id, session_id,
+  source_window_id, snapshot_hash)`.
+- Evaluate/seal: PK `(account_id, evaluation_id)` /
+  `(account_id, certificate_id)` and unique
+  `(account_id, session_id, consumer_ref, sealed_revision)`.
+- Bindings by certificate/window: composite indexes leading with
+  `account_id`.
+- Notify work: partial indexes on effect intent status.
+- Profile ANN: account-partitioned HNSW only.
+
+### Planner enforcement
+
+Any plan lacking an `account_id` equality predicate or requiring
+an unscoped board/working-set/grant-graph/key-catalog/clock-
+catalog/confirm-ledger/vote-ledger/TTL-ledger/citation scan is
+**FULL SCAN REJECTED** before execution.
+
+## 16. Auditability and replay
+
+Each command appends a hash-chained audit event:
+`event_hash = H(prev_hash || payload_hash || event_type || occurred_at)`.
+Anchors Merkle-seal ranges for offline replay. Replay
+reconstructs session, remaining-TTL, evaluation, and certificate
+state without LLM calls.
+
+## 17. Threat and failure analysis
+
+- Cross-tenant certificate via forged IDs: blocked by forced RLS
+  and PK scope.
+- Purpose amplification for consumers: attenuation hash must
+  narrow relative to observation and session purposes.
+- Sticky first-ACK success after supersession: invalidation +
+  re-evaluate + notify uncertainty + profile revocation.
+- Historical silence invented as `TRUSTED_ENROLLED` from remaining
+  TTL: history-rewrite and silence-success fences.
+- First-enrollment key auto-promoted to `TRUSTED_ENROLLED` by a
+  countdown: first-enrollment-auto-trust and
+  countdown-as-confirmation fences.
+- Remaining time computed by walking vote or TTL ledgers:
+  ledger-scan fence and **FULL SCAN REJECTED**.
+- Halt leak of frozen bodies into observe-as-restore:
+  halt-observe fence.
+- Window that restores a halted body or invents a winner:
+  successor-leak fence.
+- Hop leak of donor purpose after attenuation hops: hop-leak
+  fence.
+- Inventing a winner under restored-slot observation:
+  certificates bind receipt and remaining sets, never
+  `resolved_fact_hash`.
+- Silent notify or first-enrollment success: `UNKNOWN_EFFECT`
+  until ACK.
+- Recursive window-catalog or board storms: budget and
+  **FULL SCAN REJECTED**.
+- LLM-invented profile approval: authority-fenced approve/revoke
+  only.
+
+## 18. Observability and SLOs
+
+- Open/nominate/refresh/evaluate/seal/perception p99 latency
+  budgets for 99.99% control-plane availability.
+- History-rewrite rejection, silence-success rejection,
+  first-enrollment-auto-trust rejection, countdown-as-
+  confirmation rejection, ledger-scan rejection, halt-observe
+  rejection, purpose-amplification rejection, successor-leak
+  rejection, and `UNKNOWN_EFFECT` rate as first-class metrics.
+- Threshold-failure rejection and full-scan rejection counters
+  per account.
+- Audit chain gap alerts.
+
+## 19. Rollout
+
+### Phase 1: shadow observation
+
+Compile profiles and validate window nomination without durable
+certificates.
+
+### Phase 2: reject-countdown-confirmation and skip only
+
+Allow sealed certificates from nominated `HALTED` and
+`EXTENDED_HALT` windows as `REJECT_COUNTDOWN_CONFIRMATION` or
+`SKIP`. Window-current stays closed.
+
+### Phase 3: expire-only observe and halt-observe fences
+
+Enable budgeted `WINDOW_EXPIRED` from `RESTORED_WITHOUT_WINNER`
+windows with `ttl_expired = true` and `AWAITING_CONFIRMATION`
+only. Remaining TTL never writes `TRUSTED_ENROLLED`.
+
+### Phase 4: remaining-window cards and notify uncertainty
+
+Enable `WINDOW_CURRENT` / `WINDOW_EXPIRING` under point-lookup
+refresh and confirmation notify intents with `UNKNOWN_EFFECT`
+reconciliation and `HOLD_UNKNOWN` that cannot invent confirmation
+trust from a countdown.
+
+### Phase 5: broad availability
+
+Open approved profiles to autonomous agents under neighbor
+budgets, including remaining-window cards only for first-
+enrollment keys that cannot rewrite a countdown as success and
+cannot auto-trust from a clock tick.
+
+## 20. Ship criteria
+
+### Contract validation
+
+- TypeScript strict compile of service interfaces.
+- GraphQL schema build with 6 queries and 10 mutations.
+- PGlite + pgvector executable DDL with forced RLS.
+- Negative invariant tests for approval, immutability,
+  history-rewrite, purpose-amplification, and effect start state.
+
+### Behavioral validation
+
+- Nominate requires sealed window material point lookup and hash
+  match.
+- Refresh remaining TTL is a point lookup and never a vote-ledger
+  scan.
+- Evaluate binds window set, remaining set, and attenuation under
+  budget.
+- Seal is rejected when remaining TTL would become
+  `TRUSTED_ENROLLED`, when a countdown is treated as confirmation,
+  or when remaining time would be computed by scanning ledgers,
+  and never invents a winning fact hash.
+- Window-certificate seal binds immutable bindings under window-
+  set, clock-set, remaining-set, and attenuation hashes — never a
+  winner hash.
+- Notify silence becomes `UNKNOWN_EFFECT`.
+
+### Scale and failure validation
+
+- 1M+ row boards: no nominate/refresh/evaluate/seal path performs
+  a full table scan.
+- Neighbor budget exhaustion rejects before execution.
+- Audit replay reconstructs sealed window certificates after
+  process restart.
+
+## 21. Product decision
+
+Adopt the Confirmation-Window Observability Plane as the
+deterministic remaining-window perception path for sealed TTL and
+confirm certificates bound by the Confirmation-TTL Retirement,
+First-Enrollment Confirmation, Successor-Key Enrollment, and
+Successor-Clock Re-Attestation planes.
+
+Ship it because:
+
+1. It preserves ACID and multi-tenant isolation while closing the
+   post-retirement perception gap without history rewrite,
+   silence-success, first-enrollment auto-trust, countdown-as-
+   confirmation, ledger scans, halt leak, purpose amplification,
+   invented winners, or vote-ledger walks.
+2. Account-leading indexes, history-rewrite and
+   purpose-amplification fences, and **FULL SCAN REJECTED**
+   planner rules protect 99.99% neighbor latency on boards with
+   1M+ rows.
+3. Open API GraphQL, procedural memory, account-owned HNSW
+   profile discovery, perception cards, and hash-chained audit
+   replay make the plane agent-ready without putting
+   probabilistic AI inside the data engine.
