@@ -1,0 +1,14 @@
+{
+  "name": "mondaydb-agentic-strategy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "node scripts/validate-strategy-doc.mjs docs/agentic-promotion-containment-expiry-review-plane.md"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@electric-sql/pglite-pgvector": "^0.0.5",
+    "graphql": "^17.0.2",
+    "typescript": "^7.0.2"
+  }
+}
