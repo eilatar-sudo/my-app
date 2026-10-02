@@ -129,16 +129,16 @@ if (queryCount !== 6 || mutationCount !== 10) {
 }
 
 const ddlBlock = sqlBlocks.find((block) =>
-  block.includes("CREATE TYPE iomp_session_status"),
+  block.includes("CREATE TYPE iompcp_session_status"),
 );
 const vectorBlock = sqlBlocks.find((block) =>
-  block.includes("CREATE TABLE agent_iomp_profile_embedding"),
+  block.includes("CREATE TABLE agent_iompcp_profile_embedding"),
 );
 if (!ddlBlock || !vectorBlock) {
   throw new Error("could not locate executable SQL schema blocks");
 }
 if (
-  !/CREATE TABLE agent_iomp_profile_embedding \(\n\s+account_id/.test(
+  !/CREATE TABLE agent_iompcp_profile_embedding \(\n\s+account_id/.test(
     vectorBlock,
   )
 ) {
@@ -173,7 +173,7 @@ for (const indexDefinition of ddlBlock.matchAll(
 }
 
 const decisionColumns = `
-  account_id, decision_id, certificate_id, session_id, member_id,
+  account_id, decision_id, certificate_id, session_id, card_id,
   source_certificate_id, source_kind, decision_ordinal, status, placement_kind,
   key_lifecycle, clock_lifecycle, attested_key_kind, terminal_kind, gate_kind,
   gate_action, perceive_kind, compile_kind, body_visibility, fact_disposition,
@@ -203,10 +203,10 @@ function decisionValues({
     '20000000-0000-0000-0000-000000000001',
     '90000000-0000-0000-0000-000000000099',
     '50000000-0000-0000-0000-000000000099',
-    'SEALED_INVALIDATED_OMISSION_MEMBER', ${ordinal}, 'SEALED',
+    'SEALED_INVALIDATED_OMISSION_MEMBER_CARD', ${ordinal}, 'SEALED',
     'EXTENDED_HALT', 'FIRST_ENROLLMENT', 'ATTESTED',
     '${attestedKey}', 'REQUIRE_HUMAN', 'ALLOW_TOOL_READ', 'TOOL_READ',
-    'PERCEIVE_ATTESTED_RECEIPT', 'PERCEIVE_INVALIDATED_MEMBER', '${bodyVisibility}',
+    'PERCEIVE_ATTESTED_RECEIPT', 'ATTACH_INVALIDATED_MEMBER_CARD', '${bodyVisibility}',
     '${factDisposition}', 'REARMED', 'ATTESTED', 'ACKED', 'NARROWS', '${accessPath}',
     '${citation}', '${membership}', '${catalogStatus}', 'UNTRUSTED_METADATA',
     repeat('b', 64), repeat('4', 64), repeat('5', 64), repeat('7', 64),
@@ -224,7 +224,7 @@ try {
   await database.exec(`
     SELECT set_config('app.account_id', '101', true);
 
-    INSERT INTO agent_iomp_authorization_evidence (
+    INSERT INTO agent_iompcp_authorization_evidence (
       account_id, evidence_id, principal_id, policy_revision,
       resource_acl_revision, redacted_scope_summary,
       encrypted_evidence_ref, evidence_hash, immutable_archive_ref, created_at
@@ -234,38 +234,38 @@ try {
       repeat('8', 64), 'worm://evidence/fixture', now()
     );
 
-    INSERT INTO agent_iomp_profile (
+    INSERT INTO agent_iompcp_profile (
       account_id, profile_id, profile_version, name, status,
       definition_hash, canonicalization_version, compiler_version,
       approval_validation_hash, authorization_evidence_id,
-      authorization_snapshot_hash, compile_threshold, max_members_per_session,
-      max_nominated_members, semantic_tags, procedure_ref, revocation_policy,
+      authorization_snapshot_hash, compile_threshold, max_cards_per_session,
+      max_nominated_cards, semantic_tags, procedure_ref, revocation_policy,
       created_by, created_at
     ) VALUES (
       101, '10000000-0000-0000-0000-000000000001', 1,
       'Incident invalidated omission-member perception card', 'DRAFT',
-      repeat('a', 64), 'jcs-v1', 'iomp-perceive-1',
+      repeat('a', 64), 'jcs-v1', 'iompcp-perceive-1',
       NULL, '30000000-0000-0000-0000-000000000001',
       repeat('d', 64), 2, 1, 1,
       ARRAY['incident', 'invalidated-omission-member'],
       'proc:invalidated-omission-member-card',
-      'STOP_BEFORE_PERCEIVE', 'principal:test', now()
+      'STOP_BEFORE_ATTACH', 'principal:test', now()
     );
 
-    INSERT INTO agent_iomp_profile_perceive_rule (
+    INSERT INTO agent_iompcp_profile_perceive_rule (
       account_id, profile_id, profile_version, rule_id, ordinal,
-      allowed_source_kinds, compile_threshold, max_members_per_session,
-      max_nominated_members, require_dual_control_compile, compile_instruction
+      allowed_source_kinds, compile_threshold, max_cards_per_session,
+      max_nominated_cards, require_dual_control_compile, compile_instruction
     ) VALUES (
       101, '10000000-0000-0000-0000-000000000001', 1, 'perceive-case', 1,
-      ARRAY['SEALED_INVALIDATED_OMISSION_MEMBER', 'SEALED_PERCEPTION_CARD',
+      ARRAY['SEALED_INVALIDATED_OMISSION_MEMBER_CARD', 'SEALED_PERCEPTION_CARD',
         'SEALED_ATTEST_CERT', 'SEALED_TOOL_READ_DECISION',
         'SEALED_PROVIDER_RECEIPT', 'SEALED_EFFECT_INTENT'],
       2, 1, 1, true,
       '{"perceive_one_invalidated_member":true,"metadata_only":true,"ack_never_trust":true,"point_lookup_only":true,"invalidated_catalog_only":true,"no_nested_expiry":true}'
     );
 
-    SELECT approve_agent_iomp_profile(
+    SELECT approve_agent_iompcp_profile(
       101,
       '10000000-0000-0000-0000-000000000001',
       1,
@@ -273,9 +273,9 @@ try {
       'principal:approver'
     );
 
-    INSERT INTO agent_iomp_member_catalog (
-      account_id, member_id, source_session_id, source_certificate_id,
-      source_decision_id, member_ref, source_kind, perceive_kind, gate_kind,
+    INSERT INTO agent_iompcp_card_catalog (
+      account_id, card_id, source_session_id, source_certificate_id,
+      source_decision_id, card_ref, source_kind, perceive_kind, gate_kind,
       gate_action, terminal_kind, placement_kind, key_lifecycle, clock_lifecycle,
       attested_key_kind, status, citation_state, membership_state, catalog_status, disputed_fact_hash, prior_clock_hash,
       successor_clock_hash, provider_receipt_hash, attenuation_hash,
@@ -288,6 +288,7 @@ try {
       prior_gate_steward_a, prior_gate_steward_b,
       prior_extension_steward_a, prior_extension_steward_b,
       prior_omission_steward_a, prior_omission_steward_b,
+      prior_card_steward_a, prior_card_steward_b,
       expires_at, first_seen_at, sealed_at, created_at
     ) VALUES (
       101, '90000000-0000-0000-0000-000000000099',
@@ -295,7 +296,7 @@ try {
       '50000000-0000-0000-0000-000000000099',
       '51000000-0000-0000-0000-000000000099',
       'member:omitted/purpose:incident-triage',
-      'SEALED_INVALIDATED_OMISSION_MEMBER', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
+      'SEALED_INVALIDATED_OMISSION_MEMBER_CARD', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
       'TOOL_READ', 'REQUIRE_HUMAN', 'EXTENDED_HALT',
       'FIRST_ENROLLMENT', 'ATTESTED', 'AWAITING_CONFIRMATION', 'DROPPED', 'DROPPED', 'OMITTED', 'INVALIDATED',
       repeat('b', 64), repeat('4', 64), repeat('5', 64), repeat('7', 64),
@@ -308,13 +309,14 @@ try {
       'principal:gate-a', 'principal:gate-b',
       'principal:ext-a', 'principal:ext-b',
       'principal:omit-a', 'principal:omit-b',
+      'principal:src-card-a', 'principal:src-card-b',
       now() + interval '30 minutes',
       now() - interval '12 hours', now() - interval '12 hours', now()
     );
 
-    INSERT INTO agent_iomp_member_catalog (
-      account_id, member_id, source_session_id, source_certificate_id,
-      source_decision_id, member_ref, source_kind, perceive_kind, gate_kind,
+    INSERT INTO agent_iompcp_card_catalog (
+      account_id, card_id, source_session_id, source_certificate_id,
+      source_decision_id, card_ref, source_kind, perceive_kind, gate_kind,
       gate_action, terminal_kind, placement_kind, key_lifecycle, clock_lifecycle,
       attested_key_kind, status, citation_state, membership_state, catalog_status, disputed_fact_hash, prior_clock_hash,
       successor_clock_hash, provider_receipt_hash, attenuation_hash,
@@ -327,6 +329,7 @@ try {
       prior_gate_steward_a, prior_gate_steward_b,
       prior_extension_steward_a, prior_extension_steward_b,
       prior_omission_steward_a, prior_omission_steward_b,
+      prior_card_steward_a, prior_card_steward_b,
       expires_at, first_seen_at, sealed_at, created_at
     ) VALUES (
       101, '91000000-0000-0000-0000-000000000088',
@@ -334,7 +337,7 @@ try {
       '50000000-0000-0000-0000-000000000088',
       '51000000-0000-0000-0000-000000000088',
       'member:included/attached-decoy',
-      'SEALED_INVALIDATED_OMISSION_MEMBER', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
+      'SEALED_INVALIDATED_OMISSION_MEMBER_CARD', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
       'TOOL_READ', 'REQUIRE_HUMAN', 'EXTENDED_HALT',
       'FIRST_ENROLLMENT', 'ATTESTED', 'AWAITING_CONFIRMATION', 'ATTACHED', 'ATTACHED', 'INCLUDED', 'LIVE',
       repeat('b', 64), repeat('4', 64), repeat('5', 64), repeat('6', 64),
@@ -347,14 +350,15 @@ try {
       'principal:gate-a', 'principal:gate-b',
       'principal:ext-a', 'principal:ext-b',
       'principal:omit-a', 'principal:omit-b',
+      'principal:src-card-a', 'principal:src-card-b',
       now() + interval '30 minutes',
       now() - interval '12 hours', now() - interval '12 hours', now()
     );
 
 
-    INSERT INTO agent_iomp_member_catalog (
-      account_id, member_id, source_session_id, source_certificate_id,
-      source_decision_id, member_ref, source_kind, perceive_kind, gate_kind,
+    INSERT INTO agent_iompcp_card_catalog (
+      account_id, card_id, source_session_id, source_certificate_id,
+      source_decision_id, card_ref, source_kind, perceive_kind, gate_kind,
       gate_action, terminal_kind, placement_kind, key_lifecycle, clock_lifecycle,
       attested_key_kind, status, citation_state, membership_state, catalog_status, disputed_fact_hash, prior_clock_hash,
       successor_clock_hash, provider_receipt_hash, attenuation_hash,
@@ -367,6 +371,7 @@ try {
       prior_gate_steward_a, prior_gate_steward_b,
       prior_extension_steward_a, prior_extension_steward_b,
       prior_omission_steward_a, prior_omission_steward_b,
+      prior_card_steward_a, prior_card_steward_b,
       expires_at, first_seen_at, sealed_at, created_at
     ) VALUES (
       101, '92000000-0000-0000-0000-000000000077',
@@ -374,7 +379,7 @@ try {
       '50000000-0000-0000-0000-000000000077',
       '51000000-0000-0000-0000-000000000077',
       'member:omitted/catalog-still-live',
-      'SEALED_INVALIDATED_OMISSION_MEMBER', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
+      'SEALED_INVALIDATED_OMISSION_MEMBER_CARD', 'PERCEIVE_ATTESTED_RECEIPT', 'ALLOW_TOOL_READ',
       'TOOL_READ', 'REQUIRE_HUMAN', 'EXTENDED_HALT',
       'FIRST_ENROLLMENT', 'ATTESTED', 'AWAITING_CONFIRMATION', 'DROPPED', 'DROPPED', 'OMITTED', 'LIVE',
       repeat('b', 64), repeat('4', 64), repeat('5', 64), repeat('6', 64),
@@ -387,19 +392,20 @@ try {
       'principal:gate-a', 'principal:gate-b',
       'principal:ext-a', 'principal:ext-b',
       'principal:omit-a', 'principal:omit-b',
+      'principal:src-card-a', 'principal:src-card-b',
       now() + interval '30 minutes',
       now() - interval '12 hours', now() - interval '12 hours', now()
     );
 
-    INSERT INTO agent_iomp_session (
+    INSERT INTO agent_iompcp_session (
       account_id, session_id, profile_id, profile_version, status,
       state_revision, purpose, idempotency_key, budget_nominate_units,
       budget_bind_units, budget_seal_units, budget_vector_units,
       budget_publish_units, budget_notify_units, consumed_nominate_units,
       consumed_bind_units, consumed_seal_units, consumed_vector_units,
       consumed_publish_units, consumed_notify_units,
-      budget_max_wall_time_ms, compile_threshold, max_members_per_session,
-      max_nominated_members, deadline_at, started_by, principal_id,
+      budget_max_wall_time_ms, compile_threshold, max_cards_per_session,
+      max_nominated_cards, deadline_at, started_by, principal_id,
       authorization_evidence_id, delegated_scope_hash,
       authorization_revision, resource_scope_hash, created_at, updated_at
     ) VALUES (
@@ -414,7 +420,7 @@ try {
       repeat('e', 64), 7, repeat('f', 64), now(), now()
     );
 
-    SELECT nominate_agent_iomp_member(
+    SELECT nominate_agent_iompcp_card(
       101,
       '20000000-0000-0000-0000-000000000001',
       '90000000-0000-0000-0000-000000000099',
@@ -422,8 +428,8 @@ try {
       repeat('1', 64)
     );
 
-    INSERT INTO agent_iomp_perceive_record (
-      account_id, compile_id, session_id, member_id, prior_clock_hash,
+    INSERT INTO agent_iompcp_perceive_record (
+      account_id, compile_id, session_id, card_id, prior_clock_hash,
       successor_clock_hash, disputed_fact_hash, provider_receipt_hash,
       halt_scope_hash, attenuation_hash, decision_set_hash, compile_hash,
       compiled_at
@@ -435,17 +441,18 @@ try {
       repeat('4', 64), repeat('c', 64), repeat('2', 64), repeat('3', 64), now()
     );
 
-    INSERT INTO agent_iomp_card_certificate (
+    INSERT INTO agent_iompcp_packet_certificate (
       account_id, certificate_id, session_id, compile_id, consumer_ref,
       purpose_hash, prior_clock_hash, successor_clock_hash, disputed_fact_hash,
       provider_receipt_hash, halt_scope_hash, attenuation_hash, decision_set_hash,
-      card_steward_a, card_steward_b,
+      packet_steward_a, packet_steward_b,
       prior_omission_steward_a, prior_omission_steward_b,
       prior_compiler_steward_a, prior_compiler_steward_b,
       perception_steward_a, perception_steward_b,
       receipt_steward_a, receipt_steward_b,
       prior_gate_steward_a, prior_gate_steward_b,
       prior_extension_steward_a, prior_extension_steward_b,
+      prior_card_steward_a, prior_card_steward_b,
       decision_watermark, sealed_revision, sealed_at, created_at
     ) VALUES (
       101, '90000000-0000-0000-0000-000000000001',
@@ -461,22 +468,23 @@ try {
       'principal:rcpt-a', 'principal:rcpt-b',
       'principal:gate-a', 'principal:gate-b',
       'principal:ext-a', 'principal:ext-b',
+      'principal:src-card-a', 'principal:src-card-b',
       1, 1, now(), now()
     );
 
-    INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+    INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
       ${decisionValues({
         decisionId: "a0000000-0000-0000-0000-000000000099",
         ordinal: 1,
       })}
     );
 
-    INSERT INTO agent_iomp_perception_card (
-      account_id, card_id, session_id, certificate_id, member_id,
+    INSERT INTO agent_iompcp_context_packet (
+      account_id, packet_id, session_id, certificate_id, card_id,
       membership_state, citation_state, catalog_status, metadata_trust, effect_observation,
       provider_receipt_hash, disputed_fact_hash, fact_disposition,
-      attested_key_kind, body_visibility, inlines_fact_body, card_hash,
-      card_body, created_at
+      attested_key_kind, body_visibility, inlines_fact_body, packet_hash,
+      packet_body, created_at
     ) VALUES (
       101, 'b0000000-0000-0000-0000-000000000001',
       '20000000-0000-0000-0000-000000000001',
@@ -489,7 +497,7 @@ try {
       now()
     );
 
-    SELECT publish_agent_iomp_card(
+    SELECT attach_agent_iompcp_packet(
       101,
       '90000000-0000-0000-0000-000000000099',
       'b0000000-0000-0000-0000-000000000001',
@@ -498,7 +506,7 @@ try {
   `);
 
   const nominations = await database.query(
-    "SELECT count(*)::int AS count FROM agent_iomp_nomination WHERE account_id = 101 AND access_path = 'POINT_LOOKUP'",
+    "SELECT count(*)::int AS count FROM agent_iompcp_nomination WHERE account_id = 101 AND access_path = 'POINT_LOOKUP'",
   );
   if (nominations.rows[0]?.count !== 1) {
     throw new Error("point-lookup nomination was not compiled");
@@ -507,12 +515,12 @@ try {
   const members = await database.query(`
     SELECT membership_state, citation_state, catalog_status, effect_observation, attested_key_kind,
            fact_disposition, metadata_trust, body_visibility, inlines_fact_body,
-           card_body
-    FROM agent_iomp_perception_card
+           packet_body
+    FROM agent_iompcp_context_packet
     WHERE account_id = 101
   `);
   const member = members.rows[0];
-  const body = member?.card_body ?? {};
+  const body = member?.packet_body ?? {};
   if (
     member?.membership_state !== "OMITTED" ||
     member?.citation_state !== "DROPPED" ||
@@ -532,13 +540,13 @@ try {
 
   const records = await database.query(`
     SELECT reason_code, effect_observation
-    FROM agent_iomp_publication_record
+    FROM agent_iompcp_publication_record
     WHERE account_id = 101
-      AND member_id = '90000000-0000-0000-0000-000000000099'
+      AND card_id = '90000000-0000-0000-0000-000000000099'
   `);
   if (
     records.rows.length !== 1 ||
-    records.rows[0]?.reason_code !== "INVALIDATED_MEMBER_PERCEIVED" ||
+    records.rows[0]?.reason_code !== "INVALIDATED_MEMBER_CARD_ATTACHED" ||
     records.rows[0]?.effect_observation !== "ACKED"
   ) {
     throw new Error("publication record did not cite the omitted member by point lookup");
@@ -546,14 +554,14 @@ try {
 
   await database.exec(`
     SELECT set_config('app.account_id', '101', true);
-    SELECT reject_agent_iomp_unscoped_scan(true, true);
+    SELECT reject_agent_iompcp_unscoped_scan(true, true);
   `);
 
   await expectDatabaseRejection(
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        SELECT reject_agent_iomp_unscoped_scan(true, false);
+        SELECT reject_agent_iompcp_unscoped_scan(true, false);
       `),
     "unscoped member scan",
     "P0001",
@@ -563,7 +571,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        SELECT nominate_agent_iomp_member(
+        SELECT nominate_agent_iompcp_card(
           101,
           '20000000-0000-0000-0000-000000000001',
           NULL,
@@ -579,7 +587,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        SELECT nominate_agent_iomp_member(
+        SELECT nominate_agent_iompcp_card(
           101,
           '20000000-0000-0000-0000-000000000001',
           '91000000-0000-0000-0000-000000000088',
@@ -596,7 +604,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        INSERT INTO agent_iomp_session (
+        INSERT INTO agent_iompcp_session (
           account_id, session_id, profile_id, profile_version, status,
           state_revision, purpose, idempotency_key, budget_nominate_units,
           budget_bind_units, budget_seal_units, budget_vector_units,
@@ -604,8 +612,8 @@ try {
           consumed_nominate_units, consumed_bind_units,
           consumed_seal_units, consumed_vector_units,
           consumed_publish_units, consumed_notify_units,
-          budget_max_wall_time_ms, compile_threshold, max_members_per_session,
-          max_nominated_members, deadline_at, started_by, principal_id,
+          budget_max_wall_time_ms, compile_threshold, max_cards_per_session,
+          max_nominated_cards, deadline_at, started_by, principal_id,
           authorization_evidence_id, delegated_scope_hash,
           authorization_revision, resource_scope_hash, created_at, updated_at
         ) VALUES (
@@ -628,7 +636,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        UPDATE agent_iomp_profile_perceive_rule
+        UPDATE agent_iompcp_profile_perceive_rule
         SET require_dual_control_compile = false
         WHERE account_id = 101
           AND profile_id = '10000000-0000-0000-0000-000000000001'
@@ -644,21 +652,21 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        INSERT INTO agent_iomp_profile (
+        INSERT INTO agent_iompcp_profile (
           account_id, profile_id, profile_version, name, status,
           definition_hash, canonicalization_version, compiler_version,
           approval_validation_hash, authorization_evidence_id,
           authorization_snapshot_hash, compile_threshold,
-          max_members_per_session, max_nominated_members, semantic_tags,
+          max_cards_per_session, max_nominated_cards, semantic_tags,
           procedure_ref, revocation_policy, created_by, created_at,
           approved_by, approved_at
         ) VALUES (
           101, '10000000-0000-0000-0000-000000000002', 1,
           'Illegal approved profile', 'APPROVED',
-          repeat('b', 64), 'jcs-v1', 'iomp-perceive-1',
+          repeat('b', 64), 'jcs-v1', 'iompcp-perceive-1',
           repeat('c', 64), '30000000-0000-0000-0000-000000000001',
           repeat('d', 64), 2, 1, 1,
-          ARRAY['incident'], 'proc:illegal', 'STOP_BEFORE_PERCEIVE',
+          ARRAY['incident'], 'proc:illegal', 'STOP_BEFORE_ATTACH',
           'principal:test', now(), 'principal:test', now()
         );
       `),
@@ -671,7 +679,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        UPDATE agent_iomp_card_decision
+        UPDATE agent_iompcp_packet_decision
         SET disputed_fact_hash = repeat('e', 64)
         WHERE account_id = 101
           AND decision_id = 'a0000000-0000-0000-0000-000000000099';
@@ -685,7 +693,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        UPDATE agent_iomp_profile
+        UPDATE agent_iompcp_profile
         SET status = 'REVOKED',
             revoked_by = 'principal:unauthorized',
             revoked_at = now()
@@ -702,7 +710,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        INSERT INTO agent_iomp_effect_intent (
+        INSERT INTO agent_iompcp_effect_intent (
           account_id, effect_id, session_id, certificate_id,
           intent_status, provider_idempotency_key, generation,
           canonical_request_hash, created_at, updated_at
@@ -720,7 +728,7 @@ try {
   await database.exec(`
     SELECT set_config('app.account_id', '101', true);
 
-    INSERT INTO agent_iomp_effect_intent (
+    INSERT INTO agent_iompcp_effect_intent (
       account_id, effect_id, session_id, certificate_id,
       intent_status, provider_idempotency_key, generation,
       canonical_request_hash, created_at, updated_at
@@ -737,7 +745,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        UPDATE agent_iomp_effect_intent
+        UPDATE agent_iompcp_effect_intent
         SET canonical_request_hash = repeat('7', 64)
         WHERE account_id = 101
           AND effect_id = '60000000-0000-0000-0000-000000000002';
@@ -751,7 +759,7 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        UPDATE agent_iomp_profile
+        UPDATE agent_iompcp_profile
         SET definition_hash = repeat('9', 64)
         WHERE account_id = 101
           AND profile_id = '10000000-0000-0000-0000-000000000001'
@@ -765,7 +773,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+        INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
           ${decisionValues({
             decisionId: "c0000000-0000-0000-0000-000000000001",
             ordinal: 2,
@@ -781,7 +789,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+        INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
           ${decisionValues({
             decisionId: "c0000000-0000-0000-0000-000000000002",
             ordinal: 3,
@@ -799,7 +807,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+        INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
           ${decisionValues({
             decisionId: "c0000000-0000-0000-0000-000000000003",
             ordinal: 4,
@@ -815,11 +823,11 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+        INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
           ${decisionValues({
             decisionId: "c0000000-0000-0000-0000-000000000004",
             ordinal: 5,
-            accessPath: "MEMBER_SCAN",
+            accessPath: "CARD_SCAN",
           })}
         );
       `),
@@ -832,12 +840,12 @@ try {
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
 
-        INSERT INTO agent_iomp_perception_card (
-          account_id, card_id, session_id, certificate_id, member_id,
+        INSERT INTO agent_iompcp_context_packet (
+          account_id, packet_id, session_id, certificate_id, card_id,
           membership_state, citation_state, catalog_status, metadata_trust, effect_observation,
           provider_receipt_hash, disputed_fact_hash, fact_disposition,
-          attested_key_kind, body_visibility, inlines_fact_body, card_hash,
-          card_body, created_at
+          attested_key_kind, body_visibility, inlines_fact_body, packet_hash,
+          packet_body, created_at
         ) VALUES (
           101, 'b0000000-0000-0000-0000-000000000002',
           '20000000-0000-0000-0000-000000000001',
@@ -859,7 +867,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        SELECT nominate_agent_iomp_member(
+        SELECT nominate_agent_iompcp_card(
           101,
           '20000000-0000-0000-0000-000000000001',
           '92000000-0000-0000-0000-000000000077',
@@ -875,7 +883,7 @@ try {
     () =>
       database.exec(`
         SELECT set_config('app.account_id', '101', true);
-        INSERT INTO agent_iomp_card_decision (${decisionColumns}) VALUES (
+        INSERT INTO agent_iompcp_packet_decision (${decisionColumns}) VALUES (
           ${decisionValues({
             decisionId: "c0000000-0000-0000-0000-000000000005",
             ordinal: 6,
@@ -888,7 +896,7 @@ try {
   );
 
   const tenantCount = await database.query(
-    "SELECT count(*)::int AS count FROM agent_iomp_session WHERE account_id = 101",
+    "SELECT count(*)::int AS count FROM agent_iompcp_session WHERE account_id = 101",
   );
   if (tenantCount.rows[0]?.count !== 1) {
     throw new Error("tenant-scoped fixture was not preserved");
