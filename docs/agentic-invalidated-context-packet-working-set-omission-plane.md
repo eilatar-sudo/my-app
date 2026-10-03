@@ -1,74 +1,75 @@
-# mondayDB Agentic Invalidated Omission-Member Perception Context Packet Plane
+# mondayDB Agentic Invalidated Context-Packet Working-Set Omission Plane
 
 **Status:** Proposed
 **Decision owner:** mondayDB Product and Engineering
-**Contract version:** `2026-10-02.v1`
+**Contract version:** `2026-10-03.v1`
 
 ## 1. Why this plane, before how
 
-The 2026-10-01 Invalidated Omission-Member Perception Card
-Plane can publish exactly one perception card by point
-lookup of `(account_id, member_id)`. That card repeats
-membership `OMITTED`, citation `DROPPED`, and catalog
-status `INVALIDATED` as `UNTRUSTED_METADATA`. `ACKED`
-stays an effect observation. The disputed fact stays
-`DISPUTED_HELD`. The key stays `AWAITING_CONFIRMATION`.
-The body stays off the card.
+The 2026-10-02 Invalidated Omission-Member Perception Context
+Packet Plane can attach exactly one sealed invalidated
+omission-member card to one context packet by point lookup
+of `(account_id, card_id)`. That packet repeats membership
+`OMITTED`, citation `DROPPED`, and catalog status
+`INVALIDATED` as `UNTRUSTED_METADATA`. `ACKED` stays an
+effect observation. The disputed fact stays `DISPUTED_HELD`.
+The key stays `AWAITING_CONFIRMATION`. The body stays off
+the packet.
 
-An agent still cannot carry that card into a context
-packet without a second compile. Without this plane the
-agent either:
+An agent still cannot keep that invalidated context packet
+out of the next working-set compile without a second
+compile. Without this plane the agent either:
 
-- scans perception cards, working-set members, and board
-  rows to decide which invalidated card belongs in the next
-  prompt (neighbor-harmful on boards with 1M+ rows), or
+- scans context packets, working-set members, and board
+  rows to decide which invalidated packet to drop
+  (neighbor-harmful on boards with 1M+ rows), or
 - inlines the disputed fact and reads `ACKED` as
-  `TRUSTED_ENROLLED` so the prompt "explains" the omission
-  by revealing the held fact.
+  `TRUSTED_ENROLLED` so the next working set "explains" the
+  omission by revealing the held fact.
 
-The product trade-off is **context fluency versus citation
-integrity and neighbor latency**:
+The product trade-off is **working-set fluency versus
+citation integrity and neighbor latency**:
 
-- Scanning every perception card, or copying the fact body
-  into the packet, maximizes prompt fluency and hides the
-  hold. It also puts a 1M+ row walk on the primary path
+- Scanning every context packet, or copying the fact body
+  into the next compile, maximizes prompt fluency and hides
+  the hold. It also puts a 1M+ row walk on the primary path
   and can miss the 99.99% neighbor availability target.
-- Attaching exactly one sealed invalidated omission-member
-  card to one context packet by point lookup of
-  `(account_id, card_id)` adds one bounded compile
-  transaction. The packet may repeat membership `OMITTED`,
-  citation `DROPPED`, and catalog status `INVALIDATED` as
-  `UNTRUSTED_METADATA`. `ACKED` stays an effect
-  observation. The disputed fact stays `DISPUTED_HELD`.
-  The key stays `AWAITING_CONFIRMATION`. The body stays
-  `OMITTED`. Silence stays `UNKNOWN_EFFECT`.
-- Semantic similarity may discover attach profiles, but it
-  must never decide whether a card may be nominated,
-  metadata bound, a packet evaluated, a packet sealed, a
-  packet attached, or a consumer notified.
+- Omitting exactly one sealed invalidated context packet
+  from the next working-set compile by point lookup of
+  `(account_id, packet_id)` adds one bounded compile
+  transaction. Membership stays `OMITTED`. Citation stays
+  `DROPPED`. Catalog status stays `INVALIDATED` as
+  `UNTRUSTED_METADATA`. `ACKED` stays an effect observation.
+  The disputed fact stays `DISPUTED_HELD`. The key stays
+  `AWAITING_CONFIRMATION`. The body stays `OMITTED`. Silence
+  stays `UNKNOWN_EFFECT`.
+- Semantic similarity may discover omit profiles, but it
+  must never decide whether a packet may be nominated,
+  metadata bound, an omission evaluated, an omission sealed,
+  a working-set member written, or a consumer notified.
 
 Latency stays on the primary key. Consistency is the sealed
-packet row inside one ACID transaction, not an eventually
-consistent guess that an omitted card "probably belongs in
-the prompt." Neighbor availability stays at the 99.99%
-target because an unscoped card walk is **FULL SCAN
-REJECTED** before it touches a board.
+omission row inside one ACID transaction, not an eventually
+consistent guess that an invalidated packet "probably
+should stay in the prompt." Neighbor availability stays at
+the 99.99% target because an unscoped context-packet walk
+is **FULL SCAN REJECTED** before it touches a board.
 
 The recommended model keeps the data plane deterministic:
 
-1. An approved attach profile is procedural memory for
-   "how one sealed invalidated omission-member perception
-   card is attached to one context packet." A profile
-   **never** inlines a fact body, **never** rewrites
-   `ACKED` as `TRUSTED_ENROLLED`, and **never** opens
-   another nested expiry plane.
+1. An approved omit profile is procedural memory for "how
+   one sealed invalidated context packet is left out of the
+   next working-set compile." A profile **never** inlines a
+   fact body, **never** rewrites `ACKED` as
+   `TRUSTED_ENROLLED`, and **never** opens another nested
+   expiry plane.
 2. A session opens under purpose, budget, and authorization
-   fences, and nominates exactly one invalidated card by
-   point lookup of `(account_id, card_id)`. Hashes and
-   catalog status are copied from the card catalog. They
-   are never computed by walking perception cards or
-   ledgers.
-3. mondayDB evaluates an attach whose outcome is a pure
+   fences, and nominates exactly one invalidated context
+   packet by point lookup of `(account_id, packet_id)`.
+   Hashes and catalog status are copied from the packet
+   catalog. They are never computed by walking context
+   packets or ledgers.
+3. mondayDB evaluates an omission whose outcome is a pure
    function of `(source_kind, access_path, gate_kind,
    gate_action, terminal_kind, placement_kind,
    key_lifecycle, clock_lifecycle, attested_key_kind,
@@ -79,28 +80,29 @@ The recommended model keeps the data plane deterministic:
    silence_inferred, inlines_fact_body, opens_nested_expiry,
    hop_count)`. `ACKED` cannot become trust. `RESTORED`
    cannot be written. A body cannot be inlined. `INCLUDED`
-   cannot be attached as if the citation were live. A
+   cannot be compiled as if the citation were live. A
    catalog status other than `INVALIDATED` cannot be
-   attached by this plane.
+   omitted by this plane.
 4. Sealing binds `consumer_ref + purpose_hash +
    prior_clock_hash + successor_clock_hash +
    disputed_fact_hash + provider_receipt_hash +
    halt_scope_hash + attenuation_hash + decision_set_hash +
-   packet_steward_a + packet_steward_b`. The packet
-   **must not** emit a fact body and **must not** emit
-   `TRUSTED_ENROLLED`. Packet stewards are distinct from
-   each other and from the prior card stewards who sealed
-   the source card, and from both prior omission stewards,
-   both prior compiler stewards, both perception stewards,
-   both receipt stewards, both prior gate stewards, and
-   both prior extension stewards.
-5. Attaching the packet is a second point lookup of the
-   same `(account_id, card_id)` plus `(account_id,
-   packet_id)`. Notify intents may become `UNKNOWN_EFFECT`
+   omission_steward_a + omission_steward_b`. The working-set
+   member **must not** emit a fact body and **must not**
+   emit `TRUSTED_ENROLLED`. Omission stewards are distinct
+   from each other and from both prior packet stewards who
+   sealed the source context packet, and from both prior
+   card stewards, both prior omission stewards, both prior
+   compiler stewards, both perception stewards, both
+   receipt stewards, both prior gate stewards, and both
+   prior extension stewards.
+5. Recording the omission is a second point lookup of the
+   same `(account_id, packet_id)` plus `(account_id,
+   member_id)`. Notify intents may become `UNKNOWN_EFFECT`
    until acknowledged. A notify acknowledgement is not
    enrollment, not a fact restore, and not permission to
    put the citation back.
-6. Unscoped card-catalog, perception-card, working-set,
+6. Unscoped packet-catalog, context-packet, working-set,
    vote-ledger, page-ledger, ack-ledger, escalation-ledger,
    containment-ledger, review-ledger, resolution-ledger,
    promotion-ledger, or board scans are **FULL SCAN
@@ -108,67 +110,66 @@ The recommended model keeps the data plane deterministic:
 
 ### Product outcome
 
-For any invalidated omission-member context packet,
+For any invalidated context-packet working-set omission,
 mondayDB can answer:
 
 - Which profile, principal, and session authorized the
-  nomination, metadata bind, evaluation, seal, packet
-  attach, or notify dispatch?
-- Which sealed invalidated card was read by primary key
-  `(account_id, card_id)`, and which membership, citation,
-  and catalog status were repeated as untrusted metadata?
-- Did the packet repeat `OMITTED`, `DROPPED`, and
-  `INVALIDATED` while `ACKED` stayed an effect observation,
-  the disputed fact stayed held, the body stayed omitted,
-  and the key stayed unconfirmed?
+  nomination, metadata bind, evaluation, seal, working-set
+  omission, or notify dispatch?
+- Which sealed invalidated context packet was read by
+  primary key `(account_id, packet_id)`, and which
+  membership, citation, and catalog status were repeated
+  as untrusted metadata?
+- Did the working-set member repeat `OMITTED`, `DROPPED`,
+  and `INVALIDATED` while `ACKED` stayed an effect
+  observation, the disputed fact stayed held, the body
+  stayed omitted, and the key stayed unconfirmed?
 - Did async notify become `UNKNOWN_EFFECT`?
-- Can the packet history be replayed without invoking an
+- Can the omission history be replayed without invoking an
   LLM?
 
 HNSW profile discovery stays account-scoped and never
-authorizes this packet.
+authorizes this omission.
 
 ## 2. Scope and ownership
 
-The Invalidated Omission-Member Perception Context Packet
-Plane owns:
+The Invalidated Context-Packet Working-Set Omission Plane
+owns:
 
-1. Immutable approved attach profiles as procedural memory
-   of "how one sealed invalidated omission-member
-   perception card is attached to one context packet
-   without inlining a disputed fact, treating `ACKED` as
-   `TRUSTED_ENROLLED`, scanning perception cards,
-   amplifying purpose, or opening another nested expiry."
-2. Tenant-scoped attach sessions with purpose and budget
-   fences, and a hard cap of one nominated card and one
-   context packet per session.
-3. Deterministic nomination of sealed invalidated cards by
-   point lookup of `(account_id, card_id)`.
-4. Deterministic untrusted metadata bindings, attach
-   records, sealed decisions, and context packets that
+1. Immutable approved omit profiles as procedural memory of
+   "how one sealed invalidated context packet is omitted
+   from the next working-set compile without inlining a
+   disputed fact, treating `ACKED` as `TRUSTED_ENROLLED`,
+   scanning context packets, amplifying purpose, or opening
+   another nested expiry."
+2. Tenant-scoped omission sessions with purpose and budget
+   fences, and a hard cap of one nominated packet and one
+   working-set member per session.
+3. Deterministic nomination of sealed invalidated context
+   packets by point lookup of `(account_id, packet_id)`.
+4. Deterministic untrusted metadata bindings, omission
+   records, sealed decisions, and working-set members that
    never invent a winner and never restore a fact.
 5. Publication records and notify intents with honest
    uncertainty.
-6. Agent perception of the sealed packet, audit replay,
-   and bounded attach budgets.
+6. Agent perception of the sealed omission, audit replay,
+   and bounded omit budgets.
 
 It integrates with, but does not replace:
 
+- **Invalidated Omission-Member Perception Context Packet
+  Plane:** supplies the sealed context packet this plane
+  may nominate by `(account_id, packet_id)`. Catalog status
+  on that packet is already `INVALIDATED`. This plane never
+  rewrites that packet and never promotes `ACKED` to
+  `TRUSTED_ENROLLED`.
 - **Invalidated Omission-Member Perception Card Plane:**
-  supplies the sealed card this plane may nominate by
-  `(account_id, card_id)`. Catalog status on that card is
-  already `INVALIDATED`. This plane never rewrites that
-  card and never promotes `ACKED` to `TRUSTED_ENROLLED`.
+  the cited card stays the source of the packet. This plane
+  never re-perceives that card and never scans cards.
 - **Invalidated Omission-Packet Working-Set Omission
-  Plane:** the cited membership stays `OMITTED`. This
-  plane never puts that member back and never rewrites the
-  member body.
-- **Perception Context Packet Plane:** the cited receipt
-  hash is copied. This plane never reattaches the dropped
-  citation and never inlines a fact body.
-- **Attestation Perception Card Plane:** the cited receipt
-  hash is copied. This plane never re-perceives that card
-  as a new attestation.
+  Plane:** the cited membership stays `OMITTED`. This plane
+  never puts that member back and never rewrites the member
+  body.
 - **Tool-Read Receipt Attestation Plane:** `ACKED` stays
   the copied effect observation. This plane never re-binds
   a provider receipt.
@@ -185,50 +186,52 @@ It integrates with, but does not replace:
 
 - Letting an LLM decide that `ACKED` "probably means the
   fact is true enough to show."
-- Discovering omitted cards by scanning a board, a
-  working-set table, a perception-card table, or a
+- Discovering invalidated context packets by scanning a
+  board, a working-set table, a context-packet table, or a
   citation-drop ledger.
 - Auto-amplifying a hop-narrowed purpose back to the donor
   purpose.
-- Reconstructing authoritative packets from columnar or
+- Reconstructing authoritative omissions from columnar or
   vector projections.
-- Cross-account perception or global nearest-neighbor
+- Cross-account omission or global nearest-neighbor
   authorization.
 - Storing raw private keys, tool payloads, or fact bodies
-  on the context packet.
+  on the working-set member.
 - Claiming distributed atomicity with external notify
   providers.
 - Promoting `AWAITING_CONFIRMATION` to `TRUSTED_ENROLLED`
-  because a packet repeated an attested receipt.
-- Putting an omitted member back by writing `ATTACHED`,
+  because an omission repeated an attested receipt.
+- Putting an omitted packet back by writing `ATTACHED`,
   `INCLUDED`, or `RESTORED`.
 - Opening another nested expiry-containment-review-
-  resolution plane from a context packet.
-- Publishing more than one packet per session.
-- Showing a `PERMANENT_QUARANTINE` body because the card
-  was attached.
+  resolution plane from a working-set omission.
+- Publishing more than one omission per session.
+- Showing a `PERMANENT_QUARANTINE` body because the packet
+  was omitted.
 
 ## 3. Product contract
 
-### 3.1 Perception profile contract
+### 3.1 Omission profile contract
 
 A profile version is immutable after approval. It defines:
 
-- allowed source kinds (`SEALED_INVALIDATED_OMISSION_MEMBER_CARD`,
+- allowed source kinds (`SEALED_INVALIDATED_CONTEXT_PACKET`,
+  `SEALED_INVALIDATED_OMISSION_MEMBER_CARD`,
   `SEALED_PERCEPTION_CARD`, `SEALED_ATTEST_CERT`,
   `SEALED_TOOL_READ_DECISION`, `SEALED_PROVIDER_RECEIPT`,
   `SEALED_EFFECT_INTENT`);
-- compile threshold (distinct packet-steward principals,
-  minimum 2), max cards per session (exactly 1), and max
-  nominated cards (exactly 1);
+- compile threshold (distinct omission-steward principals,
+  minimum 2), max packets per session (exactly 1), and max
+  nominated packets (exactly 1);
 - compile policy (`HISTORY_NEVER_REWRITTEN`,
-  `ACK_NEVER_TRUST`, `PACKET_NEVER_RESTORES_FACTS`,
-  `PACKET_NEVER_INLINES_BODY`, `PACKET_NEVER_CONFIRMS`,
-  `ONE_CARD_PER_SESSION`, `OMITTED_ONLY`,
+  `ACK_NEVER_TRUST`, `OMISSION_NEVER_RESTORES_FACTS`,
+  `OMISSION_NEVER_INLINES_BODY`, `OMISSION_NEVER_CONFIRMS`,
+  `ONE_PACKET_PER_SESSION`, `OMITTED_ONLY`,
   `POINT_LOOKUP_ONLY`, `INVALIDATED_CATALOG_ONLY`,
   `NESTED_EXPIRY_NEVER_OPENS`,
-  `CARD_NEVER_SCANNED`, `HALT_DENIES_BODY_READ`,
+  `PACKET_NEVER_SCANNED`, `HALT_DENIES_BODY_READ`,
   `QUARANTINE_BODY_NEVER_VISIBLE`,
+  `PRIOR_PACKET_STEWARDS_EXCLUDED`,
   `PRIOR_CARD_STEWARDS_EXCLUDED`,
   `PRIOR_OMISSION_STEWARDS_EXCLUDED`,
   `PRIOR_COMPILER_STEWARDS_EXCLUDED`,
@@ -238,265 +241,183 @@ A profile version is immutable after approval. It defines:
   `PRIOR_EXTENSION_STEWARDS_EXCLUDED`);
 - semantic tags and an optional procedure ref;
 - revocation policy (`ALLOW_IN_FLIGHT`,
-  `STOP_BEFORE_ATTACH`, `REQUIRE_REVIEW`).
+  `STOP_BEFORE_OMIT`, `REQUIRE_REVIEW`).
 
 Every enum label in this contract is at most 63 bytes so
 PostgreSQL `CREATE TYPE` accepts it. The longest source
-kind is `SEALED_INVALIDATED_OMISSION_MEMBER_CARD` (39
-bytes). The longest compile kind is
-`ATTACH_INVALIDATED_MEMBER_CARD` (30 bytes).
+kind is `SEALED_INVALIDATED_CONTEXT_PACKET` (34 bytes).
+The longest compile kind is
+`OMIT_INVALIDATED_CONTEXT_PACKET` (31 bytes).
 
 Approval and revocation require the authority fence
-`approve_agent_iompcp_profile` /
-`revoke_agent_iompcp_profile`. Direct `UPDATE` of a sealed
-profile or its perceive rules is rejected. Profiles must
-be inserted as `DRAFT`.
+`approve_agent_icpwso_profile` /
+`revoke_agent_icpwso_profile`, owned by
+`agent_icpwso_profile_authority`. A profile cannot be
+inserted as `APPROVED`.
 
 ### 3.2 Session and budget contract
 
-A session is scoped by `account_id` and an idempotency key.
-Budgets cover nominate, bind, seal, vector, publish, and
-notify units, plus wall-clock, compile threshold, max
-cards, and max nominated cards. Consumed units cannot
-exceed the budget. Deadline must be after creation.
-Evaluation consumes bind units. Sealing consumes seal
-units. Attaching a packet consumes publish units.
-`max_cards_per_session` and `max_nominated_cards` are both
-fixed at 1.
+A session is tenant-scoped by `account_id` and idempotent
+on `(account_id, idempotency_key)`. Budgets cap nominate,
+bind, seal, vector, publish, and notify units, plus wall
+time. `max_packets_per_session` and
+`max_nominated_packets` are both exactly 1. A second
+nomination in the same session is rejected before it can
+fan out into a recursive retrieval.
 
 ### 3.3 Nomination and metadata contract
 
-Nomination is a point lookup of `(account_id, card_id)` in
-the card catalog. `nominate_agent_iompcp_card` reads that
-primary key and copies membership `OMITTED`, citation
-`DROPPED`, catalog status `INVALIDATED`, the receipt hash,
-and the effect observation. It does not store a fact body.
-`access_path` on the nomination is `POINT_LOOKUP`.
-`CARD_SCAN` and `LEDGER_SCAN` are rejected. A null card id
-is **FULL SCAN REJECTED**.
+Nomination is `nominate_agent_icpwso_packet(account_id,
+session_id, packet_id, nomination_id, nomination_hash)`.
+A null `packet_id` is **FULL SCAN REJECTED**. The catalog
+row must already be `SEALED_INVALIDATED_CONTEXT_PACKET`,
+citation `DROPPED`, membership `OMITTED`, status
+`DROPPED`, and catalog status `INVALIDATED`. `ACKED` is
+accepted only with `receipt_disposition = ATTESTED` and
+`silence_inferred = false`. `TRUSTED_ENROLLED` and
+`inlines_fact_body` are rejected at nomination. Metadata
+bindings are append-only and `UNTRUSTED_METADATA`.
 
-Nomination succeeds only when the catalog membership is
-`OMITTED`, the catalog citation is `DROPPED`, the catalog
-status is `INVALIDATED`, the source kind is
-`SEALED_INVALIDATED_OMISSION_MEMBER_CARD`, and the key is
-still `AWAITING_CONFIRMATION`. An `INCLUDED` or `ATTACHED`
-card cannot be nominated. A card whose catalog status is
-anything other than `INVALIDATED` cannot be nominated.
-That would hide a live citation, or invent an invalidation
-the upstream perception card did not seal.
+### 3.4 Omission decision and working-set contract
 
-A metadata binding is append-only. It may repeat
-membership, citation, catalog status, the receipt hash,
-and the effect observation already on the catalog row,
-tagged `UNTRUSTED_METADATA`. It never walks cards, never
-inlines a body, and never moves the clock.
+`OMIT_INVALIDATED_CONTEXT_PACKET` is the only compile kind
+that writes a working-set omission. It requires:
 
-### 3.4 Packet decision and context-packet contract
+- `source_kind = SEALED_INVALIDATED_CONTEXT_PACKET`;
+- `access_path = POINT_LOOKUP` (`PACKET_SCAN` and
+  `LEDGER_SCAN` are **FULL SCAN REJECTED**);
+- `gate_kind = ALLOW_TOOL_READ` and
+  `gate_action = TOOL_READ` (`TOOL_MUTATE` is rejected);
+- `perceive_kind = PERCEIVE_ATTESTED_RECEIPT`;
+- `placement_kind = EXTENDED_HALT`;
+- `terminal_kind = REQUIRE_HUMAN`;
+- `key_lifecycle = FIRST_ENROLLMENT` and
+  `attested_key_kind = AWAITING_CONFIRMATION`;
+- `clock_lifecycle = ATTESTED` and
+  `clock_disposition = REARMED`, with the successor clock
+  hash distinct from the prior clock hash;
+- `receipt_disposition = ATTESTED`,
+  `effect_observation = ACKED`, and
+  `silence_inferred = false`;
+- `purpose_relation = NARROWS` (not `AMPLIFIES`);
+- `body_visibility = OMITTED`,
+  `fact_disposition = DISPUTED_HELD`,
+  `membership_state = OMITTED`,
+  `citation_state = DROPPED`,
+  `catalog_status = INVALIDATED`,
+  `metadata_trust = UNTRUSTED_METADATA`;
+- `inlines_fact_body = false` and
+  `opens_nested_expiry = false`;
+- the provider receipt hash distinct from the disputed
+  fact hash.
 
-A sealed attach certificate names two distinct packet
-stewards, both prior card stewards, both prior omission
-stewards, both prior compiler stewards, both perception
-stewards, both receipt stewards, both prior gate
-stewards, and both prior extension stewards. A packet
-steward who matches a prior card steward, a prior omission
-steward, a prior compiler, a perception steward, a receipt
-steward, a gate steward, or an extension steward is
-rejected. An attach decision records:
-
-- `compile_kind`: `ATTACH_INVALIDATED_MEMBER_CARD` is the
-  only attach success; `HOLD_UNKNOWN_EFFECT`,
-  `DENY_PACKET_AS_TRUST`, `DENY_PACKET_AS_RESTORE`,
-  `DENY_BODY_INLINE`, `DENY_ACK_AS_TRUST`,
-  `DENY_CARD_SCAN`, `DENY_NESTED_EXPIRY`, `SKIP`, and
-  `UNKNOWN_EFFECT` never place a fact body;
-- `membership_state`: `OMITTED` on success; `INCLUDED` is
-  rejected because attach must not put the member back;
-- `citation_state`: `DROPPED` on success, matching the
-  catalog; writing `ATTACHED` would reattach the citation;
-- `metadata_trust`: `UNTRUSTED_METADATA` only;
-- `catalog_status`: `INVALIDATED` on success; any other
-  catalog status is rejected because this plane attaches
-  only an already-invalidated omission card;
-- `fact_disposition`: `DISPUTED_HELD`, `HALTED`, or
-  `QUARANTINE_OMITTED` (never `RESTORED`);
-- `body_visibility`: `OMITTED` on success (never
-  `BODY_VISIBLE`);
-- `clock_disposition`: `REARMED` is required for
-  `ATTACH_INVALIDATED_MEMBER_CARD`, and the successor clock
-  hash must differ from the prior clock hash;
-- `receipt_disposition`: `ATTESTED` is required when the
-  cited effect is `ACKED`;
-- `effect_observation`: the only success citation is
-  `ACKED`, and it stays an observation;
-- `attested_key_kind`: must not be `TRUSTED_ENROLLED` or
-  `TRUSTED_WITHIN_SKEW`;
-- `access_path`: `POINT_LOOKUP` (never `CARD_SCAN` or
-  `LEDGER_SCAN`);
-- `opens_nested_expiry`: must be false;
-- `inlines_fact_body`: must be false;
-- `provider_receipt_hash`: must differ from
-  `disputed_fact_hash`.
-
-There is no fact-body column and no `resolved_fact_hash`
-column. `ATTACH_INVALIDATED_MEMBER_CARD` requires
-`SEALED_INVALIDATED_OMISSION_MEMBER_CARD`, `POINT_LOOKUP`,
-`PERCEIVE_ATTESTED_RECEIPT`, `ALLOW_TOOL_READ`,
-`TOOL_READ`, `OMITTED` membership, `OMITTED` body
-visibility, `DISPUTED_HELD`, `EXTENDED_HALT`,
-`REQUIRE_HUMAN`, `NARROWS`, `AWAITING_CONFIRMATION`,
-`UNTRUSTED_METADATA`, `DROPPED`, and a non-silent `ACKED`
-receipt whose hash differs from the disputed fact hash.
-The catalog citation must still be `DROPPED` and the
-catalog membership must still be `OMITTED`. The catalog
-status must still be `INVALIDATED`.
-
-The context packet is what an agent reads. It stores
-membership `OMITTED`, citation `DROPPED`, catalog status
-`INVALIDATED`, the effect observation, the receipt hash,
-and the disputed-fact hash as separate untrusted metadata.
-The card row's citation-aligned `status` stays `DROPPED`.
-`catalog_status` is the upstream packet catalog status,
-copied by point lookup and not recomputed. `packet_body`
-must not contain `factBody`, `fact_body`, or
-`resolvedFactHash`. The packet is sealed at insert.
-Attach does not rewrite the upstream card body, does not
-move the citation back to `ATTACHED`, and does not rewrite
-catalog status.
+The working-set member repeats those states in
+`member_body` and rejects `factBody`, `fact_body`, and
+`resolvedFactHash`. Omission stewards on the certificate
+must differ from `prior_packet_steward_a/b` and from every
+prior steward pair copied from the source packet.
 
 ### 3.5 Notify and publication contract
 
-Notify intents start as `PREPARED`. Identity columns are
-immutable after insert. A missing or ambiguous provider
-response is `UNKNOWN_EFFECT`. `ACKED` on a notify intent
-means the notifier accepted the packet notice. It does not
-rewrite `effect_observation`, restore a fact, or include
-the member in a working set.
-
-`attach_agent_iompcp_packet` is the writer that appends a
-publication record. It point-looks up `(account_id,
-card_id)` and the sealed packet. It requires catalog
-membership `OMITTED`, catalog citation `DROPPED`, and
-catalog status `INVALIDATED`. A publication does not
-delete the historical receipt hash. It does not inline a
-fact. It does not promote the key.
+`omit_agent_icpwso_working_set` point-looks up
+`(account_id, packet_id)` and `(account_id, member_id)`
+and appends one publication with reason
+`INVALIDATED_CONTEXT_PACKET_OMITTED`. Effect intents start
+as `PREPARED`. Provider silence stays `UNKNOWN_EFFECT`.
+An acknowledgement does not enroll a key, restore a fact,
+or put the citation back.
 
 ## 4. Deterministic invariants
 
-1. Every row and every access index leads with
-   `account_id`.
-2. Profiles enter as `DRAFT` and leave `DRAFT` only through
-   the approval or revocation authority fence.
-3. Packet stewards are distinct from each other, from both
-   prior card stewards, from both prior omission stewards,
-   from both prior compiler stewards, from both perception
-   stewards, from both receipt stewards, from both prior
-   gate stewards, and from both prior extension stewards.
-4. A session nominates at most one card and seals at most
-   one context packet.
-5. `ACKED` on an attach decision requires
-   `receipt_disposition = ATTESTED` and
-   `silence_inferred = false`. `ACKED` does not write
-   `TRUSTED_ENROLLED`.
-6. `TRUSTED_ENROLLED` and `TRUSTED_WITHIN_SKEW` are
-   rejected on the decision and on the packet.
-7. `RESTORED`, `BODY_VISIBLE`, and `INCLUDED` are rejected.
-   A packet is not a fact restore and not a reattach.
-8. `inlines_fact_body` is false. `packet_body` cannot carry
-   a fact body.
-9. `TOOL_MUTATE` is rejected. `CARD_SCAN` and
-   `LEDGER_SCAN` are rejected.
-10. `opens_nested_expiry` must be false. This plane does
-    not start another expiry cycle.
-11. Purpose `AMPLIFIES` is rejected. After a hop, the
-    requested purpose hash must differ from the donor
-    purpose hash.
-12. The provider receipt hash must differ from the disputed
-    fact hash.
-13. `ATTACH_INVALIDATED_MEMBER_CARD` is legal only when the
-    catalog membership is `OMITTED`, the catalog citation
-    is `DROPPED`, and the catalog status is `INVALIDATED`.
-    An `INCLUDED` card is not attached by this plane. A
-    dropped card whose catalog status is not `INVALIDATED`
-    is not attached by this plane.
-14. Metadata trust is `UNTRUSTED_METADATA`. Membership
-    `OMITTED`, citation `DROPPED`, and catalog status
-    `INVALIDATED` are repeated only as that untrusted
-    metadata.
-15. Unscoped catalog or board access is **FULL SCAN
-    REJECTED**.
+1. Every row is scoped by `account_id`. RLS policy
+   `tenant_isolation` is forced on every table.
+2. Nomination and omission use point lookup only. A missing
+   `account_id` or `packet_id` is **FULL SCAN REJECTED**.
+3. `ACKED` is an effect observation. It never writes
+   `TRUSTED_ENROLLED` or `TRUSTED_WITHIN_SKEW`.
+4. `RESTORED`, `INCLUDED`, `ATTACHED`, and `BODY_VISIBLE`
+   are rejected on this plane.
+5. `member_body` never contains a fact body.
+6. Catalog status `INVALIDATED` is copied from the packet
+   catalog. A `LIVE` catalog cannot be omitted here.
+7. `opens_nested_expiry` is rejected. This plane does not
+   start another expiry, containment, review, or resolution
+   cycle.
+8. `PACKET_SCAN` and `LEDGER_SCAN` are rejected.
+9. Purpose `AMPLIFIES` is rejected. After a hop, the
+   requested purpose hash must differ from the donor
+   purpose hash.
+10. Omission stewards are distinct from each other and from
+    prior packet, card, omission, compiler, perception,
+    receipt, gate, and extension stewards.
+11. Profile approval and revocation go through the
+    authority fence. Sealed profiles and sealed omit rules
+    are immutable.
+12. Decision identity, certificate identity, catalog
+    identity, and metadata bindings are append-only.
+13. One session nominates one packet and writes one
+    working-set member.
+14. Silence is not `ACKED`. A receipt hash is not a fact
+    hash.
+15. The database engine stays deterministic. Agents above
+    it may be probabilistic. Similarity never nominates.
 
 ## 5. Execution model
 
-Open, nominate, bind, evaluate, seal, attach, and
-effect-prepare each run in one ACID row-store transaction
-with session compare-and-swap. Packet seal never joins a
-neighbor board write, never updates the disputed fact, and
-never rewrites the successor clock, the attested key, or
-the upstream card body.
+The row store is the authority. Columnar projections and
+pgvector embeddings are derived. The omit compile reads one
+packet-catalog row by primary key and writes one decision
+plus one working-set member in the same transaction.
+Publication is a second point lookup that appends history
+without rewriting the member. Notify dispatch is outside
+the ACID boundary and starts at `PREPARED`.
 
-Columnar synopses may count attached, held, unknown, and
-denied packets for an account. They are not authoritative.
-Vector search discovers profile tags inside an
-account-owned partition. It never returns a fact body and
-never authorizes seal.
-
-External notify providers are outside the ACID boundary.
-Until a notify receipt is bound, the notify observation
-remains `UNKNOWN_EFFECT`. That uncertainty does not change
-the cited tool-read effect and does not include the
-omitted member.
+An agent perceives the working-set member, not the fact.
+The member is procedural evidence that one invalidated
+context packet was left out of the next compile.
 
 ## 6. Lifecycle
 
 ### 6.1 Draft and approve
 
-A steward inserts a `DRAFT` profile and at least one
-dual-control perceive rule. Approval checks the definition
-hash and rule count, then sets `APPROVED` through
-`approve_agent_iompcp_profile`.
+A profile is inserted as `DRAFT` with at least one
+dual-control omit rule. `approve_agent_icpwso_profile`
+checks the definition hash and sets `app.icpwso_profile_approval`
+before the status becomes `APPROVED`.
 
 ### 6.2 Open and nominate
 
-A session opens under an approved profile. Nomination
-calls `nominate_agent_iompcp_card`, which copies one catalog
-row by primary key `(account_id, card_id)`. It does not
-filter the catalog by similarity and it does not scan
-boards. A card whose membership is still `INCLUDED`, or
-whose citation is still `ATTACHED`, is rejected. A card
-whose catalog status is not `INVALIDATED` is rejected.
+A session opens under an approved profile.
+`nominate_agent_icpwso_packet` point-looks up
+`(account_id, packet_id)`. Live, included, or
+non-invalidated packets are rejected. A null key is
+**FULL SCAN REJECTED**.
 
 ### 6.3 Bind and evaluate
 
-Bind appends an untrusted metadata candidate. Evaluate
-emits an attach decision. Silence evaluates to
-`HOLD_UNKNOWN_EFFECT` or `DENY_ACK_AS_TRUST`, never to
-`ATTACH_INVALIDATED_MEMBER_CARD`. An included card cannot
-be attached as omitted. A card scan cannot be evaluated
-into success.
+Metadata binding copies the receipt hash, the disputed
+fact hash, and `ACKED` as `UNTRUSTED_METADATA`. Evaluation
+is a pure function of the sealed inputs. It cannot inline
+a body or open a nested expiry.
 
 ### 6.4 Seal
 
-Seal writes the attach certificate, the decision, and the
-context packet in the same transaction. Stewards who
-sealed the source card, omitted the member, compiled the
-upstream packet, perceived the prior card, attested the
-receipt, gated the citation, or extended the clock cannot
-seal this packet.
+Dual-control omission stewards seal the certificate.
+Prior packet stewards are excluded. The decision row
+`OMIT_INVALIDATED_CONTEXT_PACKET` and the working-set
+member commit together.
 
-### 6.5 Publish and notify
+### 6.5 Record and notify
 
-`attach_agent_iompcp_packet` appends a reason
-(`INVALIDATED_MEMBER_CARD_ATTACHED`, `RETRACTED`,
-`QUARANTINED`, `KEY_REVOKED`) after a second point lookup.
-Notify is prepared, then dispatched. Ambiguity becomes
-`UNKNOWN_EFFECT`. Neither step rewrites the packet body.
+`omit_agent_icpwso_working_set` appends
+`INVALIDATED_CONTEXT_PACKET_OMITTED`. Notify may remain
+`UNKNOWN_EFFECT`.
 
 ### 6.6 Close and retain
 
-Close is explicit. Audit events stay hash-chained. Profile
-embeddings may be refreshed from the approved definition.
-They are not a second source of authorization. An attached
-packet remains replayable and is not a fact restore.
+The session closes. Audit events stay hash-chained.
+Revocation with `STOP_BEFORE_OMIT` blocks new nominations.
+In-flight sealed omissions remain replayable.
 
 ## 7. TypeScript contracts
 
@@ -504,18 +425,18 @@ packet remains replayable and is not a fact restore.
 type AccountId = number & { readonly brand: "AccountId" };
 type ProfileId = string & { readonly brand: "ProfileId" };
 type SessionId = string & { readonly brand: "SessionId" };
-type CardId = string & { readonly brand: "CardId" };
+type PacketId = string & { readonly brand: "PacketId" };
 type CompileId = string & { readonly brand: "CompileId" };
 type CertificateId = string & { readonly brand: "CertificateId" };
 type DecisionId = string & { readonly brand: "DecisionId" };
-type PacketId = string & { readonly brand: "PacketId" };
+type MemberId = string & { readonly brand: "MemberId" };
 type MetadataBindingId = string & { readonly brand: "MetadataBindingId" };
 type ConsumerRef = string & { readonly brand: "ConsumerRef" };
 type Sha256 = string & { readonly brand: "Sha256" };
 type Timestamp = string & { readonly brand: "Timestamp" };
 
 type TrustedNextAction =
-  | "NOMINATE_INVALIDATED_MEMBER_CARD"
+  | "NOMINATE_INVALIDATED_CONTEXT_PACKET"
   | "BIND_UNTRUSTED_METADATA"
   | "EVALUATE_INVALIDATED_PERCEPTION"
   | "SEAL_INVALIDATED_PERCEPTION"
@@ -524,12 +445,12 @@ type TrustedNextAction =
   | "PERCEPTION_NOTIFY_UNCERTAINTY"
   | "CLOSE_SESSION";
 
-type InvalidatedMemberContextPacketBlockedReason =
+type InvalidatedContextPacketOmissionBlockedReason =
   | "PROFILE_INACTIVE"
   | "PURPOSE_DENIED"
   | "ATTENUATION_DENIED"
   | "BUDGET_EXHAUSTED"
-  | "CARD_MISSING"
+  | "PACKET_MISSING"
   | "METADATA_NOT_READY"
   | "HISTORY_REWRITE_DENIED"
   | "PACKET_AS_TRUST_DENIED"
@@ -543,7 +464,7 @@ type InvalidatedMemberContextPacketBlockedReason =
   | "QUARANTINE_LEAK_DENIED"
   | "NESTED_EXPIRY_DENIED"
   | "PRIOR_STEWARD_EXCLUSION_DENIED"
-  | "CARD_SCAN_DENIED"
+  | "PACKET_SCAN_DENIED"
   | "PURPOSE_AMPLIFICATION_DENIED"
   | "PACKET_AS_FACT_DENIED"
   | "HOP_LEAK_DENIED"
@@ -583,14 +504,14 @@ type MemberStatus =
   | "UNKNOWN_EFFECT";
 
 type SourceKind =
-  | "SEALED_INVALIDATED_OMISSION_MEMBER_CARD"
+  | "SEALED_INVALIDATED_CONTEXT_PACKET"
   | "SEALED_PERCEPTION_CARD"
   | "SEALED_ATTEST_CERT"
   | "SEALED_TOOL_READ_DECISION"
   | "SEALED_PROVIDER_RECEIPT"
   | "SEALED_EFFECT_INTENT";
 
-type AccessPath = "POINT_LOOKUP" | "CARD_SCAN" | "LEDGER_SCAN";
+type AccessPath = "POINT_LOOKUP" | "PACKET_SCAN" | "LEDGER_SCAN";
 
 type PlacementKind =
   | "HALTED"
@@ -642,19 +563,19 @@ type PerceiveKind =
   | "PERCEIVE_ATTESTED_RECEIPT"
   | "HOLD_UNKNOWN_EFFECT"
   | "DENY_SILENCE_AS_ACK"
-  | "DENY_PACKET_AS_RESTORE"
+  | "DENY_OMISSION_AS_RESTORE"
   | "DENY_ACK_AS_TRUST"
   | "SKIP"
   | "UNKNOWN_EFFECT";
 
 type CompileKind =
-  | "ATTACH_INVALIDATED_MEMBER_CARD"
+  | "OMIT_INVALIDATED_CONTEXT_PACKET"
   | "HOLD_UNKNOWN_EFFECT"
-  | "DENY_PACKET_AS_TRUST"
-  | "DENY_PACKET_AS_RESTORE"
+  | "DENY_OMISSION_AS_TRUST"
+  | "DENY_OMISSION_AS_RESTORE"
   | "DENY_BODY_INLINE"
   | "DENY_ACK_AS_TRUST"
-  | "DENY_CARD_SCAN"
+  | "DENY_PACKET_SCAN"
   | "DENY_NESTED_EXPIRY"
   | "SKIP"
   | "UNKNOWN_EFFECT";
@@ -691,7 +612,7 @@ type SourceCatalogStatus = "INVALIDATED" | "ATTACHED" | "LIVE" | "UNKNOWN_EFFECT
 
 type EffectIntentStatus = "PREPARED" | "DISPATCHED" | "ACKED" | "FAILED" | "UNKNOWN_EFFECT";
 
-interface InvalidatedMemberContextPacketBudget {
+interface InvalidatedContextPacketOmissionBudget {
   readonly nominateUnits: number;
   readonly bindUnits: number;
   readonly sealUnits: number;
@@ -700,11 +621,11 @@ interface InvalidatedMemberContextPacketBudget {
   readonly notifyUnits: number;
   readonly maxWallTimeMs: number;
   readonly compileThreshold: number;
-  readonly maxCardsPerSession: 1;
-  readonly maxNominatedCards: 1;
+  readonly maxPacketsPerSession: 1;
+  readonly maxNominatedPackets: 1;
 }
 
-interface InvalidatedMemberContextPacketProfile {
+interface InvalidatedContextPacketOmissionProfile {
   readonly accountId: AccountId;
   readonly profileId: ProfileId;
   readonly profileVersion: number;
@@ -712,13 +633,13 @@ interface InvalidatedMemberContextPacketProfile {
   readonly status: ProfileStatus;
   readonly definitionHash: Sha256;
   readonly compileThreshold: number;
-  readonly maxCardsPerSession: 1;
-  readonly maxNominatedCards: 1;
+  readonly maxPacketsPerSession: 1;
+  readonly maxNominatedPackets: 1;
   readonly semanticTags: readonly string[];
   readonly procedureRef: string | null;
 }
 
-interface InvalidatedMemberContextPacketSession {
+interface InvalidatedContextPacketOmissionSession {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly profileId: ProfileId;
@@ -726,19 +647,19 @@ interface InvalidatedMemberContextPacketSession {
   readonly status: SessionStatus;
   readonly stateRevision: bigint;
   readonly purpose: string;
-  readonly budget: InvalidatedMemberContextPacketBudget;
+  readonly budget: InvalidatedContextPacketOmissionBudget;
   readonly consumed: Omit<
-    InvalidatedMemberContextPacketBudget,
-    "maxWallTimeMs" | "compileThreshold" | "maxCardsPerSession" | "maxNominatedCards"
+    InvalidatedContextPacketOmissionBudget,
+    "maxWallTimeMs" | "compileThreshold" | "maxPacketsPerSession" | "maxNominatedPackets"
   >;
   readonly principalId: string;
   readonly deadlineAt: Timestamp;
 }
 
-interface InvalidatedMemberCardNominationReceipt {
+interface InvalidatedContextPacketNominationReceipt {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly sourceKind: SourceKind;
   readonly accessPath: AccessPath;
   readonly gateKind: GateKind;
@@ -758,7 +679,7 @@ interface UntrustedInvalidatedMetadataBinding {
   readonly accountId: AccountId;
   readonly metadataBindingId: MetadataBindingId;
   readonly sessionId: SessionId;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly providerReceiptHash: Sha256;
   readonly effectObservation: EffectObservation;
   readonly metadataTrust: MetadataTrust;
@@ -766,11 +687,11 @@ interface UntrustedInvalidatedMetadataBinding {
   readonly capturedAt: Timestamp;
 }
 
-interface InvalidatedMemberContextPacketCompileRecord {
+interface InvalidatedContextPacketOmissionCompileRecord {
   readonly accountId: AccountId;
   readonly compileId: CompileId;
   readonly sessionId: SessionId;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly priorClockHash: Sha256;
   readonly successorClockHash: Sha256;
   readonly disputedFactHash: Sha256;
@@ -782,12 +703,12 @@ interface InvalidatedMemberContextPacketCompileRecord {
   readonly compiledAt: Timestamp;
 }
 
-interface InvalidatedMemberContextPacketDecision {
+interface InvalidatedContextPacketOmissionDecision {
   readonly accountId: AccountId;
   readonly decisionId: DecisionId;
   readonly certificateId: CertificateId;
   readonly sessionId: SessionId;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly sourceKind: SourceKind;
   readonly decisionOrdinal: number;
   readonly status: MemberStatus;
@@ -821,7 +742,7 @@ interface InvalidatedMemberContextPacketDecision {
   readonly sealedAt: Timestamp;
 }
 
-interface InvalidatedMemberContextPacketCertificate {
+interface InvalidatedContextPacketOmissionCertificate {
   readonly accountId: AccountId;
   readonly certificateId: CertificateId;
   readonly sessionId: SessionId;
@@ -835,8 +756,8 @@ interface InvalidatedMemberContextPacketCertificate {
   readonly haltScopeHash: Sha256;
   readonly attenuationHash: Sha256;
   readonly decisionSetHash: Sha256;
-  readonly packetStewardA: string;
-  readonly packetStewardB: string;
+  readonly omissionStewardA: string;
+  readonly omissionStewardB: string;
   readonly priorCompilerStewardA: string;
   readonly priorCompilerStewardB: string;
   readonly perceptionStewardA: string;
@@ -851,6 +772,8 @@ interface InvalidatedMemberContextPacketCertificate {
   readonly priorOmissionStewardB: string;
   readonly priorCardStewardA: string;
   readonly priorCardStewardB: string;
+  readonly priorPacketStewardA: string;
+  readonly priorPacketStewardB: string;
   readonly decisionWatermark: number;
   readonly sealedAt: Timestamp;
 }
@@ -863,11 +786,11 @@ interface InvalidatedNotifyObservation {
   readonly lastErrorCode: string | null;
 }
 
-interface AgentInvalidatedMemberContextPacket {
+interface AgentInvalidatedContextPacketOmission {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
+  readonly memberId: MemberId;
   readonly packetId: PacketId;
-  readonly cardId: CardId;
   readonly status: SessionStatus;
   readonly summary: UntrustedText;
   readonly membershipState: MembershipState;
@@ -892,50 +815,48 @@ interface AgentInvalidatedMemberContextPacket {
   readonly packetScanDeniedCount: number;
   readonly uncertainNotifyIntents: readonly InvalidatedNotifyObservation[];
   readonly remainingBudget: Omit<
-    InvalidatedMemberContextPacketBudget,
-    "maxWallTimeMs" | "compileThreshold" | "maxCardsPerSession" | "maxNominatedCards"
+    InvalidatedContextPacketOmissionBudget,
+    "maxWallTimeMs" | "compileThreshold" | "maxPacketsPerSession" | "maxNominatedPackets"
   >;
   readonly procedureTags: readonly string[];
   readonly allowedNextActions: readonly TrustedNextAction[];
-  readonly blockedReasons: readonly InvalidatedMemberContextPacketBlockedReason[];
-  readonly packetHash: Sha256;
+  readonly blockedReasons: readonly InvalidatedContextPacketOmissionBlockedReason[];
+  readonly memberHash: Sha256;
 }
 ```
 
-Mutation contracts keep transition decisions deterministic and explicit:
-
 ```ts
-interface CreateInvalidatedMemberContextPacketSessionInput {
+interface CreateInvalidatedContextPacketOmissionSessionInput {
   readonly accountId: AccountId;
   readonly profileId: ProfileId;
   readonly profileVersion: number;
   readonly purpose: string;
   readonly idempotencyKey: string;
-  readonly budget: InvalidatedMemberContextPacketBudget;
+  readonly budget: InvalidatedContextPacketOmissionBudget;
 }
 
-interface NominateInvalidatedMemberCardInput {
+interface NominateInvalidatedContextPacketInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly expectedDisputedFactHash: Sha256;
   readonly expectedProviderReceiptHash: Sha256;
   readonly idempotencyKey: string;
 }
 
-interface BindInvalidatedMemberContextPacketMetadataInput {
+interface BindInvalidatedContextPacketOmissionMetadataInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
-  readonly cardId: CardId;
+  readonly packetId: PacketId;
   readonly providerReceiptHash: Sha256;
   readonly effectObservation: EffectObservation;
   readonly silenceInferred: boolean;
   readonly idempotencyKey: string;
 }
 
-interface EvaluateInvalidatedMemberContextPacketInput {
+interface EvaluateInvalidatedContextPacketOmissionInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
@@ -944,29 +865,29 @@ interface EvaluateInvalidatedMemberContextPacketInput {
   readonly idempotencyKey: string;
 }
 
-interface SealInvalidatedMemberContextPacketInput {
+interface SealInvalidatedContextPacketOmissionInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
   readonly compileId: CompileId;
   readonly consumerRef: ConsumerRef;
-  readonly packetStewardA: string;
-  readonly packetStewardB: string;
+  readonly omissionStewardA: string;
+  readonly omissionStewardB: string;
   readonly expectedDisputedFactHash: Sha256;
   readonly idempotencyKey: string;
 }
 
-interface RecordInvalidatedMemberContextPacketInput {
+interface RecordInvalidatedContextPacketOmissionInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
-  readonly cardId: CardId;
   readonly packetId: PacketId;
-  readonly reasonCode: "INVALIDATED_MEMBER_CARD_ATTACHED" | "RETRACTED" | "QUARANTINED" | "KEY_REVOKED";
+  readonly memberId: MemberId;
+  readonly reasonCode: "INVALIDATED_CONTEXT_PACKET_OMITTED" | "RETRACTED" | "QUARANTINED" | "KEY_REVOKED";
   readonly idempotencyKey: string;
 }
 
-interface PrepareInvalidatedMemberContextPacketNotifyInput {
+interface PrepareInvalidatedContextPacketOmissionNotifyInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
@@ -983,38 +904,38 @@ interface InvalidatedNotifyUncertaintyInput {
   readonly idempotencyKey: string;
 }
 
-interface CloseInvalidatedMemberContextPacketSessionInput {
+interface CloseInvalidatedContextPacketOmissionSessionInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
   readonly idempotencyKey: string;
 }
 
-interface AttachInvalidatedMemberContextPacketInput {
+interface OmitInvalidatedContextPacketFromWorkingSetInput {
   readonly accountId: AccountId;
   readonly sessionId: SessionId;
   readonly expectedRevision: bigint;
   readonly idempotencyKey: string;
 }
 
-type InvalidatedMemberContextPacketDecisionResult =
+type InvalidatedContextPacketOmissionDecisionResult =
   | {
       readonly decision: "ALLOWED";
-      readonly session: InvalidatedMemberContextPacketSession;
-      readonly certificate?: InvalidatedMemberContextPacketCertificate;
-      readonly omissionDecision?: InvalidatedMemberContextPacketDecision;
-      readonly nomination?: InvalidatedMemberCardNominationReceipt;
+      readonly session: InvalidatedContextPacketOmissionSession;
+      readonly certificate?: InvalidatedContextPacketOmissionCertificate;
+      readonly omissionDecision?: InvalidatedContextPacketOmissionDecision;
+      readonly nomination?: InvalidatedContextPacketNominationReceipt;
       readonly metadata?: UntrustedInvalidatedMetadataBinding;
-      readonly compile?: InvalidatedMemberContextPacketCompileRecord;
-      readonly perception: AgentInvalidatedMemberContextPacket;
+      readonly compile?: InvalidatedContextPacketOmissionCompileRecord;
+      readonly perception: AgentInvalidatedContextPacketOmission;
       readonly auditHash: Sha256;
     }
   | {
       readonly decision: "REJECTED";
-      readonly code: InvalidatedMemberContextPacketBlockedReason;
+      readonly code: InvalidatedContextPacketOmissionBlockedReason;
       readonly retryable: boolean;
       readonly reason: string;
-      readonly perception?: AgentInvalidatedMemberContextPacket;
+      readonly perception?: AgentInvalidatedContextPacketOmission;
       readonly auditHash: Sha256;
     };
 ```
@@ -1022,98 +943,98 @@ type InvalidatedMemberContextPacketDecisionResult =
 ## 8. SQL row-store schema
 
 ```sql
-CREATE TYPE iompcp_profile_status AS ENUM ('DRAFT', 'APPROVED', 'REVOKED');
-CREATE TYPE iompcp_session_status AS ENUM (
+CREATE TYPE icpwso_profile_status AS ENUM ('DRAFT', 'APPROVED', 'REVOKED');
+CREATE TYPE icpwso_session_status AS ENUM (
   'OPEN', 'NOMINATING', 'COMPILING', 'SEALED', 'DISPATCHING',
   'CLOSED', 'EXPIRED', 'CANCELLED', 'FAILED', 'QUARANTINED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_binding_status AS ENUM (
+CREATE TYPE icpwso_binding_status AS ENUM (
   'SEALED', 'INVALIDATED', 'DISPATCHING', 'SUPERSEDED_REF', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_source_kind AS ENUM (
-  'SEALED_INVALIDATED_OMISSION_MEMBER_CARD',
+CREATE TYPE icpwso_source_kind AS ENUM (
+  'SEALED_INVALIDATED_CONTEXT_PACKET',
   'SEALED_PERCEPTION_CARD',
   'SEALED_ATTEST_CERT',
   'SEALED_TOOL_READ_DECISION',
   'SEALED_PROVIDER_RECEIPT',
   'SEALED_EFFECT_INTENT'
 );
-CREATE TYPE iompcp_access_path AS ENUM ('POINT_LOOKUP', 'CARD_SCAN', 'LEDGER_SCAN');
-CREATE TYPE iompcp_placement_kind AS ENUM (
+CREATE TYPE icpwso_access_path AS ENUM ('POINT_LOOKUP', 'PACKET_SCAN', 'LEDGER_SCAN');
+CREATE TYPE icpwso_placement_kind AS ENUM (
   'HALTED', 'EXTENDED_HALT', 'RESTORED_WITHOUT_WINNER', 'OMITTED',
   'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_key_lifecycle AS ENUM (
+CREATE TYPE icpwso_key_lifecycle AS ENUM (
   'FIRST_ENROLLMENT', 'CONFIRMED', 'MONOTONIC', 'REGRESSED',
   'INVENTED_HISTORY', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_clock_lifecycle AS ENUM (
+CREATE TYPE icpwso_clock_lifecycle AS ENUM (
   'ATTESTED', 'UNATTESTED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_attested_key_kind AS ENUM (
+CREATE TYPE icpwso_attested_key_kind AS ENUM (
   'AWAITING_CONFIRMATION', 'TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW',
   'REGRESSED', 'INVENTED_HISTORY', 'SILENCE', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_terminal_kind AS ENUM (
+CREATE TYPE icpwso_terminal_kind AS ENUM (
   'REQUIRE_HUMAN', 'PERMANENT_QUARANTINE', 'HOLD_UNKNOWN',
   'REJECT_CYCLE_CONFIRM', 'REJECT_NESTED_EXPIRY', 'SKIP',
   'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_gate_kind AS ENUM (
+CREATE TYPE icpwso_gate_kind AS ENUM (
   'ALLOW_ENVELOPE_READ', 'ALLOW_TOOL_READ', 'DENY_HALT_READ',
   'DENY_CLOCK_AS_TRUST', 'DENY_PURPOSE_AMPLIFY', 'SKIP',
   'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_gate_action AS ENUM ('READ', 'TOOL_READ', 'TOOL_MUTATE');
-CREATE TYPE iompcp_perceive_kind AS ENUM (
+CREATE TYPE icpwso_gate_action AS ENUM ('READ', 'TOOL_READ', 'TOOL_MUTATE');
+CREATE TYPE icpwso_perceive_kind AS ENUM (
   'PERCEIVE_ATTESTED_RECEIPT', 'HOLD_UNKNOWN_EFFECT', 'DENY_SILENCE_AS_ACK',
-  'DENY_PACKET_AS_RESTORE', 'DENY_ACK_AS_TRUST', 'SKIP',
+  'DENY_OMISSION_AS_RESTORE', 'DENY_ACK_AS_TRUST', 'SKIP',
   'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_compile_kind AS ENUM (
-  'ATTACH_INVALIDATED_MEMBER_CARD', 'HOLD_UNKNOWN_EFFECT', 'DENY_PACKET_AS_TRUST',
-  'DENY_PACKET_AS_RESTORE', 'DENY_BODY_INLINE', 'DENY_ACK_AS_TRUST',
-  'DENY_CARD_SCAN', 'DENY_NESTED_EXPIRY', 'SKIP', 'UNKNOWN_EFFECT'
+CREATE TYPE icpwso_compile_kind AS ENUM (
+  'OMIT_INVALIDATED_CONTEXT_PACKET', 'HOLD_UNKNOWN_EFFECT', 'DENY_OMISSION_AS_TRUST',
+  'DENY_OMISSION_AS_RESTORE', 'DENY_BODY_INLINE', 'DENY_ACK_AS_TRUST',
+  'DENY_PACKET_SCAN', 'DENY_NESTED_EXPIRY', 'SKIP', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_body_visibility AS ENUM (
+CREATE TYPE icpwso_body_visibility AS ENUM (
   'ENVELOPE_ONLY', 'BODY_VISIBLE', 'OMITTED'
 );
-CREATE TYPE iompcp_fact_disposition AS ENUM (
+CREATE TYPE icpwso_fact_disposition AS ENUM (
   'DISPUTED_HELD', 'HALTED', 'QUARANTINE_OMITTED', 'RESTORED',
   'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_clock_disposition AS ENUM (
+CREATE TYPE icpwso_clock_disposition AS ENUM (
   'REARMED', 'UNCHANGED', 'REGRESSED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_receipt_disposition AS ENUM (
+CREATE TYPE icpwso_receipt_disposition AS ENUM (
   'UNBOUND', 'ATTESTED', 'SILENCE', 'REJECTED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_effect_observation AS ENUM (
+CREATE TYPE icpwso_effect_observation AS ENUM (
   'ACKED', 'FAILED', 'DISPATCHED', 'SILENCE', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_purpose_relation AS ENUM (
+CREATE TYPE icpwso_purpose_relation AS ENUM (
   'EQUAL', 'NARROWS', 'AMPLIFIES', 'UNRELATED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_citation_state AS ENUM (
+CREATE TYPE icpwso_citation_state AS ENUM (
   'DROPPED', 'ATTACHED', 'HELD', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_membership_state AS ENUM (
+CREATE TYPE icpwso_membership_state AS ENUM (
   'OMITTED', 'INCLUDED', 'HELD', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_metadata_trust AS ENUM ('UNTRUSTED_METADATA');
-CREATE TYPE iompcp_effect_status AS ENUM (
+CREATE TYPE icpwso_metadata_trust AS ENUM ('UNTRUSTED_METADATA');
+CREATE TYPE icpwso_effect_status AS ENUM (
   'PREPARED', 'DISPATCHED', 'ACKED', 'FAILED', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_catalog_status AS ENUM (
+CREATE TYPE icpwso_catalog_status AS ENUM (
   'DROPPED', 'ATTACHED', 'HELD', 'SUPERSEDED_REF', 'UNKNOWN_EFFECT'
 );
-CREATE TYPE iompcp_source_catalog_status AS ENUM (
+CREATE TYPE icpwso_source_catalog_status AS ENUM (
   'INVALIDATED', 'ATTACHED', 'LIVE', 'UNKNOWN_EFFECT'
 );
 
-CREATE ROLE agent_iompcp_profile_authority NOLOGIN;
+CREATE ROLE agent_icpwso_profile_authority NOLOGIN;
 
-CREATE TABLE agent_iompcp_authorization_evidence (
+CREATE TABLE agent_icpwso_authorization_evidence (
   account_id BIGINT NOT NULL,
   evidence_id UUID NOT NULL,
   principal_id TEXT NOT NULL,
@@ -1129,12 +1050,12 @@ CREATE TABLE agent_iompcp_authorization_evidence (
   CHECK (length(evidence_hash) = 64)
 );
 
-CREATE TABLE agent_iompcp_profile (
+CREATE TABLE agent_icpwso_profile (
   account_id BIGINT NOT NULL,
   profile_id UUID NOT NULL,
   profile_version INTEGER NOT NULL CHECK (profile_version > 0),
   name TEXT NOT NULL,
-  status iompcp_profile_status NOT NULL,
+  status icpwso_profile_status NOT NULL,
   definition_hash CHAR(64) NOT NULL CHECK (length(definition_hash) = 64),
   canonicalization_version TEXT NOT NULL,
   compiler_version TEXT NOT NULL,
@@ -1143,15 +1064,15 @@ CREATE TABLE agent_iompcp_profile (
   authorization_snapshot_hash CHAR(64) NOT NULL,
   compile_threshold SMALLINT NOT NULL
     CHECK (compile_threshold BETWEEN 2 AND 8),
-  max_cards_per_session SMALLINT NOT NULL
-    CHECK (max_cards_per_session = 1),
-  max_nominated_cards SMALLINT NOT NULL
-    CHECK (max_nominated_cards = 1),
+  max_packets_per_session SMALLINT NOT NULL
+    CHECK (max_packets_per_session = 1),
+  max_nominated_packets SMALLINT NOT NULL
+    CHECK (max_nominated_packets = 1),
   semantic_tags TEXT[] NOT NULL,
   procedure_ref TEXT,
   revocation_policy TEXT NOT NULL CHECK (
     revocation_policy IN (
-      'ALLOW_IN_FLIGHT', 'STOP_BEFORE_ATTACH', 'REQUIRE_REVIEW'
+      'ALLOW_IN_FLIGHT', 'STOP_BEFORE_OMIT', 'REQUIRE_REVIEW'
     )
   ),
   created_by TEXT NOT NULL,
@@ -1163,7 +1084,7 @@ CREATE TABLE agent_iompcp_profile (
   PRIMARY KEY (account_id, profile_id, profile_version),
   UNIQUE (account_id, profile_id, profile_version, definition_hash),
   FOREIGN KEY (account_id, authorization_evidence_id)
-    REFERENCES agent_iompcp_authorization_evidence (account_id, evidence_id),
+    REFERENCES agent_icpwso_authorization_evidence (account_id, evidence_id),
   CHECK (
     (status = 'DRAFT' AND approved_at IS NULL
       AND approval_validation_hash IS NULL) OR
@@ -1177,7 +1098,7 @@ CREATE TABLE agent_iompcp_profile (
   CHECK (length(authorization_snapshot_hash) = 64)
 );
 
-CREATE TABLE agent_iompcp_profile_perceive_rule (
+CREATE TABLE agent_icpwso_profile_omit_rule (
   account_id BIGINT NOT NULL,
   profile_id UUID NOT NULL,
   profile_version INTEGER NOT NULL,
@@ -1185,38 +1106,38 @@ CREATE TABLE agent_iompcp_profile_perceive_rule (
   ordinal SMALLINT NOT NULL CHECK (ordinal BETWEEN 1 AND 64),
   allowed_source_kinds TEXT[] NOT NULL,
   compile_threshold SMALLINT NOT NULL CHECK (compile_threshold BETWEEN 2 AND 8),
-  max_cards_per_session SMALLINT NOT NULL
-    CHECK (max_cards_per_session = 1),
-  max_nominated_cards SMALLINT NOT NULL
-    CHECK (max_nominated_cards = 1),
+  max_packets_per_session SMALLINT NOT NULL
+    CHECK (max_packets_per_session = 1),
+  max_nominated_packets SMALLINT NOT NULL
+    CHECK (max_nominated_packets = 1),
   require_dual_control_compile BOOLEAN NOT NULL,
   compile_instruction JSONB NOT NULL,
   PRIMARY KEY (account_id, profile_id, profile_version, rule_id),
   UNIQUE (account_id, profile_id, profile_version, ordinal),
   FOREIGN KEY (account_id, profile_id, profile_version)
-    REFERENCES agent_iompcp_profile (account_id, profile_id, profile_version)
+    REFERENCES agent_icpwso_profile (account_id, profile_id, profile_version)
 );
 
-CREATE TABLE agent_iompcp_card_catalog (
+CREATE TABLE agent_icpwso_packet_catalog (
   account_id BIGINT NOT NULL,
-  card_id UUID NOT NULL,
+  packet_id UUID NOT NULL,
   source_session_id UUID NOT NULL,
   source_certificate_id UUID NOT NULL,
   source_decision_id UUID NOT NULL,
-  card_ref TEXT NOT NULL,
-  source_kind iompcp_source_kind NOT NULL,
-  perceive_kind iompcp_perceive_kind NOT NULL,
-  gate_kind iompcp_gate_kind NOT NULL,
-  gate_action iompcp_gate_action NOT NULL,
-  terminal_kind iompcp_terminal_kind NOT NULL,
-  placement_kind iompcp_placement_kind NOT NULL,
-  key_lifecycle iompcp_key_lifecycle NOT NULL,
-  clock_lifecycle iompcp_clock_lifecycle NOT NULL,
-  attested_key_kind iompcp_attested_key_kind NOT NULL,
-  status iompcp_catalog_status NOT NULL,
-  citation_state iompcp_citation_state NOT NULL,
-  membership_state iompcp_membership_state NOT NULL,
-  catalog_status iompcp_source_catalog_status NOT NULL,
+  packet_ref TEXT NOT NULL,
+  source_kind icpwso_source_kind NOT NULL,
+  perceive_kind icpwso_perceive_kind NOT NULL,
+  gate_kind icpwso_gate_kind NOT NULL,
+  gate_action icpwso_gate_action NOT NULL,
+  terminal_kind icpwso_terminal_kind NOT NULL,
+  placement_kind icpwso_placement_kind NOT NULL,
+  key_lifecycle icpwso_key_lifecycle NOT NULL,
+  clock_lifecycle icpwso_clock_lifecycle NOT NULL,
+  attested_key_kind icpwso_attested_key_kind NOT NULL,
+  status icpwso_catalog_status NOT NULL,
+  citation_state icpwso_citation_state NOT NULL,
+  membership_state icpwso_membership_state NOT NULL,
+  catalog_status icpwso_source_catalog_status NOT NULL,
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
   prior_clock_hash CHAR(64) NOT NULL CHECK (length(prior_clock_hash) = 64),
   successor_clock_hash CHAR(64) NOT NULL CHECK (length(successor_clock_hash) = 64),
@@ -1225,13 +1146,13 @@ CREATE TABLE agent_iompcp_card_catalog (
   donor_purpose_hash CHAR(64) NOT NULL CHECK (length(donor_purpose_hash) = 64),
   hop_count SMALLINT NOT NULL CHECK (hop_count BETWEEN 0 AND 8),
   halt_scope_hash CHAR(64) NOT NULL CHECK (length(halt_scope_hash) = 64),
-  receipt_disposition iompcp_receipt_disposition NOT NULL,
-  effect_observation iompcp_effect_observation NOT NULL,
+  receipt_disposition icpwso_receipt_disposition NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
   silence_inferred BOOLEAN NOT NULL,
-  fact_disposition iompcp_fact_disposition NOT NULL,
-  body_visibility iompcp_body_visibility NOT NULL,
-  clock_disposition iompcp_clock_disposition NOT NULL,
-  metadata_trust iompcp_metadata_trust NOT NULL,
+  fact_disposition icpwso_fact_disposition NOT NULL,
+  body_visibility icpwso_body_visibility NOT NULL,
+  clock_disposition icpwso_clock_disposition NOT NULL,
+  metadata_trust icpwso_metadata_trust NOT NULL,
   inlines_fact_body BOOLEAN NOT NULL,
   prior_compiler_steward_a TEXT NOT NULL,
   prior_compiler_steward_b TEXT NOT NULL,
@@ -1247,12 +1168,14 @@ CREATE TABLE agent_iompcp_card_catalog (
   prior_omission_steward_b TEXT NOT NULL,
   prior_card_steward_a TEXT NOT NULL,
   prior_card_steward_b TEXT NOT NULL,
+  prior_packet_steward_a TEXT NOT NULL,
+  prior_packet_steward_b TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   first_seen_at TIMESTAMPTZ NOT NULL,
   sealed_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (account_id, card_id),
-  UNIQUE (account_id, card_ref, source_kind),
+  PRIMARY KEY (account_id, packet_id),
+  UNIQUE (account_id, packet_ref, source_kind),
   CHECK (prior_compiler_steward_a <> prior_compiler_steward_b),
   CHECK (perception_steward_a <> perception_steward_b),
   CHECK (receipt_steward_a <> receipt_steward_b),
@@ -1260,6 +1183,7 @@ CREATE TABLE agent_iompcp_card_catalog (
   CHECK (prior_extension_steward_a <> prior_extension_steward_b),
   CHECK (prior_omission_steward_a <> prior_omission_steward_b),
   CHECK (prior_card_steward_a <> prior_card_steward_b),
+  CHECK (prior_packet_steward_a <> prior_packet_steward_b),
   CHECK (provider_receipt_hash <> disputed_fact_hash),
   CHECK (successor_clock_hash <> prior_clock_hash),
   CHECK (gate_kind <> 'ALLOW_TOOL_READ' OR gate_action = 'TOOL_READ'),
@@ -1289,12 +1213,12 @@ CREATE TABLE agent_iompcp_card_catalog (
   )
 );
 
-CREATE TABLE agent_iompcp_session (
+CREATE TABLE agent_icpwso_session (
   account_id BIGINT NOT NULL,
   session_id UUID NOT NULL,
   profile_id UUID NOT NULL,
   profile_version INTEGER NOT NULL,
-  status iompcp_session_status NOT NULL,
+  status icpwso_session_status NOT NULL,
   state_revision BIGINT NOT NULL CHECK (state_revision >= 0),
   purpose TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
@@ -1314,10 +1238,10 @@ CREATE TABLE agent_iompcp_session (
     CHECK (budget_max_wall_time_ms BETWEEN 1000 AND 86400000),
   compile_threshold SMALLINT NOT NULL
     CHECK (compile_threshold BETWEEN 2 AND 8),
-  max_cards_per_session SMALLINT NOT NULL
-    CHECK (max_cards_per_session = 1),
-  max_nominated_cards SMALLINT NOT NULL
-    CHECK (max_nominated_cards = 1),
+  max_packets_per_session SMALLINT NOT NULL
+    CHECK (max_packets_per_session = 1),
+  max_nominated_packets SMALLINT NOT NULL
+    CHECK (max_nominated_packets = 1),
   deadline_at TIMESTAMPTZ NOT NULL,
   started_by TEXT NOT NULL,
   principal_id TEXT NOT NULL,
@@ -1330,9 +1254,9 @@ CREATE TABLE agent_iompcp_session (
   PRIMARY KEY (account_id, session_id),
   UNIQUE (account_id, idempotency_key),
   FOREIGN KEY (account_id, profile_id, profile_version)
-    REFERENCES agent_iompcp_profile (account_id, profile_id, profile_version),
+    REFERENCES agent_icpwso_profile (account_id, profile_id, profile_version),
   FOREIGN KEY (account_id, authorization_evidence_id)
-    REFERENCES agent_iompcp_authorization_evidence (account_id, evidence_id),
+    REFERENCES agent_icpwso_authorization_evidence (account_id, evidence_id),
   CHECK (consumed_nominate_units <= budget_nominate_units),
   CHECK (consumed_bind_units <= budget_bind_units),
   CHECK (consumed_seal_units <= budget_seal_units),
@@ -1342,20 +1266,20 @@ CREATE TABLE agent_iompcp_session (
   CHECK (deadline_at > created_at)
 );
 
-CREATE TABLE agent_iompcp_nomination (
+CREATE TABLE agent_icpwso_nomination (
   account_id BIGINT NOT NULL,
   nomination_id UUID NOT NULL,
   session_id UUID NOT NULL,
-  card_id UUID NOT NULL,
-  access_path iompcp_access_path NOT NULL,
-  source_kind iompcp_source_kind NOT NULL,
-  gate_kind iompcp_gate_kind NOT NULL,
-  gate_action iompcp_gate_action NOT NULL,
-  effect_observation iompcp_effect_observation NOT NULL,
-  receipt_disposition iompcp_receipt_disposition NOT NULL,
+  packet_id UUID NOT NULL,
+  access_path icpwso_access_path NOT NULL,
+  source_kind icpwso_source_kind NOT NULL,
+  gate_kind icpwso_gate_kind NOT NULL,
+  gate_action icpwso_gate_action NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
+  receipt_disposition icpwso_receipt_disposition NOT NULL,
   silence_inferred BOOLEAN NOT NULL,
-  citation_state iompcp_citation_state NOT NULL,
-  catalog_status iompcp_source_catalog_status NOT NULL,
+  citation_state icpwso_citation_state NOT NULL,
+  catalog_status icpwso_source_catalog_status NOT NULL,
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
   provider_receipt_hash CHAR(64) NOT NULL CHECK (length(provider_receipt_hash) = 64),
   nomination_hash CHAR(64) NOT NULL CHECK (length(nomination_hash) = 64),
@@ -1363,42 +1287,42 @@ CREATE TABLE agent_iompcp_nomination (
   PRIMARY KEY (account_id, nomination_id),
   UNIQUE (account_id, session_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
+  FOREIGN KEY (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id),
   CHECK (access_path = 'POINT_LOOKUP'),
   CHECK (citation_state = 'DROPPED'),
   CHECK (catalog_status = 'INVALIDATED'),
-  CHECK (source_kind = 'SEALED_INVALIDATED_OMISSION_MEMBER_CARD'),
+  CHECK (source_kind = 'SEALED_INVALIDATED_CONTEXT_PACKET'),
   CHECK (provider_receipt_hash <> disputed_fact_hash)
 );
 
-CREATE TABLE agent_iompcp_metadata_binding (
+CREATE TABLE agent_icpwso_metadata_binding (
   account_id BIGINT NOT NULL,
   binding_id UUID NOT NULL,
   session_id UUID NOT NULL,
-  card_id UUID NOT NULL,
+  packet_id UUID NOT NULL,
   provider_receipt_hash CHAR(64) NOT NULL CHECK (length(provider_receipt_hash) = 64),
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
-  effect_observation iompcp_effect_observation NOT NULL,
-  metadata_trust iompcp_metadata_trust NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
+  metadata_trust icpwso_metadata_trust NOT NULL,
   inlines_fact_body BOOLEAN NOT NULL,
   captured_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, binding_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
+  FOREIGN KEY (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id),
   CHECK (metadata_trust = 'UNTRUSTED_METADATA'),
   CHECK (inlines_fact_body = false),
   CHECK (provider_receipt_hash <> disputed_fact_hash)
 );
 
-CREATE TABLE agent_iompcp_perceive_record (
+CREATE TABLE agent_icpwso_omit_compile (
   account_id BIGINT NOT NULL,
   compile_id UUID NOT NULL,
   session_id UUID NOT NULL,
-  card_id UUID NOT NULL,
+  packet_id UUID NOT NULL,
   prior_clock_hash CHAR(64) NOT NULL CHECK (length(prior_clock_hash) = 64),
   successor_clock_hash CHAR(64) NOT NULL CHECK (length(successor_clock_hash) = 64),
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
@@ -1411,14 +1335,14 @@ CREATE TABLE agent_iompcp_perceive_record (
   PRIMARY KEY (account_id, compile_id),
   UNIQUE (account_id, session_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
+  FOREIGN KEY (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id),
   CHECK (provider_receipt_hash <> disputed_fact_hash),
   CHECK (successor_clock_hash <> prior_clock_hash)
 );
 
-CREATE TABLE agent_iompcp_packet_certificate (
+CREATE TABLE agent_icpwso_omission_certificate (
   account_id BIGINT NOT NULL,
   certificate_id UUID NOT NULL,
   session_id UUID NOT NULL,
@@ -1432,8 +1356,8 @@ CREATE TABLE agent_iompcp_packet_certificate (
   halt_scope_hash CHAR(64) NOT NULL CHECK (length(halt_scope_hash) = 64),
   attenuation_hash CHAR(64) NOT NULL CHECK (length(attenuation_hash) = 64),
   decision_set_hash CHAR(64) NOT NULL CHECK (length(decision_set_hash) = 64),
-  packet_steward_a TEXT NOT NULL,
-  packet_steward_b TEXT NOT NULL,
+  omission_steward_a TEXT NOT NULL,
+  omission_steward_b TEXT NOT NULL,
   prior_compiler_steward_a TEXT NOT NULL,
   prior_compiler_steward_b TEXT NOT NULL,
   perception_steward_a TEXT NOT NULL,
@@ -1448,6 +1372,8 @@ CREATE TABLE agent_iompcp_packet_certificate (
   prior_omission_steward_b TEXT NOT NULL,
   prior_card_steward_a TEXT NOT NULL,
   prior_card_steward_b TEXT NOT NULL,
+  prior_packet_steward_a TEXT NOT NULL,
+  prior_packet_steward_b TEXT NOT NULL,
   decision_watermark SMALLINT NOT NULL CHECK (decision_watermark BETWEEN 0 AND 256),
   sealed_revision BIGINT NOT NULL CHECK (sealed_revision >= 0),
   sealed_at TIMESTAMPTZ NOT NULL,
@@ -1455,46 +1381,47 @@ CREATE TABLE agent_iompcp_packet_certificate (
   PRIMARY KEY (account_id, certificate_id),
   UNIQUE (account_id, session_id, consumer_ref, sealed_revision),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
   FOREIGN KEY (account_id, compile_id)
-    REFERENCES agent_iompcp_perceive_record (account_id, compile_id),
-  CHECK (packet_steward_a <> packet_steward_b),
+    REFERENCES agent_icpwso_omit_compile (account_id, compile_id),
+  CHECK (omission_steward_a <> omission_steward_b),
   CHECK (prior_omission_steward_a <> prior_omission_steward_b),
   CHECK (prior_card_steward_a <> prior_card_steward_b),
+  CHECK (prior_packet_steward_a <> prior_packet_steward_b),
   CHECK (provider_receipt_hash <> disputed_fact_hash),
   CHECK (successor_clock_hash <> prior_clock_hash)
 );
 
-CREATE TABLE agent_iompcp_packet_decision (
+CREATE TABLE agent_icpwso_omission_decision (
   account_id BIGINT NOT NULL,
   decision_id UUID NOT NULL,
   certificate_id UUID NOT NULL,
   session_id UUID NOT NULL,
-  card_id UUID NOT NULL,
+  packet_id UUID NOT NULL,
   source_certificate_id UUID NOT NULL,
-  source_kind iompcp_source_kind NOT NULL,
+  source_kind icpwso_source_kind NOT NULL,
   decision_ordinal SMALLINT NOT NULL CHECK (decision_ordinal BETWEEN 0 AND 256),
-  status iompcp_binding_status NOT NULL,
-  placement_kind iompcp_placement_kind NOT NULL,
-  key_lifecycle iompcp_key_lifecycle NOT NULL,
-  clock_lifecycle iompcp_clock_lifecycle NOT NULL,
-  attested_key_kind iompcp_attested_key_kind NOT NULL,
-  terminal_kind iompcp_terminal_kind NOT NULL,
-  gate_kind iompcp_gate_kind NOT NULL,
-  gate_action iompcp_gate_action NOT NULL,
-  perceive_kind iompcp_perceive_kind NOT NULL,
-  compile_kind iompcp_compile_kind NOT NULL,
-  body_visibility iompcp_body_visibility NOT NULL,
-  fact_disposition iompcp_fact_disposition NOT NULL,
-  clock_disposition iompcp_clock_disposition NOT NULL,
-  receipt_disposition iompcp_receipt_disposition NOT NULL,
-  effect_observation iompcp_effect_observation NOT NULL,
-  purpose_relation iompcp_purpose_relation NOT NULL,
-  access_path iompcp_access_path NOT NULL,
-  citation_state iompcp_citation_state NOT NULL,
-  membership_state iompcp_membership_state NOT NULL,
-  catalog_status iompcp_source_catalog_status NOT NULL,
-  metadata_trust iompcp_metadata_trust NOT NULL,
+  status icpwso_binding_status NOT NULL,
+  placement_kind icpwso_placement_kind NOT NULL,
+  key_lifecycle icpwso_key_lifecycle NOT NULL,
+  clock_lifecycle icpwso_clock_lifecycle NOT NULL,
+  attested_key_kind icpwso_attested_key_kind NOT NULL,
+  terminal_kind icpwso_terminal_kind NOT NULL,
+  gate_kind icpwso_gate_kind NOT NULL,
+  gate_action icpwso_gate_action NOT NULL,
+  perceive_kind icpwso_perceive_kind NOT NULL,
+  compile_kind icpwso_compile_kind NOT NULL,
+  body_visibility icpwso_body_visibility NOT NULL,
+  fact_disposition icpwso_fact_disposition NOT NULL,
+  clock_disposition icpwso_clock_disposition NOT NULL,
+  receipt_disposition icpwso_receipt_disposition NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
+  purpose_relation icpwso_purpose_relation NOT NULL,
+  access_path icpwso_access_path NOT NULL,
+  citation_state icpwso_citation_state NOT NULL,
+  membership_state icpwso_membership_state NOT NULL,
+  catalog_status icpwso_source_catalog_status NOT NULL,
+  metadata_trust icpwso_metadata_trust NOT NULL,
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
   prior_clock_hash CHAR(64) NOT NULL CHECK (length(prior_clock_hash) = 64),
   successor_clock_hash CHAR(64) NOT NULL CHECK (length(successor_clock_hash) = 64),
@@ -1513,44 +1440,44 @@ CREATE TABLE agent_iompcp_packet_decision (
   sealed_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, decision_id),
-  UNIQUE (account_id, certificate_id, card_id, decision_ordinal, sealed_revision),
+  UNIQUE (account_id, certificate_id, packet_id, decision_ordinal, sealed_revision),
   FOREIGN KEY (account_id, certificate_id)
-    REFERENCES agent_iompcp_packet_certificate (account_id, certificate_id),
+    REFERENCES agent_icpwso_omission_certificate (account_id, certificate_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id)
+    REFERENCES agent_icpwso_session (account_id, session_id),
+  FOREIGN KEY (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id)
 );
 
-CREATE TABLE agent_iompcp_context_packet (
+CREATE TABLE agent_icpwso_working_set_member (
   account_id BIGINT NOT NULL,
-  packet_id UUID NOT NULL,
+  member_id UUID NOT NULL,
   session_id UUID NOT NULL,
   certificate_id UUID NOT NULL,
-  card_id UUID NOT NULL,
-  membership_state iompcp_membership_state NOT NULL,
-  citation_state iompcp_citation_state NOT NULL,
-  catalog_status iompcp_source_catalog_status NOT NULL,
-  metadata_trust iompcp_metadata_trust NOT NULL,
-  effect_observation iompcp_effect_observation NOT NULL,
+  packet_id UUID NOT NULL,
+  membership_state icpwso_membership_state NOT NULL,
+  citation_state icpwso_citation_state NOT NULL,
+  catalog_status icpwso_source_catalog_status NOT NULL,
+  metadata_trust icpwso_metadata_trust NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
   provider_receipt_hash CHAR(64) NOT NULL CHECK (length(provider_receipt_hash) = 64),
   disputed_fact_hash CHAR(64) NOT NULL CHECK (length(disputed_fact_hash) = 64),
-  fact_disposition iompcp_fact_disposition NOT NULL,
-  attested_key_kind iompcp_attested_key_kind NOT NULL,
-  body_visibility iompcp_body_visibility NOT NULL,
+  fact_disposition icpwso_fact_disposition NOT NULL,
+  attested_key_kind icpwso_attested_key_kind NOT NULL,
+  body_visibility icpwso_body_visibility NOT NULL,
   inlines_fact_body BOOLEAN NOT NULL,
-  packet_hash CHAR(64) NOT NULL CHECK (length(packet_hash) = 64),
-  packet_body JSONB NOT NULL,
+  member_hash CHAR(64) NOT NULL CHECK (length(member_hash) = 64),
+  member_body JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (account_id, packet_id),
+  PRIMARY KEY (account_id, member_id),
   UNIQUE (account_id, session_id),
-  UNIQUE (account_id, card_id),
+  UNIQUE (account_id, packet_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
   FOREIGN KEY (account_id, certificate_id)
-    REFERENCES agent_iompcp_packet_certificate (account_id, certificate_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id),
+    REFERENCES agent_icpwso_omission_certificate (account_id, certificate_id),
+  FOREIGN KEY (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id),
   CHECK (provider_receipt_hash <> disputed_fact_hash),
   CHECK (fact_disposition <> 'RESTORED'),
   CHECK (body_visibility = 'OMITTED'),
@@ -1560,45 +1487,45 @@ CREATE TABLE agent_iompcp_context_packet (
   CHECK (attested_key_kind NOT IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW')),
   CHECK (inlines_fact_body = false),
   CHECK (metadata_trust = 'UNTRUSTED_METADATA'),
-  CHECK (NOT (packet_body ? 'factBody')),
-  CHECK (NOT (packet_body ? 'fact_body')),
-  CHECK (NOT (packet_body ? 'resolvedFactHash')),
-  CHECK (packet_body->>'attestedKeyKind' IS DISTINCT FROM 'TRUSTED_ENROLLED'),
-  CHECK (packet_body->>'factDisposition' IS DISTINCT FROM 'RESTORED'),
-  CHECK (packet_body->>'bodyVisibility' IS DISTINCT FROM 'BODY_VISIBLE'),
-  CHECK (packet_body->>'membershipState' = 'OMITTED'),
-  CHECK (packet_body->>'citationState' = 'DROPPED'),
-  CHECK (packet_body->>'catalogStatus' = 'INVALIDATED'),
-  CHECK (packet_body->>'metadataTrust' = 'UNTRUSTED_METADATA')
+  CHECK (NOT (member_body ? 'factBody')),
+  CHECK (NOT (member_body ? 'fact_body')),
+  CHECK (NOT (member_body ? 'resolvedFactHash')),
+  CHECK (member_body->>'attestedKeyKind' IS DISTINCT FROM 'TRUSTED_ENROLLED'),
+  CHECK (member_body->>'factDisposition' IS DISTINCT FROM 'RESTORED'),
+  CHECK (member_body->>'bodyVisibility' IS DISTINCT FROM 'BODY_VISIBLE'),
+  CHECK (member_body->>'membershipState' = 'OMITTED'),
+  CHECK (member_body->>'citationState' = 'DROPPED'),
+  CHECK (member_body->>'catalogStatus' = 'INVALIDATED'),
+  CHECK (member_body->>'metadataTrust' = 'UNTRUSTED_METADATA')
 );
 
-CREATE TABLE agent_iompcp_publication_record (
+CREATE TABLE agent_icpwso_omission_publication (
   account_id BIGINT NOT NULL,
   record_id UUID NOT NULL,
-  card_id UUID NOT NULL,
   packet_id UUID NOT NULL,
+  member_id UUID NOT NULL,
   provider_receipt_hash CHAR(64) NOT NULL CHECK (length(provider_receipt_hash) = 64),
-  effect_observation iompcp_effect_observation NOT NULL,
+  effect_observation icpwso_effect_observation NOT NULL,
   reason_code TEXT NOT NULL CHECK (
     reason_code IN (
-      'INVALIDATED_MEMBER_CARD_ATTACHED', 'RETRACTED', 'QUARANTINED', 'KEY_REVOKED'
+      'INVALIDATED_CONTEXT_PACKET_OMITTED', 'RETRACTED', 'QUARANTINED', 'KEY_REVOKED'
     )
   ),
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, record_id),
-  UNIQUE (account_id, card_id),
-  FOREIGN KEY (account_id, card_id)
-    REFERENCES agent_iompcp_card_catalog (account_id, card_id),
+  UNIQUE (account_id, packet_id),
   FOREIGN KEY (account_id, packet_id)
-    REFERENCES agent_iompcp_context_packet (account_id, packet_id)
+    REFERENCES agent_icpwso_packet_catalog (account_id, packet_id),
+  FOREIGN KEY (account_id, member_id)
+    REFERENCES agent_icpwso_working_set_member (account_id, member_id)
 );
 
-CREATE TABLE agent_iompcp_effect_intent (
+CREATE TABLE agent_icpwso_effect_intent (
   account_id BIGINT NOT NULL,
   effect_id UUID NOT NULL,
   session_id UUID NOT NULL,
   certificate_id UUID NOT NULL,
-  intent_status iompcp_effect_status NOT NULL,
+  intent_status icpwso_effect_status NOT NULL,
   provider_idempotency_key TEXT NOT NULL,
   generation INTEGER NOT NULL CHECK (generation >= 0),
   canonical_request_hash CHAR(64) NOT NULL
@@ -1609,12 +1536,12 @@ CREATE TABLE agent_iompcp_effect_intent (
   PRIMARY KEY (account_id, effect_id),
   UNIQUE (account_id, provider_idempotency_key),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id),
+    REFERENCES agent_icpwso_session (account_id, session_id),
   FOREIGN KEY (account_id, certificate_id)
-    REFERENCES agent_iompcp_packet_certificate (account_id, certificate_id)
+    REFERENCES agent_icpwso_omission_certificate (account_id, certificate_id)
 );
 
-CREATE TABLE agent_iompcp_budget_ledger (
+CREATE TABLE agent_icpwso_budget_ledger (
   account_id BIGINT NOT NULL,
   session_id UUID NOT NULL,
   entry_sequence BIGINT NOT NULL CHECK (entry_sequence >= 0),
@@ -1628,10 +1555,10 @@ CREATE TABLE agent_iompcp_budget_ledger (
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, session_id, entry_sequence),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id)
+    REFERENCES agent_icpwso_session (account_id, session_id)
 );
 
-CREATE TABLE agent_iompcp_terminal_record (
+CREATE TABLE agent_icpwso_terminal_record (
   account_id BIGINT NOT NULL,
   terminal_id UUID NOT NULL,
   session_id UUID NOT NULL,
@@ -1640,10 +1567,10 @@ CREATE TABLE agent_iompcp_terminal_record (
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, terminal_id),
   FOREIGN KEY (account_id, session_id)
-    REFERENCES agent_iompcp_session (account_id, session_id)
+    REFERENCES agent_icpwso_session (account_id, session_id)
 );
 
-CREATE TABLE agent_iompcp_command_result (
+CREATE TABLE agent_icpwso_command_result (
   account_id BIGINT NOT NULL,
   command_id UUID NOT NULL,
   session_id UUID,
@@ -1658,7 +1585,7 @@ CREATE TABLE agent_iompcp_command_result (
   UNIQUE (account_id, operation_name, principal_id, idempotency_key)
 );
 
-CREATE TABLE agent_iompcp_audit_head (
+CREATE TABLE agent_icpwso_audit_head (
   account_id BIGINT NOT NULL,
   head_sequence BIGINT NOT NULL CHECK (head_sequence >= 0),
   head_hash CHAR(64) NOT NULL CHECK (length(head_hash) = 64),
@@ -1666,7 +1593,7 @@ CREATE TABLE agent_iompcp_audit_head (
   PRIMARY KEY (account_id)
 );
 
-CREATE TABLE agent_iompcp_audit_event (
+CREATE TABLE agent_icpwso_audit_event (
   account_id BIGINT NOT NULL,
   event_sequence BIGINT NOT NULL CHECK (event_sequence >= 0),
   session_id UUID,
@@ -1678,7 +1605,7 @@ CREATE TABLE agent_iompcp_audit_event (
   PRIMARY KEY (account_id, event_sequence)
 );
 
-CREATE TABLE agent_iompcp_audit_anchor (
+CREATE TABLE agent_icpwso_audit_anchor (
   account_id BIGINT NOT NULL,
   anchor_id UUID NOT NULL,
   from_sequence BIGINT NOT NULL,
@@ -1689,7 +1616,7 @@ CREATE TABLE agent_iompcp_audit_anchor (
   CHECK (to_sequence >= from_sequence)
 );
 
-CREATE TABLE agent_iompcp_projection_checkpoint (
+CREATE TABLE agent_icpwso_projection_checkpoint (
   account_id BIGINT NOT NULL,
   projector_name TEXT NOT NULL,
   source_watermark TEXT NOT NULL,
@@ -1697,7 +1624,7 @@ CREATE TABLE agent_iompcp_projection_checkpoint (
   PRIMARY KEY (account_id, projector_name)
 );
 
-CREATE FUNCTION protect_agent_iompcp_profile()
+CREATE FUNCTION protect_agent_icpwso_profile()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_profile$
@@ -1713,8 +1640,8 @@ BEGIN
      AND (
        NEW.definition_hash IS DISTINCT FROM OLD.definition_hash
        OR NEW.compile_threshold IS DISTINCT FROM OLD.compile_threshold
-       OR NEW.max_cards_per_session IS DISTINCT FROM OLD.max_cards_per_session
-       OR NEW.max_nominated_cards IS DISTINCT FROM OLD.max_nominated_cards
+       OR NEW.max_packets_per_session IS DISTINCT FROM OLD.max_packets_per_session
+       OR NEW.max_nominated_packets IS DISTINCT FROM OLD.max_nominated_packets
        OR NEW.semantic_tags IS DISTINCT FROM OLD.semantic_tags
        OR NEW.procedure_ref IS DISTINCT FROM OLD.procedure_ref
        OR NEW.revocation_policy IS DISTINCT FROM OLD.revocation_policy
@@ -1727,7 +1654,7 @@ BEGIN
   END IF;
 
   IF OLD.status = 'APPROVED' AND NEW.status = 'REVOKED' THEN
-    IF current_setting('app.iompcp_profile_revocation', true) IS DISTINCT FROM
+    IF current_setting('app.icpwso_profile_revocation', true) IS DISTINCT FROM
        concat(
          OLD.profile_id::TEXT, ':',
          OLD.profile_version::TEXT, ':',
@@ -1739,7 +1666,7 @@ BEGIN
   END IF;
 
   IF OLD.status = 'DRAFT' AND NEW.status = 'APPROVED' THEN
-    IF current_setting('app.iompcp_profile_approval', true) IS DISTINCT FROM
+    IF current_setting('app.icpwso_profile_approval', true) IS DISTINCT FROM
        concat(
          OLD.profile_id::TEXT, ':',
          OLD.profile_version::TEXT, ':',
@@ -1762,19 +1689,19 @@ BEGIN
 END
 $protect_profile$;
 
-CREATE TRIGGER agent_iompcp_profile_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_profile
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_profile();
+CREATE TRIGGER agent_icpwso_profile_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_profile
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_profile();
 
-CREATE FUNCTION protect_agent_iompcp_profile_perceive_rule()
+CREATE FUNCTION protect_agent_icpwso_profile_omit_rule()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_rule$
 DECLARE
-  profile_status iompcp_profile_status;
+  profile_status icpwso_profile_status;
 BEGIN
   SELECT status INTO profile_status
-  FROM agent_iompcp_profile
+  FROM agent_icpwso_profile
   WHERE account_id = COALESCE(NEW.account_id, OLD.account_id)
     AND profile_id = COALESCE(NEW.profile_id, OLD.profile_id)
     AND profile_version = COALESCE(NEW.profile_version, OLD.profile_version);
@@ -1786,27 +1713,27 @@ BEGIN
 END
 $protect_rule$;
 
-CREATE TRIGGER agent_iompcp_profile_perceive_rule_protect
-BEFORE INSERT OR UPDATE OR DELETE ON agent_iompcp_profile_perceive_rule
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_profile_perceive_rule();
+CREATE TRIGGER agent_icpwso_profile_omit_rule_protect
+BEFORE INSERT OR UPDATE OR DELETE ON agent_icpwso_profile_omit_rule
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_profile_omit_rule();
 
-CREATE FUNCTION protect_agent_iompcp_card_catalog()
+CREATE FUNCTION protect_agent_icpwso_packet_catalog()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_catalog$
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    RAISE EXCEPTION 'member catalog identity is immutable';
+    RAISE EXCEPTION 'packet catalog identity is immutable';
   END IF;
   RETURN NEW;
 END
 $protect_catalog$;
 
-CREATE TRIGGER agent_iompcp_card_catalog_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_card_catalog
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_card_catalog();
+CREATE TRIGGER agent_icpwso_packet_catalog_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_packet_catalog
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_packet_catalog();
 
-CREATE FUNCTION protect_agent_iompcp_metadata_binding()
+CREATE FUNCTION protect_agent_icpwso_metadata_binding()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_binding$
@@ -1818,11 +1745,11 @@ BEGIN
 END
 $protect_binding$;
 
-CREATE TRIGGER agent_iompcp_metadata_binding_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_metadata_binding
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_metadata_binding();
+CREATE TRIGGER agent_icpwso_metadata_binding_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_metadata_binding
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_metadata_binding();
 
-CREATE FUNCTION protect_agent_iompcp_packet_certificate()
+CREATE FUNCTION protect_agent_icpwso_omission_certificate()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_certificate$
@@ -1834,8 +1761,8 @@ BEGIN
        OR NEW.provider_receipt_hash IS DISTINCT FROM OLD.provider_receipt_hash
        OR NEW.halt_scope_hash IS DISTINCT FROM OLD.halt_scope_hash
        OR NEW.attenuation_hash IS DISTINCT FROM OLD.attenuation_hash
-       OR NEW.packet_steward_a IS DISTINCT FROM OLD.packet_steward_a
-       OR NEW.packet_steward_b IS DISTINCT FROM OLD.packet_steward_b
+       OR NEW.omission_steward_a IS DISTINCT FROM OLD.omission_steward_a
+       OR NEW.omission_steward_b IS DISTINCT FROM OLD.omission_steward_b
        OR NEW.prior_compiler_steward_a IS DISTINCT FROM OLD.prior_compiler_steward_a
        OR NEW.prior_compiler_steward_b IS DISTINCT FROM OLD.prior_compiler_steward_b
        OR NEW.perception_steward_a IS DISTINCT FROM OLD.perception_steward_a
@@ -1855,63 +1782,71 @@ BEGIN
        OR NEW.prior_card_steward_a
          IS DISTINCT FROM OLD.prior_card_steward_a
        OR NEW.prior_card_steward_b
-         IS DISTINCT FROM OLD.prior_card_steward_b THEN
-      RAISE EXCEPTION 'packet certificate identity is immutable';
+         IS DISTINCT FROM OLD.prior_card_steward_b
+       OR NEW.prior_packet_steward_a
+         IS DISTINCT FROM OLD.prior_packet_steward_a
+       OR NEW.prior_packet_steward_b
+         IS DISTINCT FROM OLD.prior_packet_steward_b THEN
+      RAISE EXCEPTION 'omission certificate identity is immutable';
     END IF;
     RETURN NEW;
   END IF;
 
-  IF NEW.packet_steward_a = NEW.packet_steward_b THEN
-    RAISE EXCEPTION 'dual-control fence requires distinct card stewards';
+  IF NEW.omission_steward_a = NEW.omission_steward_b THEN
+    RAISE EXCEPTION 'dual-control fence requires distinct omission stewards';
   END IF;
-  IF NEW.packet_steward_a = NEW.prior_compiler_steward_a
-     OR NEW.packet_steward_a = NEW.prior_compiler_steward_b
-     OR NEW.packet_steward_b = NEW.prior_compiler_steward_a
-     OR NEW.packet_steward_b = NEW.prior_compiler_steward_b
-     OR NEW.packet_steward_a = NEW.perception_steward_a
-     OR NEW.packet_steward_a = NEW.perception_steward_b
-     OR NEW.packet_steward_b = NEW.perception_steward_a
-     OR NEW.packet_steward_b = NEW.perception_steward_b
-     OR NEW.packet_steward_a = NEW.receipt_steward_a
-     OR NEW.packet_steward_a = NEW.receipt_steward_b
-     OR NEW.packet_steward_b = NEW.receipt_steward_a
-     OR NEW.packet_steward_b = NEW.receipt_steward_b
-     OR NEW.packet_steward_a = NEW.prior_gate_steward_a
-     OR NEW.packet_steward_a = NEW.prior_gate_steward_b
-     OR NEW.packet_steward_b = NEW.prior_gate_steward_a
-     OR NEW.packet_steward_b = NEW.prior_gate_steward_b
-     OR NEW.packet_steward_a = NEW.prior_extension_steward_a
-     OR NEW.packet_steward_a = NEW.prior_extension_steward_b
-     OR NEW.packet_steward_b = NEW.prior_extension_steward_a
-     OR NEW.packet_steward_b = NEW.prior_extension_steward_b
-     OR NEW.packet_steward_a = NEW.prior_omission_steward_a
-     OR NEW.packet_steward_a = NEW.prior_omission_steward_b
-     OR NEW.packet_steward_b = NEW.prior_omission_steward_a
-     OR NEW.packet_steward_b = NEW.prior_omission_steward_b
-     OR NEW.packet_steward_a = NEW.prior_card_steward_a
-     OR NEW.packet_steward_a = NEW.prior_card_steward_b
-     OR NEW.packet_steward_b = NEW.prior_card_steward_a
-     OR NEW.packet_steward_b = NEW.prior_card_steward_b THEN
+  IF NEW.omission_steward_a = NEW.prior_compiler_steward_a
+     OR NEW.omission_steward_a = NEW.prior_compiler_steward_b
+     OR NEW.omission_steward_b = NEW.prior_compiler_steward_a
+     OR NEW.omission_steward_b = NEW.prior_compiler_steward_b
+     OR NEW.omission_steward_a = NEW.perception_steward_a
+     OR NEW.omission_steward_a = NEW.perception_steward_b
+     OR NEW.omission_steward_b = NEW.perception_steward_a
+     OR NEW.omission_steward_b = NEW.perception_steward_b
+     OR NEW.omission_steward_a = NEW.receipt_steward_a
+     OR NEW.omission_steward_a = NEW.receipt_steward_b
+     OR NEW.omission_steward_b = NEW.receipt_steward_a
+     OR NEW.omission_steward_b = NEW.receipt_steward_b
+     OR NEW.omission_steward_a = NEW.prior_gate_steward_a
+     OR NEW.omission_steward_a = NEW.prior_gate_steward_b
+     OR NEW.omission_steward_b = NEW.prior_gate_steward_a
+     OR NEW.omission_steward_b = NEW.prior_gate_steward_b
+     OR NEW.omission_steward_a = NEW.prior_extension_steward_a
+     OR NEW.omission_steward_a = NEW.prior_extension_steward_b
+     OR NEW.omission_steward_b = NEW.prior_extension_steward_a
+     OR NEW.omission_steward_b = NEW.prior_extension_steward_b
+     OR NEW.omission_steward_a = NEW.prior_omission_steward_a
+     OR NEW.omission_steward_a = NEW.prior_omission_steward_b
+     OR NEW.omission_steward_b = NEW.prior_omission_steward_a
+     OR NEW.omission_steward_b = NEW.prior_omission_steward_b
+     OR NEW.omission_steward_a = NEW.prior_card_steward_a
+     OR NEW.omission_steward_a = NEW.prior_card_steward_b
+     OR NEW.omission_steward_b = NEW.prior_card_steward_a
+     OR NEW.omission_steward_b = NEW.prior_card_steward_b
+     OR NEW.omission_steward_a = NEW.prior_packet_steward_a
+     OR NEW.omission_steward_a = NEW.prior_packet_steward_b
+     OR NEW.omission_steward_b = NEW.prior_packet_steward_a
+     OR NEW.omission_steward_b = NEW.prior_packet_steward_b THEN
     RAISE EXCEPTION 'prior-steward exclusion fence';
   END IF;
   RETURN NEW;
 END
 $protect_certificate$;
 
-CREATE TRIGGER agent_iompcp_packet_certificate_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_packet_certificate
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_packet_certificate();
+CREATE TRIGGER agent_icpwso_omission_certificate_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_omission_certificate
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_omission_certificate();
 
-CREATE FUNCTION protect_agent_iompcp_packet_decision()
+CREATE FUNCTION protect_agent_icpwso_omission_decision()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_decision$
 DECLARE
-  catalog_citation iompcp_citation_state;
-  catalog_source_status iompcp_source_catalog_status;
+  catalog_citation icpwso_citation_state;
+  catalog_source_status icpwso_source_catalog_status;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    IF NEW.card_id IS DISTINCT FROM OLD.card_id
+    IF NEW.packet_id IS DISTINCT FROM OLD.packet_id
        OR NEW.disputed_fact_hash IS DISTINCT FROM OLD.disputed_fact_hash
        OR NEW.prior_clock_hash IS DISTINCT FROM OLD.prior_clock_hash
        OR NEW.successor_clock_hash IS DISTINCT FROM OLD.successor_clock_hash
@@ -1945,17 +1880,17 @@ BEGIN
        OR NEW.silence_inferred IS DISTINCT FROM OLD.silence_inferred
        OR NEW.opens_nested_expiry IS DISTINCT FROM OLD.opens_nested_expiry
        OR NEW.inlines_fact_body IS DISTINCT FROM OLD.inlines_fact_body THEN
-      RAISE EXCEPTION 'packet decision identity is immutable';
+      RAISE EXCEPTION 'omission decision identity is immutable';
     END IF;
     RETURN NEW;
   END IF;
 
   IF NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
-    RAISE EXCEPTION 'packet-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
+    RAISE EXCEPTION 'omission-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
   END IF;
 
   IF NEW.fact_disposition = 'RESTORED' OR NEW.membership_state = 'INCLUDED' THEN
-    RAISE EXCEPTION 'packet-as-restore fence blocks restoring disputed facts';
+    RAISE EXCEPTION 'omission-as-restore fence blocks restoring disputed facts';
   END IF;
 
   IF NEW.body_visibility = 'BODY_VISIBLE' THEN
@@ -1979,7 +1914,7 @@ BEGIN
   END IF;
 
   IF NEW.provider_receipt_hash IS NOT DISTINCT FROM NEW.disputed_fact_hash THEN
-    RAISE EXCEPTION 'packet-as-fact fence blocks using the disputed fact hash as a receipt';
+    RAISE EXCEPTION 'omission-as-fact fence blocks using the disputed fact hash as a receipt';
   END IF;
 
   IF NEW.metadata_trust IS DISTINCT FROM 'UNTRUSTED_METADATA' THEN
@@ -1994,7 +1929,7 @@ BEGIN
     RAISE EXCEPTION 'nested-expiry fence blocks opening another expiry plane';
   END IF;
 
-  IF NEW.access_path IN ('CARD_SCAN', 'LEDGER_SCAN') THEN
+  IF NEW.access_path IN ('PACKET_SCAN', 'LEDGER_SCAN') THEN
     RAISE EXCEPTION 'FULL SCAN REJECTED';
   END IF;
 
@@ -2004,21 +1939,21 @@ BEGIN
 
   SELECT citation_state, catalog_status
     INTO catalog_citation, catalog_source_status
-  FROM agent_iompcp_card_catalog
+  FROM agent_icpwso_packet_catalog
   WHERE account_id = NEW.account_id
-    AND card_id = NEW.card_id;
+    AND packet_id = NEW.packet_id;
 
-  IF NEW.compile_kind = 'ATTACH_INVALIDATED_MEMBER_CARD'
+  IF NEW.compile_kind = 'OMIT_INVALIDATED_CONTEXT_PACKET'
      AND (
        catalog_citation IS DISTINCT FROM 'DROPPED'
        OR catalog_source_status IS DISTINCT FROM 'INVALIDATED'
      ) THEN
-    RAISE EXCEPTION 'live-card fence blocks attaching a live citation';
+    RAISE EXCEPTION 'live-packet fence blocks omitting a live context packet';
   END IF;
 
-  IF NEW.compile_kind = 'ATTACH_INVALIDATED_MEMBER_CARD'
+  IF NEW.compile_kind = 'OMIT_INVALIDATED_CONTEXT_PACKET'
      AND (
-       NEW.source_kind IS DISTINCT FROM 'SEALED_INVALIDATED_OMISSION_MEMBER_CARD'
+       NEW.source_kind IS DISTINCT FROM 'SEALED_INVALIDATED_CONTEXT_PACKET'
        OR NEW.access_path IS DISTINCT FROM 'POINT_LOOKUP'
        OR NEW.gate_kind IS DISTINCT FROM 'ALLOW_TOOL_READ'
        OR NEW.gate_action IS DISTINCT FROM 'TOOL_READ'
@@ -2042,10 +1977,10 @@ BEGIN
        OR NEW.opens_nested_expiry
        OR NEW.successor_clock_hash IS NOT DISTINCT FROM NEW.prior_clock_hash
      ) THEN
-    RAISE EXCEPTION 'attach fence requires one invalidated card by point lookup';
+    RAISE EXCEPTION 'omit fence requires one invalidated context packet by point lookup';
   END IF;
 
-  IF NEW.compile_kind = 'ATTACH_INVALIDATED_MEMBER_CARD'
+  IF NEW.compile_kind = 'OMIT_INVALIDATED_CONTEXT_PACKET'
      AND NEW.hop_count > 0
      AND NEW.requested_purpose_hash IS NOT DISTINCT FROM NEW.donor_purpose_hash THEN
     RAISE EXCEPTION 'hop-leak fence blocks donor-purpose reads after attenuation hops';
@@ -2060,22 +1995,22 @@ BEGIN
 END
 $protect_decision$;
 
-CREATE TRIGGER agent_iompcp_packet_decision_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_packet_decision
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_packet_decision();
+CREATE TRIGGER agent_icpwso_omission_decision_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_omission_decision
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_omission_decision();
 
-CREATE FUNCTION protect_agent_iompcp_context_packet()
+CREATE FUNCTION protect_agent_icpwso_working_set_member()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_member$
 DECLARE
-  catalog_citation iompcp_citation_state;
-  catalog_source_status iompcp_source_catalog_status;
+  catalog_citation icpwso_citation_state;
+  catalog_source_status icpwso_source_catalog_status;
   decision_found BOOLEAN;
 BEGIN
-  IF NEW.packet_body ? 'factBody'
-     OR NEW.packet_body ? 'fact_body'
-     OR NEW.packet_body ? 'resolvedFactHash' THEN
+  IF NEW.member_body ? 'factBody'
+     OR NEW.member_body ? 'fact_body'
+     OR NEW.member_body ? 'resolvedFactHash' THEN
     RAISE EXCEPTION 'body-inline fence blocks inlining a disputed fact';
   END IF;
 
@@ -2084,60 +2019,60 @@ BEGIN
   END IF;
 
   IF NEW.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
-    RAISE EXCEPTION 'packet-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
+    RAISE EXCEPTION 'omission-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
   END IF;
 
   IF NEW.fact_disposition = 'RESTORED'
      OR NEW.body_visibility = 'BODY_VISIBLE'
      OR NEW.membership_state = 'INCLUDED'
      OR NEW.citation_state = 'ATTACHED' THEN
-    RAISE EXCEPTION 'packet-as-restore fence blocks restoring disputed facts';
+    RAISE EXCEPTION 'omission-as-restore fence blocks restoring disputed facts';
   END IF;
 
   IF TG_OP = 'UPDATE' THEN
-    RAISE EXCEPTION 'context packet metadata is immutable';
+    RAISE EXCEPTION 'working-set member metadata is immutable';
   END IF;
 
   IF NEW.catalog_status IS DISTINCT FROM 'INVALIDATED' THEN
-    RAISE EXCEPTION 'catalog-status fence blocks a card that does not repeat INVALIDATED';
+    RAISE EXCEPTION 'catalog-status fence blocks a packet that does not repeat INVALIDATED';
   END IF;
 
   SELECT citation_state, catalog_status
     INTO catalog_citation, catalog_source_status
-  FROM agent_iompcp_card_catalog
+  FROM agent_icpwso_packet_catalog
   WHERE account_id = NEW.account_id
-    AND card_id = NEW.card_id;
+    AND packet_id = NEW.packet_id;
 
   IF catalog_citation IS DISTINCT FROM 'DROPPED'
      OR catalog_source_status IS DISTINCT FROM 'INVALIDATED' THEN
-    RAISE EXCEPTION 'live-card fence blocks attaching a live citation';
+    RAISE EXCEPTION 'live-packet fence blocks omitting a live context packet';
   END IF;
 
   SELECT EXISTS (
     SELECT 1
-    FROM agent_iompcp_packet_decision
+    FROM agent_icpwso_omission_decision
     WHERE account_id = NEW.account_id
       AND certificate_id = NEW.certificate_id
-      AND card_id = NEW.card_id
-      AND compile_kind = 'ATTACH_INVALIDATED_MEMBER_CARD'
+      AND packet_id = NEW.packet_id
+      AND compile_kind = 'OMIT_INVALIDATED_CONTEXT_PACKET'
       AND membership_state = 'OMITTED'
       AND citation_state = 'DROPPED'
       AND catalog_status = 'INVALIDATED'
   ) INTO decision_found;
 
   IF decision_found IS DISTINCT FROM TRUE THEN
-    RAISE EXCEPTION 'context packet requires a sealed attach decision';
+    RAISE EXCEPTION 'working-set member requires a sealed omission decision';
   END IF;
 
   RETURN NEW;
 END
 $protect_member$;
 
-CREATE TRIGGER agent_iompcp_context_packet_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_context_packet
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_context_packet();
+CREATE TRIGGER agent_icpwso_working_set_member_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_working_set_member
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_working_set_member();
 
-CREATE FUNCTION protect_agent_iompcp_effect_intent()
+CREATE FUNCTION protect_agent_icpwso_effect_intent()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $protect_effect$
@@ -2160,11 +2095,11 @@ BEGIN
 END
 $protect_effect$;
 
-CREATE TRIGGER agent_iompcp_effect_intent_protect
-BEFORE INSERT OR UPDATE ON agent_iompcp_effect_intent
-FOR EACH ROW EXECUTE FUNCTION protect_agent_iompcp_effect_intent();
+CREATE TRIGGER agent_icpwso_effect_intent_protect
+BEFORE INSERT OR UPDATE ON agent_icpwso_effect_intent
+FOR EACH ROW EXECUTE FUNCTION protect_agent_icpwso_effect_intent();
 
-CREATE FUNCTION approve_agent_iompcp_profile(
+CREATE FUNCTION approve_agent_icpwso_profile(
   tenant_id BIGINT,
   recipient_profile_id UUID,
   recipient_profile_version INTEGER,
@@ -2178,12 +2113,12 @@ SET search_path = public, pg_temp
 AS $approve$
 DECLARE
   stored_hash CHAR(64);
-  stored_status iompcp_profile_status;
+  stored_status icpwso_profile_status;
   rule_count INTEGER;
 BEGIN
   SELECT definition_hash, status
     INTO stored_hash, stored_status
-  FROM agent_iompcp_profile
+  FROM agent_icpwso_profile
   WHERE account_id = tenant_id
     AND profile_id = recipient_profile_id
     AND profile_version = recipient_profile_version
@@ -2196,7 +2131,7 @@ BEGIN
   END IF;
 
   SELECT count(*)::INTEGER INTO rule_count
-  FROM agent_iompcp_profile_perceive_rule
+  FROM agent_icpwso_profile_omit_rule
   WHERE account_id = tenant_id
     AND profile_id = recipient_profile_id
     AND profile_version = recipient_profile_version
@@ -2207,7 +2142,7 @@ BEGIN
   END IF;
 
   PERFORM set_config(
-    'app.iompcp_profile_approval',
+    'app.icpwso_profile_approval',
     concat(
       recipient_profile_id::TEXT, ':',
       recipient_profile_version::TEXT, ':',
@@ -2216,7 +2151,7 @@ BEGIN
     true
   );
 
-  UPDATE agent_iompcp_profile
+  UPDATE agent_icpwso_profile
   SET status = 'APPROVED',
       approved_by = approver_id,
       approved_at = clock_timestamp(),
@@ -2227,7 +2162,7 @@ BEGIN
 END
 $approve$;
 
-CREATE FUNCTION revoke_agent_iompcp_profile(
+CREATE FUNCTION revoke_agent_icpwso_profile(
   tenant_id BIGINT,
   recipient_profile_id UUID,
   recipient_profile_version INTEGER,
@@ -2241,11 +2176,11 @@ SET search_path = public, pg_temp
 AS $revoke$
 DECLARE
   stored_hash CHAR(64);
-  stored_status iompcp_profile_status;
+  stored_status icpwso_profile_status;
 BEGIN
   SELECT definition_hash, status
     INTO stored_hash, stored_status
-  FROM agent_iompcp_profile
+  FROM agent_icpwso_profile
   WHERE account_id = tenant_id
     AND profile_id = recipient_profile_id
     AND profile_version = recipient_profile_version
@@ -2258,7 +2193,7 @@ BEGIN
   END IF;
 
   PERFORM set_config(
-    'app.iompcp_profile_revocation',
+    'app.icpwso_profile_revocation',
     concat(
       recipient_profile_id::TEXT, ':',
       recipient_profile_version::TEXT, ':',
@@ -2267,7 +2202,7 @@ BEGIN
     true
   );
 
-  UPDATE agent_iompcp_profile
+  UPDATE agent_icpwso_profile
   SET status = 'REVOKED',
       revoked_by = revoker_id,
       revoked_at = clock_timestamp()
@@ -2277,10 +2212,10 @@ BEGIN
 END
 $revoke$;
 
-CREATE FUNCTION nominate_agent_iompcp_card(
+CREATE FUNCTION nominate_agent_icpwso_packet(
   tenant_id BIGINT,
   recipient_session_id UUID,
-  recipient_card_id UUID,
+  recipient_packet_id UUID,
   recipient_nomination_id UUID,
   nomination_digest TEXT
 )
@@ -2288,27 +2223,27 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $nominate$
 DECLARE
-  catalog agent_iompcp_card_catalog%ROWTYPE;
+  catalog agent_icpwso_packet_catalog%ROWTYPE;
 BEGIN
-  IF recipient_card_id IS NULL THEN
+  IF recipient_packet_id IS NULL THEN
     RAISE EXCEPTION 'FULL SCAN REJECTED';
   END IF;
 
   SELECT * INTO catalog
-  FROM agent_iompcp_card_catalog
+  FROM agent_icpwso_packet_catalog
   WHERE account_id = tenant_id
-    AND card_id = recipient_card_id;
+    AND packet_id = recipient_packet_id;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'member point lookup missed';
+    RAISE EXCEPTION 'packet point lookup missed';
   END IF;
 
   IF catalog.citation_state IS DISTINCT FROM 'DROPPED'
      OR catalog.status IS DISTINCT FROM 'DROPPED'
      OR catalog.membership_state IS DISTINCT FROM 'OMITTED'
      OR catalog.catalog_status IS DISTINCT FROM 'INVALIDATED'
-     OR catalog.source_kind IS DISTINCT FROM 'SEALED_INVALIDATED_OMISSION_MEMBER_CARD' THEN
-    RAISE EXCEPTION 'live-card fence blocks nominating a live citation';
+     OR catalog.source_kind IS DISTINCT FROM 'SEALED_INVALIDATED_CONTEXT_PACKET' THEN
+    RAISE EXCEPTION 'live-packet fence blocks nominating a live context packet';
   END IF;
 
   IF catalog.effect_observation = 'ACKED'
@@ -2320,22 +2255,22 @@ BEGIN
   END IF;
 
   IF catalog.attested_key_kind IN ('TRUSTED_ENROLLED', 'TRUSTED_WITHIN_SKEW') THEN
-    RAISE EXCEPTION 'packet-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
+    RAISE EXCEPTION 'omission-as-trust fence blocks treating ACKED as TRUSTED_ENROLLED';
   END IF;
 
   IF catalog.inlines_fact_body OR catalog.fact_disposition = 'RESTORED' THEN
     RAISE EXCEPTION 'body-inline fence blocks inlining a disputed fact';
   END IF;
 
-  INSERT INTO agent_iompcp_nomination (
-    account_id, nomination_id, session_id, card_id,
+  INSERT INTO agent_icpwso_nomination (
+    account_id, nomination_id, session_id, packet_id,
     access_path, source_kind, gate_kind, gate_action,
     effect_observation, receipt_disposition, silence_inferred,
     citation_state, catalog_status, disputed_fact_hash, provider_receipt_hash,
     nomination_hash, nominated_at
   ) VALUES (
     tenant_id, recipient_nomination_id, recipient_session_id,
-    recipient_card_id, 'POINT_LOOKUP', catalog.source_kind,
+    recipient_packet_id, 'POINT_LOOKUP', catalog.source_kind,
     catalog.gate_kind, catalog.gate_action,
     catalog.effect_observation, catalog.receipt_disposition,
     catalog.silence_inferred, catalog.citation_state, catalog.catalog_status,
@@ -2345,60 +2280,60 @@ BEGIN
 END
 $nominate$;
 
-CREATE FUNCTION attach_agent_iompcp_packet(
+CREATE FUNCTION omit_agent_icpwso_working_set(
   tenant_id BIGINT,
-  recipient_card_id UUID,
   recipient_packet_id UUID,
+  recipient_member_id UUID,
   recipient_record_id UUID
 )
 RETURNS VOID
 LANGUAGE plpgsql
 AS $record_omission$
 DECLARE
-  catalog agent_iompcp_card_catalog%ROWTYPE;
-  member agent_iompcp_context_packet%ROWTYPE;
+  catalog agent_icpwso_packet_catalog%ROWTYPE;
+  member agent_icpwso_working_set_member%ROWTYPE;
 BEGIN
-  IF recipient_card_id IS NULL OR recipient_packet_id IS NULL THEN
+  IF recipient_packet_id IS NULL OR recipient_member_id IS NULL THEN
     RAISE EXCEPTION 'FULL SCAN REJECTED';
   END IF;
 
   SELECT * INTO catalog
-  FROM agent_iompcp_card_catalog
-  WHERE account_id = tenant_id
-    AND card_id = recipient_card_id;
-
-  IF NOT FOUND
-     OR catalog.citation_state IS DISTINCT FROM 'DROPPED'
-     OR catalog.catalog_status IS DISTINCT FROM 'INVALIDATED' THEN
-    RAISE EXCEPTION 'context packet requires an invalidated card point lookup';
-  END IF;
-
-  SELECT * INTO member
-  FROM agent_iompcp_context_packet
+  FROM agent_icpwso_packet_catalog
   WHERE account_id = tenant_id
     AND packet_id = recipient_packet_id;
 
   IF NOT FOUND
-     OR member.card_id IS DISTINCT FROM recipient_card_id
+     OR catalog.citation_state IS DISTINCT FROM 'DROPPED'
+     OR catalog.catalog_status IS DISTINCT FROM 'INVALIDATED' THEN
+    RAISE EXCEPTION 'working-set omission requires an invalidated context packet point lookup';
+  END IF;
+
+  SELECT * INTO member
+  FROM agent_icpwso_working_set_member
+  WHERE account_id = tenant_id
+    AND member_id = recipient_member_id;
+
+  IF NOT FOUND
+     OR member.packet_id IS DISTINCT FROM recipient_packet_id
      OR member.membership_state IS DISTINCT FROM 'OMITTED'
      OR member.citation_state IS DISTINCT FROM 'DROPPED'
      OR member.catalog_status IS DISTINCT FROM 'INVALIDATED'
      OR member.inlines_fact_body THEN
-    RAISE EXCEPTION 'context packet requires a sealed invalidated card';
+    RAISE EXCEPTION 'working-set omission requires a sealed invalidated context packet';
   END IF;
 
-  INSERT INTO agent_iompcp_publication_record (
-    account_id, record_id, card_id, packet_id,
+  INSERT INTO agent_icpwso_omission_publication (
+    account_id, record_id, packet_id, member_id,
     provider_receipt_hash, effect_observation, reason_code, created_at
   ) VALUES (
-    tenant_id, recipient_record_id, recipient_card_id, recipient_packet_id,
+    tenant_id, recipient_record_id, recipient_packet_id, recipient_member_id,
     member.provider_receipt_hash, member.effect_observation,
-    'INVALIDATED_MEMBER_CARD_ATTACHED', clock_timestamp()
+    'INVALIDATED_CONTEXT_PACKET_OMITTED', clock_timestamp()
   );
 END
 $record_omission$;
 
-CREATE FUNCTION reject_agent_iompcp_unscoped_scan(
+CREATE FUNCTION reject_agent_icpwso_unscoped_scan(
   has_account BOOLEAN,
   has_point_key BOOLEAN
 )
@@ -2412,75 +2347,75 @@ BEGIN
 END
 $reject_scan$;
 
-ALTER FUNCTION approve_agent_iompcp_profile(
+ALTER FUNCTION approve_agent_icpwso_profile(
   BIGINT, UUID, INTEGER, TEXT, TEXT
-) OWNER TO agent_iompcp_profile_authority;
-ALTER FUNCTION revoke_agent_iompcp_profile(
+) OWNER TO agent_icpwso_profile_authority;
+ALTER FUNCTION revoke_agent_icpwso_profile(
   BIGINT, UUID, INTEGER, TEXT, TEXT
-) OWNER TO agent_iompcp_profile_authority;
+) OWNER TO agent_icpwso_profile_authority;
 
-GRANT USAGE ON SCHEMA public TO agent_iompcp_profile_authority;
+GRANT USAGE ON SCHEMA public TO agent_icpwso_profile_authority;
 GRANT SELECT ON
-  agent_iompcp_profile,
-  agent_iompcp_profile_perceive_rule
-TO agent_iompcp_profile_authority;
+  agent_icpwso_profile,
+  agent_icpwso_profile_omit_rule
+TO agent_icpwso_profile_authority;
 GRANT UPDATE (
   status, approved_by, approved_at, approval_validation_hash,
   revoked_by, revoked_at
-) ON agent_iompcp_profile TO agent_iompcp_profile_authority;
+) ON agent_icpwso_profile TO agent_icpwso_profile_authority;
 
-REVOKE ALL ON FUNCTION approve_agent_iompcp_profile(
+REVOKE ALL ON FUNCTION approve_agent_icpwso_profile(
   BIGINT, UUID, INTEGER, TEXT, TEXT
 ) FROM PUBLIC;
-REVOKE ALL ON FUNCTION revoke_agent_iompcp_profile(
+REVOKE ALL ON FUNCTION revoke_agent_icpwso_profile(
   BIGINT, UUID, INTEGER, TEXT, TEXT
 ) FROM PUBLIC;
 REVOKE UPDATE (
   status, approved_by, approved_at, approval_validation_hash,
   revoked_by, revoked_at
-) ON agent_iompcp_profile FROM PUBLIC;
+) ON agent_icpwso_profile FROM PUBLIC;
 
-CREATE INDEX agent_iompcp_session_work_idx ON agent_iompcp_session (
+CREATE INDEX agent_icpwso_session_work_idx ON agent_icpwso_session (
   account_id, status, updated_at, session_id
 );
-CREATE INDEX agent_iompcp_session_profile_idx ON agent_iompcp_session (
+CREATE INDEX agent_icpwso_session_profile_idx ON agent_icpwso_session (
   account_id, profile_id, profile_version, created_at DESC
 );
-CREATE INDEX agent_iompcp_decision_card_idx ON agent_iompcp_packet_decision (
+CREATE INDEX agent_icpwso_decision_packet_idx ON agent_icpwso_omission_decision (
   account_id, certificate_id, sealed_at DESC, decision_id
 );
-CREATE INDEX agent_iompcp_decision_source_idx ON agent_iompcp_packet_decision (
-  account_id, card_id, sealed_at DESC, decision_id
+CREATE INDEX agent_icpwso_decision_source_idx ON agent_icpwso_omission_decision (
+  account_id, packet_id, sealed_at DESC, decision_id
 );
-CREATE INDEX agent_iompcp_catalog_ref_idx ON agent_iompcp_card_catalog (
-  account_id, card_ref, sealed_at DESC, card_id
+CREATE INDEX agent_icpwso_catalog_ref_idx ON agent_icpwso_packet_catalog (
+  account_id, packet_ref, sealed_at DESC, packet_id
 );
-CREATE INDEX agent_iompcp_catalog_kind_idx ON agent_iompcp_card_catalog (
-  account_id, source_kind, sealed_at DESC, card_id
+CREATE INDEX agent_icpwso_catalog_kind_idx ON agent_icpwso_packet_catalog (
+  account_id, source_kind, sealed_at DESC, packet_id
 );
-CREATE INDEX agent_iompcp_record_session_idx ON agent_iompcp_perceive_record (
+CREATE INDEX agent_icpwso_record_session_idx ON agent_icpwso_omit_compile (
   account_id, session_id, compiled_at DESC, compile_id
 );
-CREATE INDEX agent_iompcp_certificate_session_idx ON agent_iompcp_packet_certificate (
+CREATE INDEX agent_icpwso_certificate_session_idx ON agent_icpwso_omission_certificate (
   account_id, session_id, sealed_at DESC, certificate_id
 );
-CREATE INDEX agent_iompcp_nomination_session_idx ON agent_iompcp_nomination (
+CREATE INDEX agent_icpwso_nomination_session_idx ON agent_icpwso_nomination (
   account_id, session_id, nominated_at DESC, nomination_id
 );
-CREATE INDEX agent_iompcp_effect_work_idx ON agent_iompcp_effect_intent (
+CREATE INDEX agent_icpwso_effect_work_idx ON agent_icpwso_effect_intent (
   account_id, intent_status, updated_at, effect_id
 ) WHERE intent_status IN ('PREPARED', 'DISPATCHED', 'UNKNOWN_EFFECT');
-CREATE INDEX agent_iompcp_audit_time_idx ON agent_iompcp_audit_event (
+CREATE INDEX agent_icpwso_audit_time_idx ON agent_icpwso_audit_event (
   account_id, occurred_at, session_id, event_sequence
 );
-CREATE INDEX agent_iompcp_member_status_idx ON agent_iompcp_context_packet (
-  account_id, membership_state, created_at DESC, packet_id
+CREATE INDEX agent_icpwso_member_status_idx ON agent_icpwso_working_set_member (
+  account_id, membership_state, created_at DESC, member_id
 );
-CREATE INDEX agent_iompcp_command_expiry_idx ON agent_iompcp_command_result (
+CREATE INDEX agent_icpwso_command_expiry_idx ON agent_icpwso_command_result (
   account_id, expires_at, operation_name, principal_id
 );
-CREATE INDEX agent_iompcp_publication_record_card_idx ON agent_iompcp_publication_record (
-  account_id, card_id, created_at DESC, record_id
+CREATE INDEX agent_icpwso_omission_publication_packet_idx ON agent_icpwso_omission_publication (
+  account_id, packet_id, created_at DESC, record_id
 );
 
 DO $tenant_isolation$
@@ -2488,26 +2423,26 @@ DECLARE
   table_name TEXT;
 BEGIN
   FOREACH table_name IN ARRAY ARRAY[
-    'agent_iompcp_authorization_evidence',
-    'agent_iompcp_profile',
-    'agent_iompcp_profile_perceive_rule',
-    'agent_iompcp_card_catalog',
-    'agent_iompcp_session',
-    'agent_iompcp_nomination',
-    'agent_iompcp_metadata_binding',
-    'agent_iompcp_perceive_record',
-    'agent_iompcp_packet_certificate',
-    'agent_iompcp_packet_decision',
-    'agent_iompcp_context_packet',
-    'agent_iompcp_publication_record',
-    'agent_iompcp_effect_intent',
-    'agent_iompcp_budget_ledger',
-    'agent_iompcp_terminal_record',
-    'agent_iompcp_command_result',
-    'agent_iompcp_audit_head',
-    'agent_iompcp_audit_event',
-    'agent_iompcp_audit_anchor',
-    'agent_iompcp_projection_checkpoint'
+    'agent_icpwso_authorization_evidence',
+    'agent_icpwso_profile',
+    'agent_icpwso_profile_omit_rule',
+    'agent_icpwso_packet_catalog',
+    'agent_icpwso_session',
+    'agent_icpwso_nomination',
+    'agent_icpwso_metadata_binding',
+    'agent_icpwso_omit_compile',
+    'agent_icpwso_omission_certificate',
+    'agent_icpwso_omission_decision',
+    'agent_icpwso_working_set_member',
+    'agent_icpwso_omission_publication',
+    'agent_icpwso_effect_intent',
+    'agent_icpwso_budget_ledger',
+    'agent_icpwso_terminal_record',
+    'agent_icpwso_command_result',
+    'agent_icpwso_audit_head',
+    'agent_icpwso_audit_event',
+    'agent_icpwso_audit_anchor',
+    'agent_icpwso_projection_checkpoint'
   ]
   LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
@@ -2525,29 +2460,21 @@ $tenant_isolation$;
 
 ### 8.1 Transaction boundaries
 
-Open, nominate, bind, evaluate, seal, publish, and
-effect-prepare each run in a single ACID row-store
-transaction with session compare-and-swap. Packet seal
-never joins a neighbor board write, never updates the
-disputed fact, and never rewrites the successor clock.
-`attach_agent_iompcp_packet` reads the card catalog and the
-packet by primary key `(account_id, card_id)` and
-`(account_id, packet_id)`. It appends a publication record.
-It does not scan perception cards and it does not rewrite
-the source card or the packet body.
+Nomination, metadata bind, evaluation, seal, and the
+working-set member commit or roll back together.
+Publication is its own append. Notify dispatch is not part
+of the database transaction. `state_revision` is the
+compare-and-swap token for session commands.
 
 ### 8.2 Tenant isolation
 
-Forced RLS on every table. Resolvers set `app.account_id`
-before query. Composite primary keys and every access index
-lead with `account_id`.
+`account_id` is the first column of every table and every
+index. `FORCE ROW LEVEL SECURITY` applies
+`tenant_isolation` using `app.account_id`. Cross-tenant
+reads and writes fail closed. There is no global packet
+catalog.
 
 ## 9. Open API GraphQL contract
-
-All functionality is available through the monday.com Open
-API. Long-running notify work returns durable state, not a
-synchronous board promise. Profile search discovers
-procedural memory. It does not authorize a context packet.
 
 ```graphql
 scalar DateTime
@@ -2555,7 +2482,7 @@ scalar Long
 scalar JSON
 scalar SHA256
 
-enum AgentIompcpSessionStatus {
+enum AgentIcpwsoSessionStatus {
   OPEN
   NOMINATING
   COMPILING
@@ -2569,41 +2496,41 @@ enum AgentIompcpSessionStatus {
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpCompileKind {
-  ATTACH_INVALIDATED_MEMBER_CARD
+enum AgentIcpwsoCompileKind {
+  OMIT_INVALIDATED_CONTEXT_PACKET
   HOLD_UNKNOWN_EFFECT
-  DENY_PACKET_AS_TRUST
-  DENY_PACKET_AS_RESTORE
+  DENY_OMISSION_AS_TRUST
+  DENY_OMISSION_AS_RESTORE
   DENY_BODY_INLINE
   DENY_ACK_AS_TRUST
-  DENY_CARD_SCAN
+  DENY_PACKET_SCAN
   DENY_NESTED_EXPIRY
   SKIP
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpCitationState {
+enum AgentIcpwsoCitationState {
   DROPPED
   ATTACHED
   HELD
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpSourceCatalogStatus {
+enum AgentIcpwsoSourceCatalogStatus {
   INVALIDATED
   ATTACHED
   LIVE
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpMembershipState {
+enum AgentIcpwsoMembershipState {
   OMITTED
   INCLUDED
   HELD
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpEffectObservation {
+enum AgentIcpwsoEffectObservation {
   ACKED
   FAILED
   DISPATCHED
@@ -2611,7 +2538,7 @@ enum AgentIompcpEffectObservation {
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpEffectStatus {
+enum AgentIcpwsoEffectStatus {
   PREPARED
   DISPATCHED
   ACKED
@@ -2619,8 +2546,8 @@ enum AgentIompcpEffectStatus {
   UNKNOWN_EFFECT
 }
 
-enum AgentIompcpNextAction {
-  NOMINATE_INVALIDATED_MEMBER_CARD
+enum AgentIcpwsoNextAction {
+  NOMINATE_INVALIDATED_CONTEXT_PACKET
   BIND_UNTRUSTED_METADATA
   EVALUATE_INVALIDATED_PERCEPTION
   SEAL_INVALIDATED_PERCEPTION
@@ -2630,22 +2557,22 @@ enum AgentIompcpNextAction {
   CLOSE_SESSION
 }
 
-enum AgentIompcpBlockedReason {
+enum AgentIcpwsoBlockedReason {
   PROFILE_INACTIVE
   PURPOSE_DENIED
   BUDGET_EXHAUSTED
-  CARD_MISSING
+  PACKET_MISSING
   PACKET_AS_TRUST_DENIED
   PACKET_AS_RESTORE_DENIED
   BODY_INLINE_DENIED
   CITATION_STILL_ATTACHED
   CATALOG_NOT_INVALIDATED
   NESTED_EXPIRY_DENIED
-  CARD_SCAN_DENIED
+  PACKET_SCAN_DENIED
   UNKNOWN_EFFECT
 }
 
-type AgentIompcpProfile {
+type AgentIcpwsoProfile {
   accountId: Long!
   profileId: ID!
   profileVersion: Int!
@@ -2657,55 +2584,55 @@ type AgentIompcpProfile {
   procedureRef: String
 }
 
-type AgentIompcpSession {
+type AgentIcpwsoSession {
   accountId: Long!
   sessionId: ID!
   profileId: ID!
   profileVersion: Int!
-  status: AgentIompcpSessionStatus!
+  status: AgentIcpwsoSessionStatus!
   stateRevision: Long!
   purpose: String!
   deadlineAt: DateTime!
 }
 
-type AgentIompcpCardCatalogEntry {
+type AgentIcpwsoPacketCatalogEntry {
   accountId: Long!
-  cardId: ID!
+  packetId: ID!
   sourceKind: String!
-  citationState: AgentIompcpCitationState!
-  catalogStatus: AgentIompcpSourceCatalogStatus!
+  citationState: AgentIcpwsoCitationState!
+  catalogStatus: AgentIcpwsoSourceCatalogStatus!
   gateKind: String!
   gateAction: String!
   disputedFactHash: SHA256!
   providerReceiptHash: SHA256!
-  effectObservation: AgentIompcpEffectObservation!
+  effectObservation: AgentIcpwsoEffectObservation!
   status: String!
 }
 
-type AgentIompcpCertificate {
+type AgentIcpwsoCertificate {
   accountId: Long!
   certificateId: ID!
   sessionId: ID!
   consumerRef: String!
   providerReceiptHash: SHA256!
   disputedFactHash: SHA256!
-  compileKind: AgentIompcpCompileKind!
-  effectObservation: AgentIompcpEffectObservation!
+  compileKind: AgentIcpwsoCompileKind!
+  effectObservation: AgentIcpwsoEffectObservation!
   sealedAt: DateTime!
 }
 
-type AgentIompcpContextPacket {
+type AgentIcpwsoWorkingSetMember {
   accountId: Long!
   sessionId: ID!
+  memberId: ID!
   packetId: ID!
-  cardId: ID!
-  status: AgentIompcpSessionStatus!
+  status: AgentIcpwsoSessionStatus!
   summary: String!
-  membershipState: AgentIompcpMembershipState!
-  citationState: AgentIompcpCitationState!
-  catalogStatus: AgentIompcpSourceCatalogStatus!
+  membershipState: AgentIcpwsoMembershipState!
+  citationState: AgentIcpwsoCitationState!
+  catalogStatus: AgentIcpwsoSourceCatalogStatus!
   metadataTrust: String!
-  effectObservation: AgentIompcpEffectObservation!
+  effectObservation: AgentIcpwsoEffectObservation!
   providerReceiptHash: SHA256!
   disputedFactHash: SHA256!
   factDisposition: String!
@@ -2713,29 +2640,29 @@ type AgentIompcpContextPacket {
   bodyVisibility: String!
   inlinesFactBody: Boolean!
   unknownEffectCount: Int!
-  allowedNextActions: [AgentIompcpNextAction!]!
-  blockedReasons: [AgentIompcpBlockedReason!]!
-  packetHash: SHA256!
+  allowedNextActions: [AgentIcpwsoNextAction!]!
+  blockedReasons: [AgentIcpwsoBlockedReason!]!
+  memberHash: SHA256!
 }
 
-type AgentIompcpAuditHead {
+type AgentIcpwsoAuditHead {
   accountId: Long!
   headSequence: Long!
   headHash: SHA256!
   updatedAt: DateTime!
 }
 
-type AgentIompcpResult {
+type AgentIcpwsoResult {
   decision: String!
   retryable: Boolean!
   reason: String!
-  session: AgentIompcpSession
-  certificate: AgentIompcpCertificate
-  perception: AgentIompcpContextPacket
+  session: AgentIcpwsoSession
+  certificate: AgentIcpwsoCertificate
+  perception: AgentIcpwsoWorkingSetMember
   auditHash: SHA256!
 }
 
-input AgentIompcpBudgetInput {
+input AgentIcpwsoBudgetInput {
   nominateUnits: Int!
   bindUnits: Int!
   sealUnits: Int!
@@ -2744,41 +2671,41 @@ input AgentIompcpBudgetInput {
   notifyUnits: Int!
   maxWallTimeMs: Int!
   compileThreshold: Int!
-  maxCardsPerSession: Int!
-  maxNominatedCards: Int!
+  maxPacketsPerSession: Int!
+  maxNominatedPackets: Int!
 }
 
-input CreateInvalidatedMemberContextPacketSessionInput {
+input CreateInvalidatedContextPacketOmissionSessionInput {
   accountId: Long!
   profileId: ID!
   profileVersion: Int!
   purpose: String!
   idempotencyKey: String!
-  budget: AgentIompcpBudgetInput!
+  budget: AgentIcpwsoBudgetInput!
 }
 
-input NominateInvalidatedMemberCardInput {
+input NominateInvalidatedContextPacketInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
-  cardId: ID!
+  packetId: ID!
   expectedDisputedFactHash: SHA256!
   expectedProviderReceiptHash: SHA256!
   idempotencyKey: String!
 }
 
-input BindInvalidatedMemberContextPacketMetadataInput {
+input BindInvalidatedContextPacketOmissionMetadataInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
-  cardId: ID!
+  packetId: ID!
   providerReceiptHash: SHA256!
-  effectObservation: AgentIompcpEffectObservation!
+  effectObservation: AgentIcpwsoEffectObservation!
   silenceInferred: Boolean!
   idempotencyKey: String!
 }
 
-input EvaluateInvalidatedMemberContextPacketInput {
+input EvaluateInvalidatedContextPacketOmissionInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
@@ -2787,29 +2714,29 @@ input EvaluateInvalidatedMemberContextPacketInput {
   idempotencyKey: String!
 }
 
-input SealInvalidatedMemberContextPacketInput {
+input SealInvalidatedContextPacketOmissionInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
   compileId: ID!
   consumerRef: String!
-  packetStewardA: String!
-  packetStewardB: String!
+  omissionStewardA: String!
+  omissionStewardB: String!
   expectedDisputedFactHash: SHA256!
   idempotencyKey: String!
 }
 
-input RecordInvalidatedMemberContextPacketInput {
+input RecordInvalidatedContextPacketOmissionInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
-  cardId: ID!
   packetId: ID!
+  memberId: ID!
   reasonCode: String!
   idempotencyKey: String!
 }
 
-input PrepareInvalidatedMemberContextPacketNotifyInput {
+input PrepareInvalidatedContextPacketOmissionNotifyInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
@@ -2817,7 +2744,7 @@ input PrepareInvalidatedMemberContextPacketNotifyInput {
   idempotencyKey: String!
 }
 
-input RecordInvalidatedMemberContextPacketNotifyUncertaintyInput {
+input RecordInvalidatedContextPacketOmissionNotifyUncertaintyInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
@@ -2826,14 +2753,14 @@ input RecordInvalidatedMemberContextPacketNotifyUncertaintyInput {
   idempotencyKey: String!
 }
 
-input CloseInvalidatedMemberContextPacketSessionInput {
+input CloseInvalidatedContextPacketOmissionSessionInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
   idempotencyKey: String!
 }
 
-input AttachInvalidatedMemberContextPacketInput {
+input OmitInvalidatedContextPacketFromWorkingSetInput {
   accountId: Long!
   sessionId: ID!
   expectedRevision: Long!
@@ -2841,53 +2768,52 @@ input AttachInvalidatedMemberContextPacketInput {
 }
 
 type Query {
-  invalidatedMemberContextPacketProfile(accountId: Long!, profileId: ID!, profileVersion: Int!): AgentIompcpProfile
-  invalidatedMemberContextPacketSession(accountId: Long!, sessionId: ID!): AgentIompcpSession
-  invalidatedMemberCardCatalogEntry(accountId: Long!, cardId: ID!): AgentIompcpCardCatalogEntry
-  invalidatedMemberContextPacketCertificate(accountId: Long!, certificateId: ID!): AgentIompcpCertificate
-  invalidatedMemberContextPacket(accountId: Long!, packetId: ID!): AgentIompcpContextPacket
-  invalidatedMemberContextPacketAuditReplay(accountId: Long!, sessionId: ID!): AgentIompcpAuditHead
+  invalidatedContextPacketOmissionProfile(accountId: Long!, profileId: ID!, profileVersion: Int!): AgentIcpwsoProfile
+  invalidatedContextPacketOmissionSession(accountId: Long!, sessionId: ID!): AgentIcpwsoSession
+  invalidatedContextPacketCatalogEntry(accountId: Long!, packetId: ID!): AgentIcpwsoPacketCatalogEntry
+  invalidatedContextPacketOmissionCertificate(accountId: Long!, certificateId: ID!): AgentIcpwsoCertificate
+  invalidatedContextPacketOmission(accountId: Long!, memberId: ID!): AgentIcpwsoWorkingSetMember
+  invalidatedContextPacketOmissionAuditReplay(accountId: Long!, sessionId: ID!): AgentIcpwsoAuditHead
 }
 
 type Mutation {
-  createInvalidatedMemberContextPacketSession(input: CreateInvalidatedMemberContextPacketSessionInput!): AgentIompcpResult!
-  nominateInvalidatedMemberCard(input: NominateInvalidatedMemberCardInput!): AgentIompcpResult!
-  bindInvalidatedMemberContextPacketMetadata(input: BindInvalidatedMemberContextPacketMetadataInput!): AgentIompcpResult!
-  evaluateInvalidatedMemberContextPacket(input: EvaluateInvalidatedMemberContextPacketInput!): AgentIompcpResult!
-  sealInvalidatedMemberContextPacket(input: SealInvalidatedMemberContextPacketInput!): AgentIompcpResult!
-  recordInvalidatedMemberContextPacket(input: RecordInvalidatedMemberContextPacketInput!): AgentIompcpResult!
-  prepareInvalidatedMemberContextPacketNotify(input: PrepareInvalidatedMemberContextPacketNotifyInput!): AgentIompcpResult!
-  recordInvalidatedMemberContextPacketNotifyUncertainty(input: RecordInvalidatedMemberContextPacketNotifyUncertaintyInput!): AgentIompcpResult!
-  closeInvalidatedMemberContextPacketSession(input: CloseInvalidatedMemberContextPacketSessionInput!): AgentIompcpResult!
-  attachInvalidatedMemberContextPacket(input: AttachInvalidatedMemberContextPacketInput!): AgentIompcpResult!
+  createInvalidatedContextPacketOmissionSession(input: CreateInvalidatedContextPacketOmissionSessionInput!): AgentIcpwsoResult!
+  nominateInvalidatedContextPacket(input: NominateInvalidatedContextPacketInput!): AgentIcpwsoResult!
+  bindInvalidatedContextPacketOmissionMetadata(input: BindInvalidatedContextPacketOmissionMetadataInput!): AgentIcpwsoResult!
+  evaluateInvalidatedContextPacketOmission(input: EvaluateInvalidatedContextPacketOmissionInput!): AgentIcpwsoResult!
+  sealInvalidatedContextPacketOmission(input: SealInvalidatedContextPacketOmissionInput!): AgentIcpwsoResult!
+  recordInvalidatedContextPacketOmission(input: RecordInvalidatedContextPacketOmissionInput!): AgentIcpwsoResult!
+  prepareInvalidatedContextPacketOmissionNotify(input: PrepareInvalidatedContextPacketOmissionNotifyInput!): AgentIcpwsoResult!
+  recordInvalidatedContextPacketOmissionNotifyUncertainty(input: RecordInvalidatedContextPacketOmissionNotifyUncertaintyInput!): AgentIcpwsoResult!
+  closeInvalidatedContextPacketOmissionSession(input: CloseInvalidatedContextPacketOmissionSessionInput!): AgentIcpwsoResult!
+  omitInvalidatedContextPacketFromWorkingSet(input: OmitInvalidatedContextPacketFromWorkingSetInput!): AgentIcpwsoResult!
 }
 ```
 
 ### GraphQL limits
 
-Resolvers require `accountId` and reject missing tenant
-scope. Catalog and certificate reads are primary-key point
-lookups of `(account_id, card_id)` or
-`(account_id, certificate_id)`. Packet and audit reads are
-bounded by one id. There is no list-all-cards field and
-no list-all-packets field. A client that asks for every
-invalidated card on a board is **FULL SCAN REJECTED** before
-execution.
+The schema exposes 6 point-lookup queries and 10 mutations.
+Every operation takes `accountId`. There is no unbounded
+list of context packets. Resolvers that would scan a board
+with 1M+ rows are **FULL SCAN REJECTED** before planning.
+`omitInvalidatedContextPacketFromWorkingSet` repeats one
+already sealed member. It does not search for the next
+packet to drop.
 
 ## 10. Procedural memory
 
 The approved profile is the instruction an agent may
-follow. `compile_instruction` records that one context
-packet attaches one sealed invalidated omission-member
-card, repeats membership `OMITTED`, citation `DROPPED`,
-and catalog status `INVALIDATED` as untrusted metadata,
-and never treats `ACKED` as trust. `procedureRef` points
-at that profile version. Agents do not store a second
-hidden policy. If the profile is revoked with
-`STOP_BEFORE_ATTACH`, new nominations stop. In-flight
-packets remain replayable.
+follow. `compile_instruction` records that one working-set
+compile omits one sealed invalidated context packet,
+repeats membership `OMITTED`, citation `DROPPED`, and
+catalog status `INVALIDATED` as untrusted metadata, and
+never treats `ACKED` as trust. `procedureRef` points at
+that profile version. Agents do not store a second hidden
+policy. If the profile is revoked with `STOP_BEFORE_OMIT`,
+new nominations stop. In-flight omissions remain
+replayable.
 
-Semantic tags (`incident`, `invalidated-omission-member`)
+Semantic tags (`incident`, `invalidated-context-packet`)
 are for discovery. They are not authorization.
 
 ## 11. Semantic retrieval and HNSW compatibility
@@ -2898,7 +2824,7 @@ Queries must filter `account_id` before topK. A global ANN
 index would mix tenants and is rejected.
 
 ```sql
-CREATE TABLE agent_iompcp_profile_embedding (
+CREATE TABLE agent_icpwso_profile_embedding (
   account_id BIGINT NOT NULL,
   profile_id UUID NOT NULL,
   profile_version INTEGER NOT NULL,
@@ -2910,12 +2836,12 @@ CREATE TABLE agent_iompcp_profile_embedding (
   updated_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, profile_id, profile_version),
   FOREIGN KEY (account_id, profile_id, profile_version)
-    REFERENCES agent_iompcp_profile (account_id, profile_id, profile_version)
+    REFERENCES agent_icpwso_profile (account_id, profile_id, profile_version)
 );
 
-ALTER TABLE agent_iompcp_profile_embedding ENABLE ROW LEVEL SECURITY;
-ALTER TABLE agent_iompcp_profile_embedding FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON agent_iompcp_profile_embedding
+ALTER TABLE agent_icpwso_profile_embedding ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_icpwso_profile_embedding FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON agent_icpwso_profile_embedding
   USING (account_id = NULLIF(current_setting('app.account_id', true), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', true), '')::BIGINT);
 ```
@@ -2925,43 +2851,45 @@ CREATE POLICY tenant_isolation ON agent_iompcp_profile_embedding
 -- only inside an account-partitioned table or segment. Never build one
 -- global ANN index across tenants. Reference validation intentionally
 -- omits that DDL. ANN queries must include account_id equality before topK.
--- Unscoped member-catalog or board walks are FULL SCAN REJECTED.
+-- Unscoped context-packet catalog or board walks are FULL SCAN REJECTED.
 ```
 
 An HNSW hit returns a profile id. The caller still opens a
-session, nominates one invalidated card by primary key
-`(account_id, card_id)`, and seals under dual control.
-Similarity never attaches a packet and never puts an
-omitted member back into the working set.
+session, nominates one invalidated context packet by
+primary key `(account_id, packet_id)`, and seals under
+dual control. Similarity never omits a packet and never
+puts an omitted member back into the working set.
 
 ## 12. Agent perception
 
-Agents receive one context packet per session. The packet
-exposes `membershipState`, `citationState`,
+Agents receive one working-set member per session. The
+member exposes `membershipState`, `citationState`,
 `catalogStatus`, `metadataTrust`, `effectObservation`,
 `providerReceiptHash`, and `disputedFactHash` as separate
 metadata, plus `factDisposition`, `attestedKeyKind`, and
-`bodyVisibility`. Summary text is `UntrustedText`. Packets
-also expose included-member rejection counts,
-unknown-effect counts, card-scan denials, remaining
-budgets, procedure tags, allowed next actions, and blocked
-reasons. They never embed raw private keys, tool payloads,
-fact bodies, or a winning fact hash. `packetHash` makes
-perception replayable.
+`bodyVisibility`. Summary text is `UntrustedText`. Members
+also expose omission counts, unknown-effect counts,
+packet-scan denials, remaining budgets, procedure tags,
+allowed next actions, and blocked reasons. They never
+embed raw private keys, tool payloads, fact bodies, or a
+winning fact hash. `memberHash` makes perception
+replayable.
 
-An LLM should read the packet as: "one sealed invalidated
-omission-member card was attached by point lookup of
-`(account_id, card_id)`. Membership is `OMITTED`, the
-citation is `DROPPED`, and the catalog status is
-`INVALIDATED`, all as `UNTRUSTED_METADATA`. The effect is
-either `ACKED` with this untrusted receipt hash or still
-`UNKNOWN_EFFECT`." It should not read the packet as "the
-disputed fact is now false," "the fact body is available,"
-"the catalog status promotes the key," or "the signing key
-is `TRUSTED_ENROLLED`." Metadata tags that keep that
-reading stable are `metadataTrust=UNTRUSTED_METADATA`,
+An LLM should read the member as: "one sealed invalidated
+context packet was omitted from the next working-set
+compile by point lookup of `(account_id, packet_id)`.
+Membership is `OMITTED`, the citation is `DROPPED`, and
+the catalog status is `INVALIDATED`, all as
+`UNTRUSTED_METADATA`. The effect is either `ACKED` with
+this untrusted receipt hash or still `UNKNOWN_EFFECT`."
+It should not read the member as "the disputed fact is now
+false," "the fact body is available," "the catalog status
+promotes the key," or "the signing key is
+`TRUSTED_ENROLLED`." Metadata tags that keep that reading
+stable are `metadataTrust=UNTRUSTED_METADATA`,
 `membershipState=OMITTED`, `citationState=DROPPED`,
-`catalogStatus=INVALIDATED`, `factDisposition=DISPUTED_HELD`,
+`catalogStatus=INVALIDATED`,
+`factDisposition=DISPUTED_HELD`,
 `attestedKeyKind=AWAITING_CONFIRMATION`,
 `bodyVisibility=OMITTED`, and `inlinesFactBody=false`.
 
@@ -2972,41 +2900,42 @@ reading stable are `metadataTrust=UNTRUSTED_METADATA`,
 Nomination, metadata bind, evaluation, and seal commit or
 roll back together. Compare-and-swap on `state_revision`
 rejects lost updates. Decision identity is immutable. The
-packet is a projection of one invalidated card, not a
-second fact. The publication record is its own transaction
-and appends history without rewriting the packet.
+working-set member is a projection of one invalidated
+context packet, not a second fact. The publication record
+is its own transaction and appends history without
+rewriting the member.
 
 ### Columnar store
 
 Analytical counts of compile kinds, membership states, and
 effect observations are derived from the row store by
 `account_id`. They lag the seal watermark and cannot
-authorize a new packet or restore an omitted member.
+authorize a new omission or restore an omitted packet.
 
 ### Vector store
 
 Embeddings track approved profile versions. A revoked
 profile's vector may remain discoverable until the next
-projection, but discovery never nominates a card. Account
-predicates are applied before HNSW topK.
+projection, but discovery never nominates a packet.
+Account predicates are applied before HNSW topK.
 
 ### External tools
 
 Notify providers sit outside the ACID boundary. Silence and
 ambiguous responses stay `UNKNOWN_EFFECT`. A notify
-acknowledgement cannot include a member, inline a fact
+acknowledgement cannot include a packet, inline a fact
 body, or promote `ACKED` to `TRUSTED_ENROLLED`.
 
 ## 14. Guardrails and neighbor protection
 
-Attach budgets cap nominate, bind, seal, vector, publish,
-and notify units per session. The one-card cap rejects a
+Omit budgets cap nominate, bind, seal, vector, publish,
+and notify units per session. The one-packet cap rejects a
 second nomination before it can fan out into recursive
-retrieval. A packet cannot schedule another compile of
-itself and cannot open a nested expiry. `CARD_SCAN`,
+retrieval. An omission cannot schedule another compile of
+itself and cannot open a nested expiry. `PACKET_SCAN`,
 `LEDGER_SCAN`, missing `account_id`, and a missing
-`card_id` are **FULL SCAN REJECTED** by
-`reject_agent_iompcp_unscoped_scan` before the planner
+`packet_id` are **FULL SCAN REJECTED** by
+`reject_agent_icpwso_unscoped_scan` before the planner
 touches a board with 1M+ rows. Vector discovery is capped
 by `budget_vector_units` and cannot authorize seal. Halted
 and quarantined bodies stay `OMITTED`.
@@ -3015,22 +2944,26 @@ and quarantined bodies stay `OMITTED`.
 
 ### Full-table-scan risks
 
-- Listing every perception card for an account to "find
-  the invalidated ones before attaching a packet."
+- Listing every context packet for an account to "find the
+  invalidated ones before omitting them from the working
+  set."
 - Joining context packets to board items or citation
   ledgers to recover a fact body.
 - Building one global HNSW index and authorizing from the
   nearest profile.
-- Attaching a packet by scanning every prior omission
+- Omitting a packet by scanning every prior omission
   record.
 
-Each of those plans is **FULL SCAN REJECTED**.
+Each of those plans is **FULL SCAN REJECTED**. The primary
+path is one index lookup on `(account_id, packet_id)`,
+which stays selective on boards with 1M+ rows.
 
 ### Required access paths
 
-- Card nomination and packet attach: primary key
-  `(account_id, card_id)`.
-- Context packet read: primary key `(account_id, packet_id)`.
+- Packet nomination and working-set omission: primary key
+  `(account_id, packet_id)`.
+- Working-set member read: primary key
+  `(account_id, member_id)`.
 - Session and audit reads: `(account_id, session_id)` plus
   the session work index.
 - Profile discovery: `account_id` equality, then HNSW topK
@@ -3038,47 +2971,49 @@ Each of those plans is **FULL SCAN REJECTED**.
 
 ### Planner enforcement
 
-`nominate_agent_iompcp_card` and `attach_agent_iompcp_packet`
-refuse a null point key. Resolvers do not expose an
-unbounded list field. The reference schema creates no
-cross-tenant HNSW index.
+`nominate_agent_icpwso_packet` and
+`omit_agent_icpwso_working_set` refuse a null point key.
+Resolvers do not expose an unbounded list field. The
+reference schema creates no cross-tenant HNSW index.
 
 ## 16. Auditability and replay
 
-`agent_iompcp_audit_event` is a hash chain per `account_id`.
-Anchors store a Merkle root over a sequence range. Replay
-recomputes the attach decision from the sealed card
-hashes, the dual-control stewards, and the membership,
-citation, and catalog status. It does not call an LLM and
-does not reconstruct a fact body. A publication record
-stores `INVALIDATED_MEMBER_CARD_ATTACHED` without erasing
-the historical receipt hash and without promoting `ACKED`.
+`agent_icpwso_audit_event` is a hash chain per
+`account_id`. Anchors store a Merkle root over a sequence
+range. Replay recomputes the omit decision from the sealed
+packet hashes, the dual-control stewards, and the
+membership, citation, and catalog status. It does not call
+an LLM and does not reconstruct a fact body. A publication
+record stores `INVALIDATED_CONTEXT_PACKET_OMITTED` without
+erasing the historical receipt hash and without promoting
+`ACKED`.
 
 ## 17. Threat and failure analysis
 
-- **Packet-as-trust:** a compiler writes `TRUSTED_ENROLLED`
-  because the effect was `ACKED`. Rejected.
-- **Packet-as-restore:** a compiler writes `RESTORED`,
+- **Omission-as-trust:** a compiler writes
+  `TRUSTED_ENROLLED` because the effect was `ACKED`.
+  Rejected.
+- **Omission-as-restore:** a compiler writes `RESTORED`,
   `INCLUDED`, `ATTACHED`, or `BODY_VISIBLE`. Rejected.
-- **Body inline:** `packet_body` contains `factBody`.
+- **Body inline:** `member_body` contains `factBody`.
   Rejected.
 - **Silence-as-ack:** `ACKED` with `silence_inferred`.
   Rejected.
-- **Live card:** the catalog membership is `INCLUDED`, the
-  citation is `ATTACHED`, or the catalog status is not
-  `INVALIDATED`, and the compiler still tries to attach
-  it. Nomination and seal are rejected. This plane does
-  not invent an omission or an invalidation.
+- **Live packet:** the catalog membership is `INCLUDED`,
+  the citation is `ATTACHED`, or the catalog status is not
+  `INVALIDATED`, and the compiler still tries to omit it.
+  Nomination and seal are rejected. This plane does not
+  invent an omission or an invalidation.
 - **Nested expiry:** `opens_nested_expiry` is rejected.
-  Attach does not start another review cycle.
-- **Card scan and hop leak:** `CARD_SCAN`, `LEDGER_SCAN`,
-  and purpose amplification are rejected.
-- **Prior steward reuse:** card, omission, compiler,
-  perception, receipt, gate, and extension stewards cannot
-  seal the packet.
-- **Neighbor damage:** unscoped scans and a second card in
-  the same session are rejected before they touch a 1M+
-  row board.
+  Omission does not start another review cycle.
+- **Packet scan and hop leak:** `PACKET_SCAN`,
+  `LEDGER_SCAN`, and purpose amplification are rejected.
+- **Prior steward reuse:** packet, card, omission,
+  compiler, perception, receipt, gate, and extension
+  stewards cannot seal the omission.
+- **Neighbor damage:** unscoped scans and a second packet
+  in the same session are rejected before they touch a
+  1M+ row board.
 
 ## 18. Observability and SLOs
 
@@ -3088,33 +3023,34 @@ traffic. This plane's SLOs are:
 - point-lookup nomination p99 under 20 ms inside the
   tenant partition;
 - seal transaction p99 under 50 ms with no board write;
-- attach append p99 under 20 ms after the packet is
+- omission append p99 under 20 ms after the member is
   sealed;
-- zero packets sealed with `inlines_fact_body = true`;
-- zero `OMITTED` packets whose catalog membership is not
+- zero members sealed with `inlines_fact_body = true`;
+- zero `OMITTED` members whose catalog membership is not
   `OMITTED`, whose catalog citation is not `DROPPED`, or
   whose catalog status is not `INVALIDATED`;
-- `UNKNOWN_EFFECT` notify age visible on the context
-  packet.
+- `UNKNOWN_EFFECT` notify age visible on the working-set
+  member.
 
-Columnar counts of attached, held, and denied packets are
+Columnar counts of omitted, held, and denied packets are
 operational. They are not authorization.
 
 ## 19. Rollout
 
-### Phase 1: shadow packets
+### Phase 1: shadow omissions
 
-Compile packets in shadow mode. Agents do not read them.
-Compare packet metadata with the source invalidated card.
+Compile omissions in shadow mode. Agents do not read them.
+Compare member metadata with the source invalidated
+context packet.
 
 ### Phase 2: deny-only
 
-Serve `DENY_PACKET_AS_TRUST`, `DENY_PACKET_AS_RESTORE`,
-`DENY_BODY_INLINE`, and `DENY_CARD_SCAN`. Do not attach.
+Serve `DENY_OMISSION_AS_TRUST`, `DENY_OMISSION_AS_RESTORE`,
+`DENY_BODY_INLINE`, and `DENY_PACKET_SCAN`. Do not omit.
 
-### Phase 3: one attached card
+### Phase 3: one omitted packet
 
-Allow `ATTACH_INVALIDATED_MEMBER_CARD` for approved
+Allow `OMIT_INVALIDATED_CONTEXT_PACKET` for approved
 profiles. Facts stay `DISPUTED_HELD`. Metadata stays
 untrusted. Membership is `OMITTED`. Citation is `DROPPED`.
 Catalog status is `INVALIDATED`.
@@ -3128,7 +3064,7 @@ promote `ACKED`.
 ### Phase 5: broad availability
 
 Default-on for tenants that already publish invalidated
-omission-member perception cards. Profiles still require
+omission-member context packets. Profiles still require
 dual control. Similarity still cannot seal.
 
 ## 20. Ship criteria
@@ -3142,48 +3078,49 @@ with `account_id`.
 
 ### Behavioral validation
 
-- An invalidated card can be nominated by
-  `(account_id, card_id)` and attached once.
-- The packet repeats `OMITTED`, `DROPPED`, `INVALIDATED`,
-  `ACKED`, and the receipt hash as `UNTRUSTED_METADATA`
-  while the key stays `AWAITING_CONFIRMATION` and the fact
-  stays `DISPUTED_HELD`.
+- An invalidated context packet can be nominated by
+  `(account_id, packet_id)` and omitted once.
+- The working-set member repeats `OMITTED`, `DROPPED`,
+  `INVALIDATED`, `ACKED`, and the receipt hash as
+  `UNTRUSTED_METADATA` while the key stays
+  `AWAITING_CONFIRMATION` and the fact stays
+  `DISPUTED_HELD`.
 - `TRUSTED_ENROLLED`, `RESTORED`, `BODY_VISIBLE`,
   `INCLUDED`, and `factBody` are rejected.
-- `CARD_SCAN`, `opens_nested_expiry`, and nomination of an
-  `INCLUDED` card are rejected.
-- `attach_agent_iompcp_packet` appends
-  `INVALIDATED_MEMBER_CARD_ATTACHED` without rewriting the
-  packet body.
+- `PACKET_SCAN`, `opens_nested_expiry`, and nomination of
+  an `INCLUDED` packet are rejected.
+- `omit_agent_icpwso_working_set` appends
+  `INVALIDATED_CONTEXT_PACKET_OMITTED` without rewriting
+  the member body.
 - Direct profile approval, sealed-rule edits, and unscoped
   scans are rejected.
 
 ### Scale and failure validation
 
-Explain plans for nomination and attach use the primary
+Explain plans for nomination and omission use the primary
 key. A missing point key is **FULL SCAN REJECTED**. A 1M+
 row board is not read. Notify silence remains
 `UNKNOWN_EFFECT`.
 
 ## 21. Product decision
 
-Ship the Invalidated Omission-Member Perception Context
-Packet Plane as the deterministic bridge from one sealed
-invalidated omission-member perception card to one agent
-context packet. The latency cost is one primary-key
-compile on `(account_id, card_id)`. The consistency win is
-that membership `OMITTED`, citation `DROPPED`, and catalog
+Ship the Invalidated Context-Packet Working-Set Omission
+Plane as the deterministic bridge from one sealed
+invalidated context packet to one omitted working-set
+member. The latency cost is one primary-key compile on
+`(account_id, packet_id)`. The consistency win is that
+membership `OMITTED`, citation `DROPPED`, and catalog
 status `INVALIDATED` stay untrusted metadata, `ACKED`
 stays an effect observation, the disputed fact stays held,
 and the body stays omitted. Catalog status `INVALIDATED`
-is copied from the card catalog. It is not invented by the
-packet, and it is not `TRUSTED_ENROLLED`.
+is copied from the packet catalog. It is not invented by
+the omission, and it is not `TRUSTED_ENROLLED`.
 
-The next increment should omit one invalidated copy of
-this context packet from the next working-set compile by
-point lookup of `(account_id, packet_id)`. Membership stays
+The next increment should perceive one omitted invalidated
+context-packet working-set member as a perception card by
+point lookup of `(account_id, member_id)`. Membership stays
 `OMITTED`, citation stays `DROPPED`, and catalog status
-stays `INVALIDATED` as `UNTRUSTED_METADATA`. That omission
-must not scan context packets, must not inline the fact
+stays `INVALIDATED` as `UNTRUSTED_METADATA`. That card must
+not scan working-set members, must not inline the fact
 body, must not promote `ACKED` to `TRUSTED_ENROLLED`, and
 must not open another nested expiry plane.

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "validate": "node scripts/validate-strategy-doc.mjs docs/agentic-invalidated-omission-member-perception-context-packet-plane.md"
+    "validate": "node scripts/validate-strategy-doc.mjs docs/agentic-invalidated-context-packet-working-set-omission-plane.md"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
