@@ -155,6 +155,38 @@ for (const name of [...queryNames, ...mutationNames]) {
   }
 }
 
+const synopsisFields = Object.keys(
+  schema.getType("AdmittedCountCardSynopsis").getFields(),
+);
+const hiddenGapFields = [
+  "projectedCount",
+  "sealedCardCount",
+  "unprojectedCardCount",
+  "publishedAt",
+  "watermark",
+];
+for (const hidden of hiddenGapFields) {
+  if (synopsisFields.includes(hidden)) {
+    throw new Error(
+      `admittedCountCardSynopsis exposes the operator gap as ${hidden}`,
+    );
+  }
+}
+const publishArgs = mutationType
+  .getFields()
+  .publishAdmittedCountCardSynopsis.args.map((argument) => argument.name);
+if (publishArgs.join(",") !== "accountId,utcDay") {
+  throw new Error(
+    `publish mutation gained arguments: ${publishArgs.join(", ")}`,
+  );
+}
+if (markdown.includes("awaiting age") || markdown.includes("that question stays a question")) {
+  throw new Error("awaiting freshness must stay the day-counter gap");
+}
+if (!markdown.includes("unprojected card count") || !markdown.includes("for COMPLETE rows only")) {
+  throw new Error("missing the closed awaiting-freshness reading");
+}
+
 const ddlBlock = sqlBlocks.find((block) => block.includes("CREATE TYPE accs_bucket"));
 const vectorBlock = sqlBlocks.find((block) =>
   block.includes("CREATE TABLE agent_accs_profile_embedding"),
@@ -500,15 +532,25 @@ try {
     )
   `);
   const awaiting = await database.query(`
-    SELECT completeness, admitted_tally, trusted_next_action
+    SELECT completeness, admitted_tally, trusted_next_action, projected_count
     FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-27'
+  `);
+  const awaitingGap = await database.query(`
+    SELECT sealed_card_count - projected_count AS gap
+    FROM agent_accs_day_counter
     WHERE account_id = 101 AND utc_day = DATE '2026-10-27'
   `);
   assert(
     awaiting.rows[0]?.completeness === "AWAITING_PROJECTION" &&
       awaiting.rows[0]?.admitted_tally === null &&
-      awaiting.rows[0]?.trusted_next_action === "AWAIT_CARD_PROJECTION",
-    `awaiting synopsis mismatch: ${JSON.stringify(awaiting.rows[0])}`,
+      awaiting.rows[0]?.trusted_next_action === "AWAIT_CARD_PROJECTION" &&
+      Number(awaiting.rows[0]?.projected_count) === 0 &&
+      Number(awaitingGap.rows[0]?.gap) === 1,
+    `awaiting synopsis mismatch: ${JSON.stringify({
+      awaiting: awaiting.rows[0],
+      gap: awaitingGap.rows[0],
+    })}`,
   );
   const hiddenPartial = await database.query(
     "SELECT count(*)::int AS n FROM read_agent_accs_rollup(101, DATE '2026-10-27')",
@@ -521,6 +563,32 @@ try {
       "2026-10-27",
       "principal:consumer-await",
     ),
+  );
+  const staleSnapshot = await database.query(`
+    SELECT completeness, admitted_tally, projected_count
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-27'
+  `);
+  const liveGap = await database.query(`
+    SELECT projected_count, sealed_card_count - projected_count AS gap
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-27'
+  `);
+  const stillHidden = await database.query(
+    "SELECT count(*)::int AS n FROM read_agent_accs_rollup(101, DATE '2026-10-27')",
+  );
+  assert(
+    staleSnapshot.rows[0]?.completeness === "AWAITING_PROJECTION" &&
+      staleSnapshot.rows[0]?.admitted_tally === null &&
+      Number(staleSnapshot.rows[0]?.projected_count) === 0 &&
+      Number(liveGap.rows[0]?.projected_count) === 1 &&
+      Number(liveGap.rows[0]?.gap) === 0 &&
+      Number(stillHidden.rows[0]?.n) === 0,
+    `live counter gap leaked into the agent snapshot: ${JSON.stringify({
+      snapshot: staleSnapshot.rows[0],
+      counter: liveGap.rows[0],
+      rollup: stillHidden.rows[0],
+    })}`,
   );
   await database.query(`
     SELECT publish_agent_accs_day_synopsis(
@@ -539,6 +607,65 @@ try {
       Number(closedAwait.rows[0]?.omitted_tally) === 0 &&
       closedAwait.rows[0]?.completeness === "COMPLETE",
     `closed awaiting day mismatch: ${JSON.stringify(closedAwait.rows[0])}`,
+  );
+
+  await database.exec(`
+    ${cardInsert({ day: "2026-10-02", consumer: "principal:consumer-gap-1", cardId: "40000000-0000-0000-0000-000000000020" })}
+    ${cardInsert({ day: "2026-10-02", consumer: "principal:consumer-gap-2", cardId: "40000000-0000-0000-0000-000000000021" })}
+  `);
+  const gapDigest = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      101, '10000000-0000-0000-0000-000000000001', 1, DATE '2026-10-02',
+      'a1000000-0000-0000-0000-000000000020'
+    ) AS digest
+  `);
+  await database.query(
+    project(
+      "20000000-0000-0000-0000-000000000001",
+      "2026-10-02",
+      "principal:consumer-gap-1",
+    ),
+  );
+  const gapReplay = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      101, '10000000-0000-0000-0000-000000000001', 1, DATE '2026-10-02',
+      'a1000000-0000-0000-0000-000000000021'
+    ) AS digest
+  `);
+  const gapSnapshot = await database.query(`
+    SELECT completeness, admitted_tally, projected_count
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-02'
+  `);
+  const gapCounter = await database.query(`
+    SELECT projected_count, sealed_card_count - projected_count AS gap
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-02'
+  `);
+  const gapRollup = await database.query(
+    "SELECT count(*)::int AS n FROM read_agent_accs_rollup(101, DATE '2026-10-02')",
+  );
+  const gapAudits = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_audit_event
+    WHERE account_id = 101
+      AND utc_day = DATE '2026-10-02'
+      AND event_kind = 'SYNOPSIS_PUBLISHED'
+  `);
+  assert(
+    gapDigest.rows[0]?.digest === gapReplay.rows[0]?.digest &&
+      gapSnapshot.rows[0]?.completeness === "AWAITING_PROJECTION" &&
+      gapSnapshot.rows[0]?.admitted_tally === null &&
+      Number(gapSnapshot.rows[0]?.projected_count) === 0 &&
+      Number(gapCounter.rows[0]?.projected_count) === 1 &&
+      Number(gapCounter.rows[0]?.gap) === 1 &&
+      Number(gapRollup.rows[0]?.n) === 0 &&
+      Number(gapAudits.rows[0]?.n) === 1,
+    `awaiting republish refreshed the synopsis copy: ${JSON.stringify({
+      snapshot: gapSnapshot.rows[0],
+      counter: gapCounter.rows[0],
+      audits: gapAudits.rows[0],
+    })}`,
   );
 
   const refused = await database.query(`
@@ -583,10 +710,16 @@ try {
     FROM agent_accs_synopsis
     WHERE account_id = 101 AND utc_day = DATE '2026-10-21'
   `);
+  const budgetGap = await database.query(`
+    SELECT sealed_card_count - projected_count AS gap
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-21'
+  `);
   assert(
     Number(budgetColumn.rows[0]?.tally) === 1 &&
       budgetSynopsis.rows[0]?.completeness === "AWAITING_PROJECTION" &&
-      budgetSynopsis.rows[0]?.admitted_tally === null,
+      budgetSynopsis.rows[0]?.admitted_tally === null &&
+      Number(budgetGap.rows[0]?.gap) === 1,
     "partial columnar tally was published to the agent read",
   );
 

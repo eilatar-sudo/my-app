@@ -2,7 +2,9 @@
 
 Contract `2026-10-26.v1`. Prefix `accs`. This plane publishes one
 columnar daily synopsis of already sealed ack-hold cards. It does not
-seal another acknowledgement, hold, receipt, or expiry.
+seal another acknowledgement, hold, receipt, or expiry. Reviewed
+2026-10-28 without a version bump: awaiting freshness is the
+unprojected card count on the day counter, not a new watermark.
 
 ## 1. Why this plane, before how
 
@@ -1691,8 +1693,10 @@ plane:
 - `metadata_trust = UNTRUSTED_METADATA`
 
 The card does not include a consumer list, a reader principal, a fact
-body, or the upstream observation triple. A tag is not an
-authorization decision.
+body, the upstream observation triple, or the unprojected card count.
+A tag is not an authorization decision. Operators may read that gap
+from `agent_accs_day_counter` by primary key. The perception card
+must not copy it into a tally.
 
 ## 13. ACID and consistency
 
@@ -1780,12 +1784,24 @@ The scan function refuses it and leaves a tenant-scoped rejection row.
 ## 18. Observability and SLOs
 
 Count `AWAITING_PROJECTION` days, `REFUSED_OVER_BUDGET` days, scan
-rejections, and second-reader rejections per `account_id`. Alert when
-a tenant's awaiting age exceeds the product freshness target. Do not
-alert by running a board scan. The board path's availability target
-is 99.99%. Synopsis lag is a freshness SLO, measured from
-`agent_accs_day_counter.updated_at` to `agent_accs_synopsis.published_at`
-for `COMPLETE` rows only.
+rejections, and second-reader rejections per `account_id`. Alert on
+those counts. Do not alert by running a board scan, and do not alert
+on a wall-clock age of an awaiting row. `published_at` on an
+`AWAITING_PROJECTION` row is the time publish was attempted, not how
+far the fold is behind. Awaiting freshness is the integer unprojected
+card count, `sealed_card_count - projected_count`, on
+`agent_accs_day_counter`, read by primary key `(account_id, utc_day)`.
+That gap is stable under replay. It is the operator watermark already
+stored on the counter. It is not an agent field.
+`admittedCountCardSynopsis` does not expose `projectedCount`,
+`sealedCardCount`, or the unprojected card count. The synopsis row
+copies `projected_count` only when the digest changes, so a later
+projection that leaves the day awaiting does not move that copy.
+Operators read the counter.
+
+The board path's availability target is 99.99%. The timestamp delta
+from `agent_accs_day_counter.updated_at` to
+`agent_accs_synopsis.published_at` applies for COMPLETE rows only.
 
 ## 19. Rollout
 
@@ -1815,8 +1831,10 @@ lookup.
 
 Ship the columnar day synopsis as the agent-facing summary of sealed
 ack-hold cards. Do not wrap this synopsis in another acknowledgement,
-hold, perception seal, or expiry plane. The next product question is
-whether operators need a freshness watermark on the awaiting state.
-Until this contract is reviewed, that question stays a question. The
-engine remains deterministic, tenant scoped, and unwilling to scan a
-1M-row board to answer a daily tally.
+hold, perception seal, expiry, or watermark plane. Reviewed
+2026-10-28: operators do not need a new freshness watermark. Awaiting
+freshness is the unprojected card count already stored on
+`agent_accs_day_counter`. `admittedCountCardSynopsis` does not expose
+that gap. This contract does not add a table, a GraphQL field, or a
+plane to answer it. The engine remains deterministic, tenant scoped,
+and unwilling to scan a 1M-row board to answer a daily tally.
