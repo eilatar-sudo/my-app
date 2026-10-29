@@ -896,6 +896,34 @@ try {
     )`,
     "SYNOPSIS WRITE REJECTED",
   );
+  await expectRejection(
+    `UPDATE agent_accs_day_counter
+     SET sealed_card_count = sealed_card_count + 1
+     WHERE account_id = 101 AND utc_day = DATE '2026-10-26'`,
+    "DAY COUNTER IMMUTABLE",
+  );
+  const sealedAfterForge = await database.query(`
+    SELECT sealed_card_count,
+           (SELECT count(*)::int FROM agent_accs_sealed_card
+             WHERE account_id = 101 AND utc_day = DATE '2026-10-26') AS cards
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-26'
+  `);
+  assert(
+    Number(sealedAfterForge.rows[0]?.sealed_card_count) ===
+      Number(sealedAfterForge.rows[0]?.cards) &&
+      Number(sealedAfterForge.rows[0]?.cards) === 4,
+    `forged seal count stuck: ${JSON.stringify(sealedAfterForge.rows[0])}`,
+  );
+  await expectRejection(
+    `INSERT INTO agent_accs_day_counter (
+       account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
+     ) VALUES (
+       101, DATE '2026-10-23', 1, 0, TIMESTAMPTZ '2026-10-26 00:00:00+00',
+       TIMESTAMPTZ '2026-10-26 00:00:00+00'
+     )`,
+    "DAY COUNTER IMMUTABLE",
+  );
 
   const scanRejected = await database.query(
     "SELECT reject_agent_accs_board_scan(101, 1000000, TRUE, TRUE) AS reason",

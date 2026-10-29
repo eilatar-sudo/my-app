@@ -5,6 +5,8 @@ columnar daily synopsis of already sealed ack-hold cards. It does not
 seal another acknowledgement, hold, receipt, or expiry. Reviewed
 2026-10-28 without a version bump: awaiting freshness is the
 unprojected card count on the day counter, not a new watermark.
+Reviewed 2026-10-29 without a version bump. The sealed increment on
+that counter is the card-insert trigger, one card at a time.
 
 ## 1. Why this plane, before how
 
@@ -821,6 +823,7 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  PERFORM set_config('accs.sealing', 'on', true);
   INSERT INTO agent_accs_day_counter AS c (
     account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
   ) VALUES (
@@ -830,6 +833,7 @@ BEGIN
   DO UPDATE SET
     sealed_card_count = c.sealed_card_count + 1,
     updated_at = clock_timestamp();
+  PERFORM set_config('accs.sealing', 'off', true);
   RETURN NEW;
 END;
 $$;
@@ -915,7 +919,24 @@ BEGIN
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
   END IF;
+  IF TG_OP = 'INSERT' THEN
+    IF current_setting('accs.sealing', true) IS DISTINCT FROM 'on'
+       OR NEW.sealed_card_count <> 1
+       OR NEW.projected_count <> 0 THEN
+      RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
+    END IF;
+  END IF;
   IF TG_OP = 'UPDATE' THEN
+    IF NEW.account_id IS DISTINCT FROM OLD.account_id
+       OR NEW.utc_day IS DISTINCT FROM OLD.utc_day THEN
+      RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
+    END IF;
+    IF NEW.sealed_card_count IS DISTINCT FROM OLD.sealed_card_count THEN
+      IF current_setting('accs.sealing', true) IS DISTINCT FROM 'on'
+         OR NEW.sealed_card_count <> OLD.sealed_card_count + 1 THEN
+        RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
+      END IF;
+    END IF;
     IF NEW.projected_count IS DISTINCT FROM OLD.projected_count THEN
       IF current_setting('accs.projecting', true) IS DISTINCT FROM 'on' THEN
         RAISE EXCEPTION 'COLUMN TALLY REJECTED';
@@ -923,9 +944,6 @@ BEGIN
       IF NEW.projected_count <> OLD.projected_count + 1 THEN
         RAISE EXCEPTION 'COLUMN TALLY REJECTED';
       END IF;
-    END IF;
-    IF NEW.sealed_card_count < OLD.sealed_card_count THEN
-      RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
     END IF;
   END IF;
   RETURN NEW;
@@ -1774,6 +1792,7 @@ and does not change the digest. An auditor recomputes
 | Explicit second-reader request | row in `agent_accs_second_reader_rejection`, no grant |
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
 | Direct tally or synopsis write | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
+| Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
 | Approved budget mutated | `APPROVED PROFILE IMMUTABLE` |
 
@@ -1797,7 +1816,10 @@ stored on the counter. It is not an agent field.
 `sealedCardCount`, or the unprojected card count. The synopsis row
 copies `projected_count` only when the digest changes, so a later
 projection that leaves the day awaiting does not move that copy.
-Operators read the counter.
+Operators read the counter. The sealed increment is the card-insert
+trigger, and it adds one. A direct insert or a direct change of
+`sealed_card_count` is `DAY COUNTER IMMUTABLE`. The gap stays the
+number of inserted cards minus the number of projected cards.
 
 The board path's availability target is 99.99%. The timestamp delta
 from `agent_accs_day_counter.updated_at` to
