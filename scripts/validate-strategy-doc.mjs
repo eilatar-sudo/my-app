@@ -965,6 +965,144 @@ try {
   rejectionChecks += 1;
 
   await database.exec(`
+    ${cardInsert({
+      day: "2026-10-30",
+      consumer: "principal:consumer-race",
+      cardId: "40000000-0000-0000-0000-000000000030",
+    })}
+    ${project(
+      "20000000-0000-0000-0000-000000000001",
+      "2026-10-30",
+      "principal:consumer-race",
+    )}
+  `);
+  await database.exec(`
+    CREATE FUNCTION accs_probe_insert_card()
+    RETURNS TRIGGER
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      INSERT INTO agent_accs_sealed_card (
+        account_id, utc_day, consumer_principal_id, ack_hold_card_id,
+        reader_principal_id, source_plane, hold_card_class, hold_card_reason,
+        hold_card_recorded, trusted_next_action, ack_hold_class, ack_hold_reason,
+        ack_hold_recorded, effect_observation, attested_key_kind, body_visibility,
+        access_path, inlines_fact_body, executes_tool, opens_nested_expiry,
+        packet_scan_used, ack_promoted_to_trust, sealed_at, created_at
+      ) VALUES (
+        NEW.account_id, NEW.utc_day, 'principal:consumer-race-2',
+        '40000000-0000-0000-0000-000000000031',
+        'principal:reader-1', 'ack-hold-card', 'HOLD_PERCEIVED',
+        'ACK_HELD_HOLD_PERCEIVED', TRUE, 'PERCEIVE_ACK_HELD_HOLD', 'ACK_HELD',
+        'ACKNOWLEDGED_ACKNOWLEDGEMENT_HELD', TRUE, 'ACKED',
+        'AWAITING_CONFIRMATION', 'OMITTED', 'POINT_LOOKUP',
+        FALSE, FALSE, FALSE, FALSE, FALSE,
+        TIMESTAMPTZ '2026-10-26 00:00:00+00', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+      );
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER accs_probe_before_synopsis
+    BEFORE INSERT ON agent_accs_synopsis
+    FOR EACH ROW EXECUTE FUNCTION accs_probe_insert_card();
+  `);
+  await expectRejection(
+    `SELECT publish_agent_accs_day_synopsis(
+       101, '10000000-0000-0000-0000-000000000001', 1, DATE '2026-10-30',
+       'a1000000-0000-0000-0000-000000000030'
+     )`,
+    "SYNOPSIS PUBLISH IN PROGRESS",
+  );
+  const raced = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_sealed_card
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-30') AS cards,
+      (SELECT count(*)::int FROM agent_accs_synopsis
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-30') AS synopses
+  `);
+  assert(
+    Number(raced.rows[0]?.cards) === 1 && Number(raced.rows[0]?.synopses) === 0,
+    `publish admitted a card beside the seal: ${JSON.stringify(raced.rows[0])}`,
+  );
+  await database.exec(`
+    DROP TRIGGER accs_probe_before_synopsis ON agent_accs_synopsis;
+    DROP FUNCTION accs_probe_insert_card();
+  `);
+  await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      101, '10000000-0000-0000-0000-000000000001', 1, DATE '2026-10-30',
+      'a1000000-0000-0000-0000-000000000030'
+    )
+  `);
+  const racedClosed = await database.query(`
+    SELECT completeness, admitted_tally, sealed_card_count
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-30'
+  `);
+  const racedCounter = await database.query(`
+    SELECT sealed_card_count, projected_count
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-30'
+  `);
+  assert(
+    racedClosed.rows[0]?.completeness === "COMPLETE" &&
+      Number(racedClosed.rows[0]?.admitted_tally) === 1 &&
+      Number(racedClosed.rows[0]?.sealed_card_count) === 1 &&
+      Number(racedCounter.rows[0]?.sealed_card_count) === 1 &&
+      Number(racedCounter.rows[0]?.projected_count) === 1,
+    `closed race day drifted: ${JSON.stringify({
+      synopsis: racedClosed.rows[0],
+      counter: racedCounter.rows[0],
+    })}`,
+  );
+
+  const lockDefs = await database.query(`
+    SELECT proname, pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname IN (
+      'publish_agent_accs_day_synopsis',
+      'project_agent_accs_card',
+      'protect_agent_accs_sealed_card',
+      'accs_lock_tenant_day'
+    )
+  `);
+  const lockByName = Object.fromEntries(
+    lockDefs.rows.map((row) => [row.proname, row.def]),
+  );
+  const publishLockAt = lockByName.publish_agent_accs_day_synopsis.indexOf(
+    "accs_lock_tenant_day",
+  );
+  const publishReadAt = lockByName.publish_agent_accs_day_synopsis.indexOf(
+    "INTO v_sealed",
+  );
+  const projectLockAt = lockByName.project_agent_accs_card.indexOf(
+    "accs_lock_tenant_day",
+  );
+  const projectLedgerAt = lockByName.project_agent_accs_card.indexOf(
+    "agent_accs_projection_ledger",
+  );
+  const cardLockAt = lockByName.protect_agent_accs_sealed_card.indexOf(
+    "accs_lock_tenant_day",
+  );
+  const cardSealAt = lockByName.protect_agent_accs_sealed_card.indexOf(
+    "SYNOPSIS ALREADY SEALED",
+  );
+  assert(
+    lockByName.accs_lock_tenant_day.includes("hashtext('accs-day')") &&
+      lockByName.accs_lock_tenant_day.includes("pg_advisory_xact_lock") &&
+      publishLockAt !== -1 &&
+      publishReadAt !== -1 &&
+      publishLockAt < publishReadAt &&
+      projectLockAt !== -1 &&
+      projectLedgerAt !== -1 &&
+      projectLockAt < projectLedgerAt &&
+      cardLockAt !== -1 &&
+      cardSealAt !== -1 &&
+      cardLockAt < cardSealAt,
+    "tenant-day lock must precede the counter read, the ledger read, and the seal check",
+  );
+
+  await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
     GRANT SELECT ON agent_accs_synopsis TO accs_reader;

@@ -6,7 +6,9 @@ seal another acknowledgement, hold, receipt, or expiry. Reviewed
 2026-10-28 without a version bump: awaiting freshness is the
 unprojected card count on the day counter, not a new watermark.
 Reviewed 2026-10-29 without a version bump. The sealed increment on
-that counter is the card-insert trigger, one card at a time.
+that counter is the card-insert trigger, one card at a time. Publish,
+projection, and card insert share one tenant-day advisory lock from
+the counter read through the synopsis write.
 
 ## 1. Why this plane, before how
 
@@ -130,14 +132,15 @@ synopsis steward a second reader of the card.
 
 ## 5. Execution model
 
-1. Upstream inserts one immutable sealed card. The insert increments
+1. Upstream inserts one immutable sealed card. The insert takes the
+   tenant-day advisory lock, then increments
    `agent_accs_day_counter.sealed_card_count` by 1. It does not scan
    siblings.
-2. `project_agent_accs_card` point-looks up that card, appends one
-   ledger row, and adds 1 to one columnar bucket.
-3. `publish_agent_accs_day_synopsis` point-looks up the counter and,
-   only when the day is complete, copies the three tallies onto the
-   synopsis row.
+2. `project_agent_accs_card` takes that same lock, point-looks up that
+   card, appends one ledger row, and adds 1 to one columnar bucket.
+3. `publish_agent_accs_day_synopsis` takes that same lock, point-looks
+   up the counter, and, only when the day is complete, copies the three
+   tallies onto the synopsis row.
 4. `read_agent_accs_rollup` returns those synopsis tallies only when
    the synopsis is `COMPLETE`. It does not read the card table.
 
@@ -838,6 +841,18 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION accs_lock_tenant_day(p_account_id BIGINT, p_utc_day DATE)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(
+    hashtext('accs-day'),
+    hashtext(p_account_id::TEXT || '|' || p_utc_day::TEXT)
+  );
+END;
+$$;
+
 CREATE FUNCTION protect_agent_accs_sealed_card()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -848,6 +863,10 @@ BEGIN
   IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SEALED CARD IMMUTABLE';
   END IF;
+  IF current_setting('accs.publishing', true) = 'on' THEN
+    RAISE EXCEPTION 'SYNOPSIS PUBLISH IN PROGRESS';
+  END IF;
+  PERFORM accs_lock_tenant_day(NEW.account_id, NEW.utc_day);
   IF NEW.inlines_fact_body OR NEW.executes_tool OR NEW.opens_nested_expiry
      OR NEW.packet_scan_used OR NEW.ack_promoted_to_trust THEN
     RAISE EXCEPTION 'UNSAFE CARD REJECTED';
@@ -1128,6 +1147,10 @@ DECLARE
   v_bucket accs_bucket;
 BEGIN
   PERFORM accs_require_tenant(p_account_id);
+  IF current_setting('accs.publishing', true) = 'on' THEN
+    RAISE EXCEPTION 'SYNOPSIS PUBLISH IN PROGRESS';
+  END IF;
+  PERFORM accs_lock_tenant_day(p_account_id, p_utc_day);
   SELECT bucket::TEXT INTO v_existing
   FROM agent_accs_projection_ledger
   WHERE account_id = p_account_id
@@ -1267,9 +1290,12 @@ BEGIN
     RAISE EXCEPTION 'PROFILE REJECTED';
   END IF;
 
+  PERFORM accs_lock_tenant_day(p_account_id, p_utc_day);
+  PERFORM set_config('accs.publishing', 'on', true);
   SELECT sealed_card_count, projected_count INTO v_sealed, v_projected
   FROM agent_accs_day_counter
-  WHERE account_id = p_account_id AND utc_day = p_utc_day;
+  WHERE account_id = p_account_id AND utc_day = p_utc_day
+  FOR UPDATE;
   IF NOT FOUND THEN
     v_sealed := 0;
     v_projected := 0;
@@ -1328,10 +1354,10 @@ BEGIN
     RAISE EXCEPTION 'SYNOPSIS DRIFT REJECTED';
   END IF;
   IF v_found AND v_existing.digest = v_digest THEN
+    PERFORM set_config('accs.publishing', 'off', true);
     RETURN v_existing.digest;
   END IF;
 
-  PERFORM set_config('accs.publishing', 'on', true);
   IF v_found THEN
     UPDATE agent_accs_synopsis
     SET
@@ -1370,6 +1396,7 @@ BEGIN
     p_account_id, p_utc_day, 'SYNOPSIS_PUBLISHED',
     p_utc_day::TEXT || '|' || v_completeness::TEXT || '|' || v_digest
   );
+  PERFORM set_config('accs.publishing', 'off', true);
   RETURN v_digest;
 END;
 $$;
@@ -1723,9 +1750,16 @@ transaction. The projection writes the ledger, the columnar tally, the
 counter, the session budget, and the audit event together. A conflict
 rolls all five back, so a tally cannot move without a ledger row.
 
-The consistency choice is closed-day stability. `COMPLETE` does not
-move. Callers that still expect cards leave the synopsis in
-`AWAITING_PROJECTION`. That is a fresher answer withheld on purpose,
+Publish holds the tenant-day lock from the counter read through the
+synopsis write. Card insert and projection take that lock first. A
+card inserted in the publish transaction raises
+`SYNOPSIS PUBLISH IN PROGRESS` and rolls back with the publish. The
+lock key is one account and one day. Board reads do not take it, and
+another account's day uses another key. Writers of that tenant-day
+wait so a `COMPLETE` tally cannot tear. That wait is the consistency
+side of the trade. The consistency choice is closed-day stability.
+`COMPLETE` does not move. Callers that still expect cards leave the
+synopsis in `AWAITING_PROJECTION`. That is a fresher answer withheld on purpose,
 so two agents cannot observe different tallies for a day that was
 already published. The row store that serves board writes is not
 waiting on this publish, which is the availability side of the same
@@ -1752,6 +1786,10 @@ neighbor's board query.
   nested expiry are rejected at the card boundary.
 - Advisory lock on audit append serializes one tenant's hash chain
   without locking another tenant's rows.
+- Tenant-day lock: `accs_lock_tenant_day` serializes card insert,
+  projection, and publish for one `(account_id, utc_day)`. It uses the
+  two-integer advisory namespace, so the audit chain keeps the
+  one-integer lock. Another account waits on its own key.
 
 ## 15. Performance check for boards with 1M+ rows
 
@@ -1764,8 +1802,10 @@ three tally rows. Projection reads one sealed card by
 `(account_id, utc_day, consumer_principal_id)`.
 
 The card table can grow with consumers. The publish path never walks
-it and never issues `COUNT` against it. The counter is maintained on
-insert. A tenant that seals more cards than `max_cards_per_day` still
+it and never issues `COUNT` against it. The tenant-day gate is an
+advisory lock on `(account_id, utc_day)`. Publish still reads the
+counter and at most three tally rows by primary key. The counter is
+maintained on insert. A tenant that seals more cards than `max_cards_per_day` still
 pays one index update per insert, then one point read that refuses the
 day. Neighbor board queries do not share that fold. Indexes in this
 schema lead with `account_id`.
@@ -1793,6 +1833,7 @@ and does not change the digest. An auditor recomputes
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
 | Direct tally or synopsis write | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
+| Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
 | Approved budget mutated | `APPROVED PROFILE IMMUTABLE` |
 
