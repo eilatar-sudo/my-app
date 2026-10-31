@@ -1056,6 +1056,99 @@ try {
     })}`,
   );
 
+  await database.exec(`
+    ${cardInsert({
+      day: "2026-10-31",
+      consumer: "principal:consumer-forge-1",
+      cardId: "40000000-0000-0000-0000-000000000032",
+    })}
+    ${cardInsert({
+      day: "2026-10-31",
+      consumer: "principal:consumer-forge-2",
+      cardId: "40000000-0000-0000-0000-000000000033",
+    })}
+  `);
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM project_agent_accs_card(
+         101, '20000000-0000-0000-0000-000000000001', DATE '2026-10-31',
+         'principal:consumer-forge-1'
+       );
+       UPDATE agent_accs_day_column
+       SET tally = tally + 1
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-31'
+         AND bucket = 'ADMITTED';
+       UPDATE agent_accs_day_counter
+       SET projected_count = projected_count + 1
+       WHERE account_id = 101 AND utc_day = DATE '2026-10-31';
+     END $$;`,
+    "COLUMN TALLY REJECTED",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM project_agent_accs_card(
+         101, '20000000-0000-0000-0000-000000000001', DATE '2026-10-31',
+         'principal:consumer-forge-1'
+       );
+       INSERT INTO agent_accs_projection_ledger (
+         account_id, utc_day, consumer_principal_id, ack_hold_card_id,
+         bucket, projected_at
+       ) VALUES (
+         101, DATE '2026-10-31', 'principal:consumer-forge-2',
+         '40000000-0000-0000-0000-000000000033', 'ADMITTED',
+         TIMESTAMPTZ '2026-10-26 00:00:00+00'
+       );
+     END $$;`,
+    "PROJECTION LEDGER REJECTED",
+  );
+  const forged = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_projection_ledger
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-31') AS ledger_rows,
+      (SELECT count(*)::int FROM agent_accs_day_column
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-31') AS tally_rows,
+      sealed_card_count,
+      projected_count
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-31'
+  `);
+  assert(
+    Number(forged.rows[0]?.ledger_rows) === 0 &&
+      Number(forged.rows[0]?.tally_rows) === 0 &&
+      Number(forged.rows[0]?.sealed_card_count) === 2 &&
+      Number(forged.rows[0]?.projected_count) === 0,
+    `projection gate left a forged tally: ${JSON.stringify(forged.rows[0])}`,
+  );
+  await database.query(
+    project(
+      "20000000-0000-0000-0000-000000000001",
+      "2026-10-31",
+      "principal:consumer-forge-1",
+    ),
+  );
+  const honest = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_projection_ledger
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-31') AS ledger_rows,
+      (SELECT tally FROM agent_accs_day_column
+        WHERE account_id = 101 AND utc_day = DATE '2026-10-31'
+          AND bucket = 'ADMITTED') AS admitted_tally,
+      projected_count,
+      sealed_card_count
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-31'
+  `);
+  assert(
+    Number(honest.rows[0]?.ledger_rows) === 1 &&
+      Number(honest.rows[0]?.admitted_tally) === 1 &&
+      Number(honest.rows[0]?.projected_count) === 1 &&
+      Number(honest.rows[0]?.sealed_card_count) === 2,
+    `honest projection drifted: ${JSON.stringify(honest.rows[0])}`,
+  );
+
   const lockDefs = await database.query(`
     SELECT proname, pg_get_functiondef(oid) AS def
     FROM pg_proc
@@ -1081,6 +1174,18 @@ try {
   const projectLedgerAt = lockByName.project_agent_accs_card.indexOf(
     "agent_accs_projection_ledger",
   );
+  const projectGateOnAt = lockByName.project_agent_accs_card.indexOf(
+    "set_config('accs.projecting', 'on'",
+  );
+  const projectCountAt = lockByName.project_agent_accs_card.indexOf(
+    "projected_count = projected_count + 1",
+  );
+  const projectGateOffAt = lockByName.project_agent_accs_card.indexOf(
+    "set_config('accs.projecting', 'off'",
+  );
+  const projectSessionAt = lockByName.project_agent_accs_card.indexOf(
+    "consumed_project_units = consumed_project_units + 1",
+  );
   const cardLockAt = lockByName.protect_agent_accs_sealed_card.indexOf(
     "accs_lock_tenant_day",
   );
@@ -1096,10 +1201,17 @@ try {
       projectLockAt !== -1 &&
       projectLedgerAt !== -1 &&
       projectLockAt < projectLedgerAt &&
+      projectGateOnAt !== -1 &&
+      projectCountAt !== -1 &&
+      projectGateOffAt !== -1 &&
+      projectSessionAt !== -1 &&
+      projectGateOnAt < projectCountAt &&
+      projectCountAt < projectGateOffAt &&
+      projectGateOffAt < projectSessionAt &&
       cardLockAt !== -1 &&
       cardSealAt !== -1 &&
       cardLockAt < cardSealAt,
-    "tenant-day lock must precede the counter read, the ledger read, and the seal check",
+    "tenant-day lock must precede the counter read, the ledger read, and the seal check, and the projection gate must close before the session write",
   );
 
   await database.exec(`

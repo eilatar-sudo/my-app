@@ -8,7 +8,12 @@ unprojected card count on the day counter, not a new watermark.
 Reviewed 2026-10-29 without a version bump. The sealed increment on
 that counter is the card-insert trigger, one card at a time. Publish,
 projection, and card insert share one tenant-day advisory lock from
-the counter read through the synopsis write.
+the counter read through the synopsis write. Reviewed 2026-10-31
+without a version bump. `project_agent_accs_card` clears
+`accs.projecting` before it returns, after the ledger row, the
+columnar tally, and the projected-count increment. A later statement
+in that transaction cannot add another tally or another projected
+card. One ledger row still moves one tally by one.
 
 ## 1. Why this plane, before how
 
@@ -137,7 +142,9 @@ synopsis steward a second reader of the card.
    `agent_accs_day_counter.sealed_card_count` by 1. It does not scan
    siblings.
 2. `project_agent_accs_card` takes that same lock, point-looks up that
-   card, appends one ledger row, and adds 1 to one columnar bucket.
+   card, appends one ledger row, and adds 1 to one columnar bucket and
+   to `projected_count`. It then clears `accs.projecting` before the
+   session budget write, the audit append, and the return.
 3. `publish_agent_accs_day_synopsis` takes that same lock, point-looks
    up the counter, and, only when the day is complete, copies the three
    tallies onto the synopsis row.
@@ -1245,6 +1252,7 @@ BEGIN
   UPDATE agent_accs_day_counter
   SET projected_count = projected_count + 1, updated_at = clock_timestamp()
   WHERE account_id = p_account_id AND utc_day = p_utc_day;
+  PERFORM set_config('accs.projecting', 'off', true);
   UPDATE agent_accs_session
   SET consumed_project_units = consumed_project_units + 1
   WHERE account_id = p_account_id AND session_id = p_session_id;
@@ -1749,6 +1757,11 @@ Card insert, counter bump, and the later projection each run in a
 transaction. The projection writes the ledger, the columnar tally, the
 counter, the session budget, and the audit event together. A conflict
 rolls all five back, so a tally cannot move without a ledger row.
+`accs.projecting` is on only for the ledger insert, the tally
+increment, and the projected-count increment. The function turns it
+off before the session write and the audit append. A following
+statement in that transaction is `COLUMN TALLY REJECTED` or
+`PROJECTION LEDGER REJECTED`.
 
 Publish holds the tenant-day lock from the counter read through the
 synopsis write. Card insert and projection take that lock first. A
@@ -1831,7 +1844,7 @@ and does not change the digest. An auditor recomputes
 | Reader or consumer is a synopsis steward | `SECOND READER REJECTED` |
 | Explicit second-reader request | row in `agent_accs_second_reader_rejection`, no grant |
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
-| Direct tally or synopsis write | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
+| Direct tally, projected increment, or synopsis write, including one after project returns | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
 | Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
@@ -1859,7 +1872,11 @@ copies `projected_count` only when the digest changes, so a later
 projection that leaves the day awaiting does not move that copy.
 Operators read the counter. The sealed increment is the card-insert
 trigger, and it adds one. A direct insert or a direct change of
-`sealed_card_count` is `DAY COUNTER IMMUTABLE`. The gap stays the
+`sealed_card_count` is `DAY COUNTER IMMUTABLE`. The projected
+increment is the projection function, and it adds one for the ledger
+row it just inserted. The function clears `accs.projecting` before
+return. A later statement in that transaction cannot move
+`projected_count` or a columnar tally. The gap stays the
 number of inserted cards minus the number of projected cards.
 
 The board path's availability target is 99.99%. The timestamp delta
@@ -1898,6 +1915,8 @@ hold, perception seal, expiry, or watermark plane. Reviewed
 2026-10-28: operators do not need a new freshness watermark. Awaiting
 freshness is the unprojected card count already stored on
 `agent_accs_day_counter`. `admittedCountCardSynopsis` does not expose
-that gap. This contract does not add a table, a GraphQL field, or a
-plane to answer it. The engine remains deterministic, tenant scoped,
-and unwilling to scan a 1M-row board to answer a daily tally.
+that gap. Reviewed 2026-10-31: the projection gate closes before
+`project_agent_accs_card` returns. This contract does not add a
+table, a GraphQL field, or a plane to answer it. The engine remains
+deterministic, tenant scoped, and unwilling to scan a 1M-row board to
+answer a daily tally.
