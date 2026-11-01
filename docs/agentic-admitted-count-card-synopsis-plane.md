@@ -13,7 +13,12 @@ without a version bump. `project_agent_accs_card` clears
 `accs.projecting` before it returns, after the ledger row, the
 columnar tally, and the projected-count increment. A later statement
 in that transaction cannot add another tally or another projected
-card. One ledger row still moves one tally by one.
+card. One ledger row still moves one tally by one. Reviewed
+2026-11-01 without a version bump. `accs_append_audit` is the only
+writer of `agent_accs_audit_event`. It clears `accs.auditing` before
+it returns. A later statement cannot insert another event. Update and
+delete are rejected. The link is `accs_audit_digest` over the previous
+digest, the event kind, the entity key, and the sequence.
 
 ## 1. Why this plane, before how
 
@@ -761,6 +766,20 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION accs_audit_digest(
+  p_prev TEXT,
+  p_event_kind TEXT,
+  p_entity_key TEXT,
+  p_seq BIGINT
+) RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT md5(
+    COALESCE(p_prev, 'genesis') || '|' || p_event_kind || '|' || p_entity_key || '|' || p_seq::TEXT
+  );
+$$;
+
 CREATE FUNCTION accs_append_audit(
   p_account_id BIGINT,
   p_utc_day DATE,
@@ -774,6 +793,7 @@ DECLARE
   v_seq BIGINT;
   v_digest TEXT;
 BEGIN
+  PERFORM accs_require_tenant(p_account_id);
   PERFORM pg_advisory_xact_lock(p_account_id);
   SELECT digest INTO v_prev
   FROM agent_accs_audit_event
@@ -783,15 +803,57 @@ BEGIN
   SELECT COALESCE(MAX(seq), 0) + 1 INTO v_seq
   FROM agent_accs_audit_event
   WHERE account_id = p_account_id;
-  v_digest := md5(COALESCE(v_prev, 'genesis') || '|' || p_event_kind || '|' || p_entity_key || '|' || v_seq::TEXT);
+  v_digest := accs_audit_digest(v_prev, p_event_kind, p_entity_key, v_seq);
+  PERFORM set_config('accs.auditing', 'on', true);
   INSERT INTO agent_accs_audit_event (
     account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
   ) VALUES (
     p_account_id, v_seq, p_utc_day, p_event_kind, p_entity_key, v_prev, v_digest, clock_timestamp()
   );
+  PERFORM set_config('accs.auditing', 'off', true);
   RETURN v_digest;
 END;
 $$;
+
+CREATE FUNCTION protect_agent_accs_audit_event()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_prev TEXT;
+  v_seq BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'AUDIT CHAIN IMMUTABLE';
+  END IF;
+  IF current_setting('accs.auditing', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
+  END IF;
+  PERFORM pg_advisory_xact_lock(NEW.account_id);
+  SELECT digest, seq INTO v_prev, v_seq
+  FROM agent_accs_audit_event
+  WHERE account_id = NEW.account_id
+  ORDER BY seq DESC
+  LIMIT 1;
+  IF NOT FOUND THEN
+    IF NEW.seq <> 1 OR NEW.prev_digest IS NOT NULL THEN
+      RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
+    END IF;
+  ELSIF NEW.seq <> v_seq + 1 OR NEW.prev_digest IS DISTINCT FROM v_prev THEN
+    RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
+  END IF;
+  IF NEW.digest IS DISTINCT FROM accs_audit_digest(
+    NEW.prev_digest, NEW.event_kind, NEW.entity_key, NEW.seq
+  ) THEN
+    RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_audit_event_row
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_audit_event
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_audit_event();
 
 CREATE FUNCTION protect_agent_accs_profile()
 RETURNS TRIGGER
@@ -1767,6 +1829,9 @@ Publish holds the tenant-day lock from the counter read through the
 synopsis write. Card insert and projection take that lock first. A
 card inserted in the publish transaction raises
 `SYNOPSIS PUBLISH IN PROGRESS` and rolls back with the publish. The
+audit append holds the tenant audit lock only while it writes the next
+link, then clears `accs.auditing` before it returns. A following
+statement cannot insert, update, or delete that chain. The
 lock key is one account and one day. Board reads do not take it, and
 another account's day uses another key. Writers of that tenant-day
 wait so a `COMPLETE` tally cannot tear. That wait is the consistency
@@ -1798,7 +1863,8 @@ neighbor's board query.
 - Tool execution, fact bodies, packet scans, trusted enrollment, and
   nested expiry are rejected at the card boundary.
 - Advisory lock on audit append serializes one tenant's hash chain
-  without locking another tenant's rows.
+  without locking another tenant's rows. The audit trigger takes that
+  same one-integer lock before it reads the tip.
 - Tenant-day lock: `accs_lock_tenant_day` serializes card insert,
   projection, and publish for one `(account_id, utc_day)`. It uses the
   two-integer advisory namespace, so the audit chain keeps the
@@ -1832,7 +1898,13 @@ or the day plus completeness plus synopsis digest. It is not a fact
 body. Replaying `project_agent_accs_card` does not append a second
 event. Replaying a `COMPLETE` publish does not append a second event
 and does not change the digest. An auditor recomputes
-`accs_synopsis_digest` from the synopsis columns.
+`accs_synopsis_digest` from the synopsis columns and
+`accs_audit_digest` from the previous digest, the event kind, the
+entity key, and the sequence. The append reads that tip by primary
+key `(account_id, seq)`. It does not walk a board. `accs.auditing` is
+on only for that insert. Update and delete are rejected even if the
+flag is on. A later statement in the same transaction is
+`AUDIT CHAIN REJECTED`.
 
 ## 17. Threat and failure analysis
 
@@ -1846,6 +1918,8 @@ and does not change the digest. An auditor recomputes
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
 | Direct tally, projected increment, or synopsis write, including one after project returns | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
+| Direct audit insert, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
+| Audit update or delete | `AUDIT CHAIN IMMUTABLE` |
 | Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
 | Approved budget mutated | `APPROVED PROFILE IMMUTABLE` |
@@ -1905,6 +1979,8 @@ lookup.
 - A second project does not double-count.
 - A second reader, a board scan of 1,000,000 rows, a fact body, a tool
   flag, and a nested expiry flag are rejected.
+- A direct audit insert, update, or delete is rejected, and a replay
+  does not append a second event.
 - A reader role under row-level security sees only its `account_id`.
 
 ## 21. Product decision
@@ -1916,7 +1992,8 @@ hold, perception seal, expiry, or watermark plane. Reviewed
 freshness is the unprojected card count already stored on
 `agent_accs_day_counter`. `admittedCountCardSynopsis` does not expose
 that gap. Reviewed 2026-10-31: the projection gate closes before
-`project_agent_accs_card` returns. This contract does not add a
-table, a GraphQL field, or a plane to answer it. The engine remains
-deterministic, tenant scoped, and unwilling to scan a 1M-row board to
-answer a daily tally.
+`project_agent_accs_card` returns. Reviewed 2026-11-01: the audit
+chain rejects a direct insert, update, or delete. This contract does
+not add a table, a GraphQL field, or a plane to answer it. The engine
+remains deterministic, tenant scoped, and unwilling to scan a 1M-row
+board to answer a daily tally.

@@ -754,6 +754,28 @@ try {
       Number(publishEvents.rows[0]?.n) === 1,
     "audit chain recorded a replay",
   );
+  const linked = await database.query(`
+    SELECT
+      count(*)::int AS n,
+      bool_and(
+        digest = accs_audit_digest(prev_digest, event_kind, entity_key, seq)
+      ) AS digests_match,
+      bool_and(
+        prev_digest IS NOT DISTINCT FROM (
+          SELECT p.digest
+          FROM agent_accs_audit_event AS p
+          WHERE p.account_id = e.account_id AND p.seq = e.seq - 1
+        )
+      ) AS links
+    FROM agent_accs_audit_event AS e
+    WHERE account_id = 101
+  `);
+  assert(
+    Number(linked.rows[0]?.n) >= 5 &&
+      linked.rows[0]?.digests_match === true &&
+      linked.rows[0]?.links === true,
+    `audit links do not recompute: ${JSON.stringify(linked.rows[0])}`,
+  );
 
   await database.exec(`
     INSERT INTO agent_accs_profile_embedding (
@@ -1212,6 +1234,129 @@ try {
       cardSealAt !== -1 &&
       cardLockAt < cardSealAt,
     "tenant-day lock must precede the counter read, the ledger read, and the seal check, and the projection gate must close before the session write",
+  );
+
+  const auditDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'accs_append_audit'
+  `);
+  const auditBody = auditDef.rows[0]?.def ?? "";
+  const auditTenantAt = auditBody.indexOf("accs_require_tenant");
+  const auditLockAt = auditBody.indexOf("pg_advisory_xact_lock");
+  const auditOnAt = auditBody.indexOf("set_config('accs.auditing', 'on'");
+  const auditInsertAt = auditBody.indexOf("INSERT INTO agent_accs_audit_event");
+  const auditOffAt = auditBody.indexOf("set_config('accs.auditing', 'off'");
+  assert(
+    auditTenantAt !== -1 &&
+      auditLockAt !== -1 &&
+      auditOnAt !== -1 &&
+      auditInsertAt !== -1 &&
+      auditOffAt !== -1 &&
+      auditTenantAt < auditLockAt &&
+      auditLockAt < auditOnAt &&
+      auditOnAt < auditInsertAt &&
+      auditInsertAt < auditOffAt,
+    "audit append must scope the tenant, lock the chain, and clear the gate before return",
+  );
+
+  await expectRejection(
+    `DELETE FROM agent_accs_audit_event WHERE account_id = 101 AND seq = 1`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_audit_event
+     SET entity_key = 'forged'
+     WHERE account_id = 101 AND seq = 1`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.auditing', 'on', true);
+       UPDATE agent_accs_audit_event
+       SET entity_key = 'forged'
+       WHERE account_id = 101 AND seq = 1;
+     END $$;`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `INSERT INTO agent_accs_audit_event (
+       account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
+     ) VALUES (
+       101, 1, DATE '2026-11-01', 'CARD_PROJECTED', 'forged', NULL, repeat('f', 32),
+       TIMESTAMPTZ '2026-10-26 00:00:00+00'
+     )`,
+    "AUDIT CHAIN REJECTED",
+  );
+  await database.exec(`
+    ${cardInsert({
+      day: "2026-11-01",
+      consumer: "principal:consumer-audit",
+      cardId: "40000000-0000-0000-0000-000000000140",
+    })}
+  `);
+  await expectRejection(
+    `DO $$
+     DECLARE
+       v_prev TEXT;
+       v_seq BIGINT;
+       v_digest TEXT;
+     BEGIN
+       PERFORM project_agent_accs_card(
+         101, '20000000-0000-0000-0000-000000000001', DATE '2026-11-01',
+         'principal:consumer-audit'
+       );
+       SELECT digest, seq INTO v_prev, v_seq
+       FROM agent_accs_audit_event
+       WHERE account_id = 101
+       ORDER BY seq DESC
+       LIMIT 1;
+       v_seq := COALESCE(v_seq, 0) + 1;
+       v_digest := accs_audit_digest(v_prev, 'CARD_PROJECTED', 'forged-after', v_seq);
+       INSERT INTO agent_accs_audit_event (
+         account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
+       ) VALUES (
+         101, v_seq, DATE '2026-11-01', 'CARD_PROJECTED', 'forged-after', v_prev,
+         v_digest, TIMESTAMPTZ '2026-10-26 00:00:00+00'
+       );
+     END $$;`,
+    "AUDIT CHAIN REJECTED",
+  );
+  const auditAfterForge = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_projection_ledger
+        WHERE account_id = 101 AND utc_day = DATE '2026-11-01') AS ledger_rows,
+      (SELECT count(*)::int FROM agent_accs_audit_event
+        WHERE account_id = 101 AND utc_day = DATE '2026-11-01') AS audit_rows,
+      (SELECT count(*)::int FROM agent_accs_audit_event
+        WHERE account_id = 101
+          AND entity_key IN ('forged', 'forged-after')) AS forged_rows
+  `);
+  assert(
+    Number(auditAfterForge.rows[0]?.ledger_rows) === 0 &&
+      Number(auditAfterForge.rows[0]?.audit_rows) === 0 &&
+      Number(auditAfterForge.rows[0]?.forged_rows) === 0,
+    `audit gate left a forged event: ${JSON.stringify(auditAfterForge.rows[0])}`,
+  );
+  const chainAfter = await database.query(`
+    SELECT
+      bool_and(
+        digest = accs_audit_digest(prev_digest, event_kind, entity_key, seq)
+      ) AS digests_match,
+      bool_and(
+        prev_digest IS NOT DISTINCT FROM (
+          SELECT p.digest
+          FROM agent_accs_audit_event AS p
+          WHERE p.account_id = e.account_id AND p.seq = e.seq - 1
+        )
+      ) AS links
+    FROM agent_accs_audit_event AS e
+    WHERE account_id = 101
+  `);
+  assert(
+    chainAfter.rows[0]?.digests_match === true && chainAfter.rows[0]?.links === true,
+    `audit chain drifted after rejected writes: ${JSON.stringify(chainAfter.rows[0])}`,
   );
 
   await database.exec(`
