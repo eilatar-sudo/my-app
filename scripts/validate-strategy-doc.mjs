@@ -959,19 +959,34 @@ try {
   const scanRows = await database.query(
     "SELECT count(*)::int AS n FROM agent_accs_scan_rejection WHERE account_id = 101 AND reason = 'FULL SCAN REJECTED'",
   );
+  const scanUnknown = await database.query(
+    "SELECT reject_agent_accs_board_scan(101, NULL, TRUE, TRUE) AS reason",
+  );
+  const scanNegative = await database.query(
+    "SELECT reject_agent_accs_board_scan(101, -1, TRUE, TRUE) AS reason",
+  );
+  const scanRowsAfterEstimate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_scan_rejection WHERE account_id = 101 AND reason = 'FULL SCAN REJECTED'",
+  );
   assert(
     scanRejected.rows[0]?.reason === "FULL SCAN REJECTED" &&
       scanAllowed.rows[0]?.reason === null &&
       scanUnscoped.rows[0]?.reason === "FULL SCAN REJECTED" &&
-      Number(scanRows.rows[0]?.n) === 2,
+      scanUnknown.rows[0]?.reason === "FULL SCAN REJECTED" &&
+      scanNegative.rows[0]?.reason === "FULL SCAN REJECTED" &&
+      Number(scanRows.rows[0]?.n) === 2 &&
+      Number(scanRowsAfterEstimate.rows[0]?.n) === 4,
     `board scan gate mismatch: ${JSON.stringify({
       scanRejected: scanRejected.rows[0],
       scanAllowed: scanAllowed.rows[0],
       scanUnscoped: scanUnscoped.rows[0],
+      scanUnknown: scanUnknown.rows[0],
+      scanNegative: scanNegative.rows[0],
       scanRows: scanRows.rows[0],
+      scanRowsAfterEstimate: scanRowsAfterEstimate.rows[0],
     })}`,
   );
-  rejectionChecks += 2;
+  rejectionChecks += 4;
 
   const secondReader = await database.query(
     "SELECT reject_agent_accs_second_reader(101, 'principal:reader-2') AS reason",
@@ -1357,6 +1372,95 @@ try {
   assert(
     chainAfter.rows[0]?.digests_match === true && chainAfter.rows[0]?.links === true,
     `audit chain drifted after rejected writes: ${JSON.stringify(chainAfter.rows[0])}`,
+  );
+
+  const auditCountBeforeCall = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 101",
+  );
+  await expectRejection(
+    `SELECT accs_append_audit(101, DATE '2026-10-26', 'CARD_PROJECTED', 'forged|ADMITTED')`,
+    "AUDIT CHAIN REJECTED",
+  );
+  const auditCountAfterCall = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 101",
+  );
+  assert(
+    Number(auditCountAfterCall.rows[0]?.n) === Number(auditCountBeforeCall.rows[0]?.n),
+    `append without a ticket wrote a link: ${JSON.stringify(auditCountAfterCall.rows[0])}`,
+  );
+
+  await expectRejection(
+    "TRUNCATE agent_accs_audit_event",
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_sealed_card CASCADE",
+    "SEALED CARD IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_day_counter",
+    "DAY COUNTER IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_day_column",
+    "COLUMN TALLY REJECTED",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_projection_ledger",
+    "PROJECTION LEDGER IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_synopsis",
+    "SYNOPSIS IMMUTABLE",
+  );
+  const auditCountAfterTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 101",
+  );
+  assert(
+    Number(auditCountAfterTruncate.rows[0]?.n) === Number(auditCountBeforeCall.rows[0]?.n),
+    `truncate rewrote the audit chain: ${JSON.stringify(auditCountAfterTruncate.rows[0])}`,
+  );
+
+  await database.exec(`
+    INSERT INTO agent_accs_profile (
+      account_id, profile_id, profile_version, status, definition_hash,
+      max_cards_per_day, budget_project_units, synopsis_steward_a,
+      synopsis_steward_b, procedure_ref, evidence_id, created_at, approved_at
+    ) VALUES (
+      101, '10000000-0000-0000-0000-000000000004', 1, 'DRAFT', '${"e".repeat(32)}',
+      100, 10, 'principal:accs-a', 'principal:accs-b',
+      'procedure:fold-admitted-count-card-day',
+      '30000000-0000-0000-0000-000000000001',
+      TIMESTAMPTZ '2026-10-26 00:00:00+00', NULL
+    );
+    SELECT approve_agent_accs_profile(
+      101, '10000000-0000-0000-0000-000000000004', 1, '${"e".repeat(32)}'
+    );
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET status = 'REVOKED', max_cards_per_day = 7, budget_project_units = 9
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000004'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile
+    SET status = 'REVOKED'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000004'
+  `);
+  const revokedProfile = await database.query(`
+    SELECT status, max_cards_per_day, budget_project_units
+    FROM agent_accs_profile
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000004'
+  `);
+  assert(
+    revokedProfile.rows[0]?.status === "REVOKED" &&
+      Number(revokedProfile.rows[0]?.max_cards_per_day) === 100 &&
+      Number(revokedProfile.rows[0]?.budget_project_units) === 10,
+    `revoke rewrote the approved budget: ${JSON.stringify(revokedProfile.rows[0])}`,
   );
 
   await database.exec(`

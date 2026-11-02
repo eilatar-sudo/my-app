@@ -18,7 +18,14 @@ card. One ledger row still moves one tally by one. Reviewed
 writer of `agent_accs_audit_event`. It clears `accs.auditing` before
 it returns. A later statement cannot insert another event. Update and
 delete are rejected. The link is `accs_audit_digest` over the previous
-digest, the event kind, the entity key, and the sequence.
+digest, the event kind, the entity key, and the sequence. Reviewed
+2026-11-02 without a version bump. Project and publish set a one-shot
+`accs.audit_ticket` for that link, and `accs_append_audit` clears the
+ticket before it writes. A later call without a new ticket is
+`AUDIT CHAIN REJECTED`. `TRUNCATE` is rejected on the audit chain, the
+sealed card, the day counter, the columnar tally, the projection
+ledger, and the synopsis. Revoke cannot rewrite an approved budget.
+An unknown or negative board estimate is `FULL SCAN REJECTED`.
 
 ## 1. Why this plane, before how
 
@@ -157,14 +164,16 @@ synopsis steward a second reader of the card.
    the synopsis is `COMPLETE`. It does not read the card table.
 
 There is no recursive CTE, no join, and no board iterator. A plan
-whose estimated board cardinality is 1,000,000 or greater, or which
-arrives without an account key and a day key, is `FULL SCAN REJECTED`.
+whose estimated board cardinality is missing, negative, or 1,000,000
+or greater, or which arrives without an account key and a day key, is
+`FULL SCAN REJECTED`.
 
 ## 6. Lifecycle
 
 Profiles start `DRAFT` and become `APPROVED` only when the definition
 hash matches. Approved budgets, stewards, and the procedure ref are
-immutable. A session copies the budget at open. Projection consumes
+immutable, including on the transition to `REVOKED`. A session copies
+the budget at open. Projection consumes
 one budget unit per new card. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
 `SYNOPSIS ALREADY SEALED`. The next day is a new key.
@@ -376,6 +385,8 @@ export function rejectUnscopedBoardScan(input: {
   if (
     input.accountId.length === 0 ||
     input.utcDay.length === 0 ||
+    !Number.isFinite(input.boardRowEstimate) ||
+    input.boardRowEstimate < 0 ||
     input.boardRowEstimate >= FULL_SCAN_ROW_THRESHOLD
   ) {
     return "FULL SCAN REJECTED";
@@ -700,7 +711,7 @@ CREATE TABLE agent_accs_audit_event (
 CREATE TABLE agent_accs_scan_rejection (
   account_id BIGINT NOT NULL,
   rejection_id UUID NOT NULL,
-  board_row_estimate BIGINT NOT NULL,
+  board_row_estimate BIGINT,
   reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (account_id, rejection_id),
@@ -766,6 +777,19 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION accs_audit_ticket(
+  p_account_id BIGINT,
+  p_utc_day DATE,
+  p_event_kind TEXT,
+  p_entity_key TEXT
+) RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT p_account_id::TEXT || chr(10) || p_utc_day::TEXT || chr(10) ||
+    p_event_kind || chr(10) || p_entity_key;
+$$;
+
 CREATE FUNCTION accs_audit_digest(
   p_prev TEXT,
   p_event_kind TEXT,
@@ -794,6 +818,12 @@ DECLARE
   v_digest TEXT;
 BEGIN
   PERFORM accs_require_tenant(p_account_id);
+  IF current_setting('accs.audit_ticket', true) IS DISTINCT FROM accs_audit_ticket(
+    p_account_id, p_utc_day, p_event_kind, p_entity_key
+  ) THEN
+    RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
+  END IF;
+  PERFORM set_config('accs.audit_ticket', '', true);
   PERFORM pg_advisory_xact_lock(p_account_id);
   SELECT digest INTO v_prev
   FROM agent_accs_audit_event
@@ -823,7 +853,7 @@ DECLARE
   v_prev TEXT;
   v_seq BIGINT;
 BEGIN
-  IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'AUDIT CHAIN IMMUTABLE';
   END IF;
   IF current_setting('accs.auditing', true) IS DISTINCT FROM 'on' THEN
@@ -855,6 +885,10 @@ CREATE TRIGGER protect_agent_accs_audit_event_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_audit_event
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_audit_event();
 
+CREATE TRIGGER protect_agent_accs_audit_event_statement
+  BEFORE TRUNCATE ON agent_accs_audit_event
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_audit_event();
+
 CREATE FUNCTION protect_agent_accs_profile()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -867,7 +901,15 @@ BEGIN
     IF OLD.status = 'DRAFT' AND NEW.status = 'APPROVED' THEN
       NULL;
     ELSIF OLD.status = 'APPROVED' AND NEW.status = 'REVOKED' THEN
-      NULL;
+      IF OLD.definition_hash IS DISTINCT FROM NEW.definition_hash
+         OR OLD.max_cards_per_day IS DISTINCT FROM NEW.max_cards_per_day
+         OR OLD.budget_project_units IS DISTINCT FROM NEW.budget_project_units
+         OR OLD.synopsis_steward_a IS DISTINCT FROM NEW.synopsis_steward_a
+         OR OLD.synopsis_steward_b IS DISTINCT FROM NEW.synopsis_steward_b
+         OR OLD.procedure_ref IS DISTINCT FROM NEW.procedure_ref
+         OR OLD.evidence_id IS DISTINCT FROM NEW.evidence_id THEN
+        RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
+      END IF;
     ELSIF OLD.status = 'APPROVED' AND NEW.status = 'APPROVED' THEN
       IF OLD.definition_hash IS DISTINCT FROM NEW.definition_hash
          OR OLD.max_cards_per_day IS DISTINCT FROM NEW.max_cards_per_day
@@ -929,7 +971,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 BEGIN
-  IF TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SEALED CARD IMMUTABLE';
   END IF;
   IF current_setting('accs.publishing', true) = 'on' THEN
@@ -995,6 +1037,10 @@ CREATE TRIGGER protect_agent_accs_sealed_card_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_sealed_card
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_sealed_card();
 
+CREATE TRIGGER protect_agent_accs_sealed_card_statement
+  BEFORE TRUNCATE ON agent_accs_sealed_card
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_sealed_card();
+
 CREATE TRIGGER bump_agent_accs_day_counter_row
   AFTER INSERT ON agent_accs_sealed_card
   FOR EACH ROW EXECUTE FUNCTION bump_agent_accs_day_counter();
@@ -1004,7 +1050,7 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF TG_OP = 'DELETE' THEN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
   END IF;
   IF TG_OP = 'INSERT' THEN
@@ -1042,11 +1088,18 @@ CREATE TRIGGER protect_agent_accs_day_counter_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_day_counter
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_day_counter();
 
+CREATE TRIGGER protect_agent_accs_day_counter_statement
+  BEFORE TRUNCATE ON agent_accs_day_counter
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_day_counter();
+
 CREATE FUNCTION protect_agent_accs_day_column()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'COLUMN TALLY REJECTED';
+  END IF;
   IF current_setting('accs.projecting', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'COLUMN TALLY REJECTED';
   END IF;
@@ -1071,12 +1124,16 @@ CREATE TRIGGER protect_agent_accs_day_column_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_day_column
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_day_column();
 
+CREATE TRIGGER protect_agent_accs_day_column_statement
+  BEFORE TRUNCATE ON agent_accs_day_column
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_day_column();
+
 CREATE FUNCTION protect_agent_accs_projection_ledger()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF TG_OP <> 'INSERT' THEN
+  IF TG_OP = 'TRUNCATE' OR TG_OP <> 'INSERT' THEN
     RAISE EXCEPTION 'PROJECTION LEDGER IMMUTABLE';
   END IF;
   IF current_setting('accs.projecting', true) IS DISTINCT FROM 'on' THEN
@@ -1090,11 +1147,18 @@ CREATE TRIGGER protect_agent_accs_projection_ledger_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_projection_ledger
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_projection_ledger();
 
+CREATE TRIGGER protect_agent_accs_projection_ledger_statement
+  BEFORE TRUNCATE ON agent_accs_projection_ledger
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_projection_ledger();
+
 CREATE FUNCTION protect_agent_accs_synopsis()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
+  END IF;
   IF current_setting('accs.publishing', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'SYNOPSIS WRITE REJECTED';
   END IF;
@@ -1125,6 +1189,10 @@ $$;
 CREATE TRIGGER protect_agent_accs_synopsis_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_synopsis
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_synopsis();
+
+CREATE TRIGGER protect_agent_accs_synopsis_statement
+  BEFORE TRUNCATE ON agent_accs_synopsis
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_synopsis();
 
 CREATE FUNCTION approve_agent_accs_profile(
   p_account_id BIGINT,
@@ -1214,6 +1282,7 @@ DECLARE
   v_counter agent_accs_day_counter%ROWTYPE;
   v_card agent_accs_sealed_card%ROWTYPE;
   v_bucket accs_bucket;
+  v_entity TEXT;
 BEGIN
   PERFORM accs_require_tenant(p_account_id);
   IF current_setting('accs.publishing', true) = 'on' THEN
@@ -1318,9 +1387,14 @@ BEGIN
   UPDATE agent_accs_session
   SET consumed_project_units = consumed_project_units + 1
   WHERE account_id = p_account_id AND session_id = p_session_id;
+  v_entity := p_consumer_principal_id || '|' || v_bucket::TEXT;
+  PERFORM set_config(
+    'accs.audit_ticket',
+    accs_audit_ticket(p_account_id, p_utc_day, 'CARD_PROJECTED', v_entity),
+    true
+  );
   PERFORM accs_append_audit(
-    p_account_id, p_utc_day, 'CARD_PROJECTED',
-    p_consumer_principal_id || '|' || v_bucket::TEXT
+    p_account_id, p_utc_day, 'CARD_PROJECTED', v_entity
   );
   RETURN v_bucket::TEXT;
 END;
@@ -1348,6 +1422,7 @@ DECLARE
   v_reason accs_synopsis_reason;
   v_next accs_synopsis_next;
   v_digest TEXT;
+  v_entity TEXT;
   v_found BOOLEAN := FALSE;
 BEGIN
   PERFORM accs_require_tenant(p_account_id);
@@ -1462,9 +1537,14 @@ BEGIN
       v_digest, clock_timestamp()
     );
   END IF;
+  v_entity := p_utc_day::TEXT || '|' || v_completeness::TEXT || '|' || v_digest;
+  PERFORM set_config(
+    'accs.audit_ticket',
+    accs_audit_ticket(p_account_id, p_utc_day, 'SYNOPSIS_PUBLISHED', v_entity),
+    true
+  );
   PERFORM accs_append_audit(
-    p_account_id, p_utc_day, 'SYNOPSIS_PUBLISHED',
-    p_utc_day::TEXT || '|' || v_completeness::TEXT || '|' || v_digest
+    p_account_id, p_utc_day, 'SYNOPSIS_PUBLISHED', v_entity
   );
   PERFORM set_config('accs.publishing', 'off', true);
   RETURN v_digest;
@@ -1511,6 +1591,8 @@ BEGIN
   PERFORM accs_require_tenant(p_account_id);
   IF p_has_account IS DISTINCT FROM TRUE
      OR p_has_day IS DISTINCT FROM TRUE
+     OR p_board_row_estimate IS NULL
+     OR p_board_row_estimate < 0
      OR p_board_row_estimate >= 1000000 THEN
     INSERT INTO agent_accs_scan_rejection (
       account_id, rejection_id, board_row_estimate, reason, created_at
@@ -1830,8 +1912,12 @@ synopsis write. Card insert and projection take that lock first. A
 card inserted in the publish transaction raises
 `SYNOPSIS PUBLISH IN PROGRESS` and rolls back with the publish. The
 audit append holds the tenant audit lock only while it writes the next
-link, then clears `accs.auditing` before it returns. A following
-statement cannot insert, update, or delete that chain. The
+link, then clears `accs.auditing` before it returns. Project and
+publish set `accs.audit_ticket` to `accs_audit_ticket` for that one
+link. The append checks the ticket and clears it before the insert.
+A following call to `accs_append_audit` is `AUDIT CHAIN REJECTED`.
+A following statement cannot insert, update, delete, or truncate that
+chain. The
 lock key is one account and one day. Board reads do not take it, and
 another account's day uses another key. Writers of that tenant-day
 wait so a `COMPLETE` tally cannot tear. That wait is the consistency
@@ -1855,7 +1941,11 @@ neighbor's board query.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
   project and `REFUSED_OVER_BUDGET` on publish. Tallies stay null.
 - Board gate: `reject_agent_accs_board_scan` records `FULL SCAN REJECTED`
-  and returns that reason. It does not start a scan.
+  and returns that reason when the account key or the day key is
+  missing, or when the estimate is null, negative, or at least
+  1,000,000. It does not start a scan. A missing estimate is stored
+  as null on that rejection row. A finite estimate from 0 through
+  999,999 with both keys returns null and still does not scan.
 - Second reader: `reject_agent_accs_second_reader` records the attempt
   and returns `SECOND READER REJECTED`. There is no grant function.
 - Recursive expansion is not representable. The SQL has no recursive
@@ -1872,8 +1962,9 @@ neighbor's board query.
 
 ## 15. Performance check for boards with 1M+ rows
 
-`FULL SCAN REJECTED` is the planned outcome for an unscoped board walk
-or an estimate of 1,000,000 rows or more. Publish and rollup read
+`FULL SCAN REJECTED` is the planned outcome for an unscoped board walk,
+a missing estimate, a negative estimate, or an estimate of 1,000,000
+rows or more. Publish and rollup read
 `agent_accs_synopsis` and `agent_accs_day_counter` by
 `(account_id, utc_day)`. The columnar segment primary key is
 `(account_id, utc_day, bucket)`, so a complete day touches at most
@@ -1902,9 +1993,14 @@ and does not change the digest. An auditor recomputes
 `accs_audit_digest` from the previous digest, the event kind, the
 entity key, and the sequence. The append reads that tip by primary
 key `(account_id, seq)`. It does not walk a board. `accs.auditing` is
-on only for that insert. Update and delete are rejected even if the
-flag is on. A later statement in the same transaction is
-`AUDIT CHAIN REJECTED`.
+on only for that insert. Update, delete, and truncate are rejected
+even if the flag is on. The append consumes `accs.audit_ticket` before
+it writes. A later call without a new ticket, or a later insert in
+the same transaction, is `AUDIT CHAIN REJECTED`. A caller who sets
+`accs.audit_ticket` by hand can still append one well-formed link.
+That is the same boundary as a hand-set `accs.auditing` flag. The
+ticket check is a primary-key-sized comparison. It does not walk the
+ledger or the card table.
 
 ## 17. Threat and failure analysis
 
@@ -1918,11 +2014,13 @@ flag is on. A later statement in the same transaction is
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
 | Direct tally, projected increment, or synopsis write, including one after project returns | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
-| Direct audit insert, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
-| Audit update or delete | `AUDIT CHAIN IMMUTABLE` |
+| Direct audit insert, a call to `accs_append_audit` without a ticket, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
+| Audit update, delete, or truncate | `AUDIT CHAIN IMMUTABLE` |
+| Truncate of a sealed card, day counter, columnar tally, ledger, or synopsis | the same immutability error as delete |
 | Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
-| Approved budget mutated | `APPROVED PROFILE IMMUTABLE` |
+| Approved budget mutated, including on revoke | `APPROVED PROFILE IMMUTABLE` |
+| Board estimate null or negative | `FULL SCAN REJECTED` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -1979,8 +2077,11 @@ lookup.
 - A second project does not double-count.
 - A second reader, a board scan of 1,000,000 rows, a fact body, a tool
   flag, and a nested expiry flag are rejected.
-- A direct audit insert, update, or delete is rejected, and a replay
-  does not append a second event.
+- A direct audit insert, update, delete, or truncate is rejected, a
+  later `accs_append_audit` without a new ticket is rejected, and a
+  replay does not append a second event.
+- A null or negative board estimate is rejected.
+- Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
 ## 21. Product decision
@@ -1993,7 +2094,11 @@ freshness is the unprojected card count already stored on
 `agent_accs_day_counter`. `admittedCountCardSynopsis` does not expose
 that gap. Reviewed 2026-10-31: the projection gate closes before
 `project_agent_accs_card` returns. Reviewed 2026-11-01: the audit
-chain rejects a direct insert, update, or delete. This contract does
+chain rejects a direct insert, update, or delete. Reviewed
+2026-11-02: a later `accs_append_audit` needs a one-shot ticket,
+truncate is rejected on the immutable tables, revoke keeps the
+approved budget, and an unknown or negative board estimate is
+rejected. This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
 board to answer a daily tally.
