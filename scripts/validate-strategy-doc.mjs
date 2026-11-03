@@ -285,6 +285,7 @@ function cardInsert({
   day,
   consumer,
   cardId,
+  account = 101,
   reader = "principal:reader-1",
   shape = "ADMITTED",
   inlinesFactBody = false,
@@ -338,7 +339,7 @@ function cardInsert({
       access_path, inlines_fact_body, executes_tool, opens_nested_expiry,
       packet_scan_used, ack_promoted_to_trust, sealed_at, created_at
     ) VALUES (
-      101, DATE '${day}', '${consumer}', '${cardId}',
+      ${account}, DATE '${day}', '${consumer}', '${cardId}',
       '${reader}', 'ack-hold-card', '${picked.holdClass}', '${picked.holdReason}',
       ${flag(picked.holdRecorded)}, '${picked.next}', '${picked.ackClass}',
       '${picked.ackReason}', ${flag(picked.ackRecorded)}, '${picked.effect}',
@@ -355,6 +356,26 @@ try {
   await database.exec(ddlBlock);
   await database.exec(vectorBlock);
   await database.exec("SELECT set_config('app.account_id', '101', false);");
+  await expectRejection(
+    cardInsert({
+      day: "2026-10-26",
+      consumer: "principal:consumer-other-tenant",
+      cardId: "40000000-0000-0000-0000-000000000901",
+      account: 202,
+    }),
+    "TENANT SCOPE REJECTED",
+  );
+  const crossTenantCard = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_sealed_card WHERE account_id = 202",
+  );
+  const crossTenantCounter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_counter WHERE account_id = 202",
+  );
+  assert(
+    Number(crossTenantCard.rows[0]?.n) === 0 &&
+      Number(crossTenantCounter.rows[0]?.n) === 0,
+    `cross-tenant seal wrote neighbor state: cards ${crossTenantCard.rows[0]?.n}, counters ${crossTenantCounter.rows[0]?.n}`,
+  );
 
   const profile = (id, hash, maxCards, budget) => `
     INSERT INTO agent_accs_profile (
@@ -1462,6 +1483,177 @@ try {
       Number(revokedProfile.rows[0]?.budget_project_units) === 10,
     `revoke rewrote the approved budget: ${JSON.stringify(revokedProfile.rows[0])}`,
   );
+  await expectRejection(
+    `DELETE FROM agent_accs_profile
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000004'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await database.exec(`
+    INSERT INTO agent_accs_profile (
+      account_id, profile_id, profile_version, status, definition_hash,
+      max_cards_per_day, budget_project_units, synopsis_steward_a,
+      synopsis_steward_b, procedure_ref, evidence_id, created_at, approved_at
+    ) VALUES (
+      101, '10000000-0000-0000-0000-000000000005', 1, 'DRAFT', '${"f".repeat(32)}',
+      100, 10, 'principal:accs-a', 'principal:accs-b',
+      'procedure:fold-admitted-count-card-day',
+      '30000000-0000-0000-0000-000000000001',
+      TIMESTAMPTZ '2026-10-26 00:00:00+00', NULL
+    );
+    SELECT approve_agent_accs_profile(
+      101, '10000000-0000-0000-0000-000000000005', 1, '${"f".repeat(32)}'
+    );
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET profile_version = 7
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000005'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET account_id = 202
+     WHERE profile_id = '10000000-0000-0000-0000-000000000005'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_profile
+     WHERE profile_id = '10000000-0000-0000-0000-000000000005'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  const approvedIdentity = await database.query(`
+    SELECT profile_version, account_id::text AS account_id, status
+    FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000005'
+  `);
+  assert(
+    Number(approvedIdentity.rows[0]?.profile_version) === 1 &&
+      approvedIdentity.rows[0]?.account_id === "101" &&
+      approvedIdentity.rows[0]?.status === "APPROVED",
+    `approved profile identity moved: ${JSON.stringify(approvedIdentity.rows[0])}`,
+  );
+  await database.exec(`
+    INSERT INTO agent_accs_profile (
+      account_id, profile_id, profile_version, status, definition_hash,
+      max_cards_per_day, budget_project_units, synopsis_steward_a,
+      synopsis_steward_b, procedure_ref, evidence_id, created_at, approved_at
+    ) VALUES (
+      101, '10000000-0000-0000-0000-000000000006', 1, 'DRAFT', '${"c".repeat(32)}',
+      100, 10, 'principal:accs-a', 'principal:accs-b',
+      'procedure:fold-admitted-count-card-day',
+      '30000000-0000-0000-0000-000000000001',
+      TIMESTAMPTZ '2026-10-26 00:00:00+00', NULL
+    );
+    DELETE FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000006';
+  `);
+  const draftGone = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000006'
+  `);
+  assert(
+    Number(draftGone.rows[0]?.n) === 0,
+    `draft profile delete was rejected: ${JSON.stringify(draftGone.rows[0])}`,
+  );
+  const profilesBeforeTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_profile",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_profile CASCADE",
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  const profilesAfterTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_profile",
+  );
+  assert(
+    Number(profilesAfterTruncate.rows[0]?.n) ===
+      Number(profilesBeforeTruncate.rows[0]?.n) &&
+      Number(profilesAfterTruncate.rows[0]?.n) > 0,
+    `truncate removed approved profiles: ${JSON.stringify(profilesAfterTruncate.rows[0])}`,
+  );
+
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       UPDATE agent_accs_synopsis
+       SET profile_id = '10000000-0000-0000-0000-0000000000aa'
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-26'
+         AND completeness = 'COMPLETE';
+     END $$;`,
+    "SYNOPSIS DRIFT REJECTED",
+  );
+  const digestStillMatches = await database.query(`
+    SELECT bool_and(
+      digest = accs_synopsis_digest(
+        account_id, utc_day, profile_id, profile_version, completeness,
+        admitted_tally, refused_tally, omitted_tally, sealed_card_count
+      )
+    ) AS matches
+    FROM agent_accs_synopsis
+    WHERE account_id = 101
+  `);
+  assert(
+    digestStillMatches.rows[0]?.matches === true,
+    `synopsis digest no longer recomputes: ${JSON.stringify(digestStillMatches.rows[0])}`,
+  );
+
+  await database.exec(`
+    SELECT set_config('accs.publishing', 'on', true);
+    INSERT INTO agent_accs_synopsis (
+      account_id, utc_day, synopsis_id, profile_id, profile_version,
+      admitted_tally, refused_tally, omitted_tally, sealed_card_count,
+      projected_count, max_cards_per_day, completeness, synopsis_class,
+      synopsis_reason, trusted_next_action, body_visibility, access_path,
+      metadata_trust, inlines_fact_body, executes_tool, opens_nested_expiry,
+      packet_scan_used, second_reader_granted, synopsis_steward_a,
+      synopsis_steward_b, digest, published_at
+    ) VALUES (
+      202, DATE '2026-12-01', '50000000-0000-0000-0000-000000000202',
+      '10000000-0000-0000-0000-000000000202', 1,
+      0, 0, 0, 0, 0, 100, 'COMPLETE', 'PUBLISHED', 'SEALED_CARDS_TALLIED',
+      'READ_CARD_DAY_SYNOPSIS', 'OMITTED', 'COLUMN_PRUNE', 'UNTRUSTED_METADATA',
+      FALSE, FALSE, FALSE, FALSE, FALSE, 'principal:accs-a', 'principal:accs-b',
+      accs_synopsis_digest(
+        202, DATE '2026-12-01', '10000000-0000-0000-0000-000000000202', 1,
+        'COMPLETE', 0, 0, 0, 0
+      ),
+      TIMESTAMPTZ '2026-10-26 00:00:00+00'
+    );
+    SELECT set_config('accs.publishing', 'off', true);
+    CREATE ROLE accs_writer NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_writer;
+    GRANT INSERT ON agent_accs_sealed_card TO accs_writer;
+  `);
+  await database.exec("SET ROLE accs_writer");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      cardInsert({
+        day: "2026-12-01",
+        consumer: "principal:consumer-oracle-sealed",
+        cardId: "40000000-0000-0000-0000-000000000902",
+        account: 202,
+      }),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      cardInsert({
+        day: "2026-12-02",
+        consumer: "principal:consumer-oracle-empty",
+        cardId: "40000000-0000-0000-0000-000000000903",
+        account: 202,
+      }),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
 
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
