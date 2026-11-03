@@ -25,7 +25,13 @@ ticket before it writes. A later call without a new ticket is
 `AUDIT CHAIN REJECTED`. `TRUNCATE` is rejected on the audit chain, the
 sealed card, the day counter, the columnar tally, the projection
 ledger, and the synopsis. Revoke cannot rewrite an approved budget.
-An unknown or negative board estimate is `FULL SCAN REJECTED`.
+An unknown or negative board estimate is `FULL SCAN REJECTED`. Reviewed
+2026-11-03 without a version bump. A sealed-card insert whose
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
+before the trigger reads a synopsis, so a neighbor's `COMPLETE` day is
+not a different error from an empty day. An approved or revoked profile
+cannot be deleted, truncated, or re-keyed. A synopsis digest that does
+not recompute from its columns is `SYNOPSIS DRIFT REJECTED`.
 
 ## 1. Why this plane, before how
 
@@ -172,7 +178,10 @@ or greater, or which arrives without an account key and a day key, is
 
 Profiles start `DRAFT` and become `APPROVED` only when the definition
 hash matches. Approved budgets, stewards, and the procedure ref are
-immutable, including on the transition to `REVOKED`. A session copies
+immutable, including on the transition to `REVOKED`. The approved row's
+`account_id`, `profile_id`, and `profile_version` stay with that budget.
+Delete and truncate of an approved or revoked profile are rejected.
+A draft can still be deleted. A session copies
 the budget at open. Projection consumes
 one budget unit per new card. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
@@ -894,24 +903,28 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status <> 'DRAFT' THEN
+      RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
+    END IF;
+    RETURN OLD;
+  END IF;
   IF TG_OP = 'INSERT' AND NEW.status <> 'DRAFT' THEN
     RAISE EXCEPTION 'PROFILE MUST START DRAFT';
   END IF;
   IF TG_OP = 'UPDATE' THEN
     IF OLD.status = 'DRAFT' AND NEW.status = 'APPROVED' THEN
       NULL;
-    ELSIF OLD.status = 'APPROVED' AND NEW.status = 'REVOKED' THEN
-      IF OLD.definition_hash IS DISTINCT FROM NEW.definition_hash
-         OR OLD.max_cards_per_day IS DISTINCT FROM NEW.max_cards_per_day
-         OR OLD.budget_project_units IS DISTINCT FROM NEW.budget_project_units
-         OR OLD.synopsis_steward_a IS DISTINCT FROM NEW.synopsis_steward_a
-         OR OLD.synopsis_steward_b IS DISTINCT FROM NEW.synopsis_steward_b
-         OR OLD.procedure_ref IS DISTINCT FROM NEW.procedure_ref
-         OR OLD.evidence_id IS DISTINCT FROM NEW.evidence_id THEN
-        RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
-      END IF;
-    ELSIF OLD.status = 'APPROVED' AND NEW.status = 'APPROVED' THEN
-      IF OLD.definition_hash IS DISTINCT FROM NEW.definition_hash
+    ELSIF OLD.status = 'APPROVED' AND (
+      NEW.status = 'REVOKED' OR NEW.status = 'APPROVED'
+    ) THEN
+      IF OLD.account_id IS DISTINCT FROM NEW.account_id
+         OR OLD.profile_id IS DISTINCT FROM NEW.profile_id
+         OR OLD.profile_version IS DISTINCT FROM NEW.profile_version
+         OR OLD.definition_hash IS DISTINCT FROM NEW.definition_hash
          OR OLD.max_cards_per_day IS DISTINCT FROM NEW.max_cards_per_day
          OR OLD.budget_project_units IS DISTINCT FROM NEW.budget_project_units
          OR OLD.synopsis_steward_a IS DISTINCT FROM NEW.synopsis_steward_a
@@ -929,8 +942,12 @@ END;
 $$;
 
 CREATE TRIGGER protect_agent_accs_profile_row
-  BEFORE INSERT OR UPDATE ON agent_accs_profile
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_profile
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_profile();
+
+CREATE TRIGGER protect_agent_accs_profile_statement
+  BEFORE TRUNCATE ON agent_accs_profile
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_profile();
 
 CREATE FUNCTION bump_agent_accs_day_counter()
 RETURNS TRIGGER
@@ -973,6 +990,9 @@ AS $$
 BEGIN
   IF TG_OP = 'TRUNCATE' OR TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SEALED CARD IMMUTABLE';
+  END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
   END IF;
   IF current_setting('accs.publishing', true) = 'on' THEN
     RAISE EXCEPTION 'SYNOPSIS PUBLISH IN PROGRESS';
@@ -1164,6 +1184,21 @@ BEGIN
   END IF;
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
+  END IF;
+  IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
+    IF NEW.digest IS DISTINCT FROM accs_synopsis_digest(
+      NEW.account_id,
+      NEW.utc_day,
+      NEW.profile_id,
+      NEW.profile_version,
+      NEW.completeness,
+      NEW.admitted_tally,
+      NEW.refused_tally,
+      NEW.omitted_tally,
+      NEW.sealed_card_count
+    ) THEN
+      RAISE EXCEPTION 'SYNOPSIS DRIFT REJECTED';
+    END IF;
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.completeness = 'COMPLETE' THEN
     IF NEW.digest IS DISTINCT FROM OLD.digest
@@ -1935,7 +1970,9 @@ neighbor's board query.
 
 - Tenant scope: `accs_require_tenant` compares the argument with
   `app.account_id`. A mismatch raises `TENANT SCOPE REJECTED` before
-  any read of another tenant's cards.
+  any read of another tenant's cards. A direct sealed-card insert does
+  the same comparison before it locks the day or reads a synopsis, so
+  a neighbor's `COMPLETE` day and an empty day return the same error.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2000,13 +2037,17 @@ the same transaction, is `AUDIT CHAIN REJECTED`. A caller who sets
 `accs.audit_ticket` by hand can still append one well-formed link.
 That is the same boundary as a hand-set `accs.auditing` flag. The
 ticket check is a primary-key-sized comparison. It does not walk the
-ledger or the card table.
+ledger or the card table. A synopsis insert or update whose stored
+digest disagrees with `accs_synopsis_digest` of its columns is
+`SYNOPSIS DRIFT REJECTED`. That comparison is the digest function. It
+does not read the card table. `projected_count` is not an input, so an
+awaiting republish can still leave that copy unchanged.
 
 ## 17. Threat and failure analysis
 
 | Failure | Result |
 | --- | --- |
-| Account argument disagrees with the session setting | `TENANT SCOPE REJECTED` |
+| Account argument, or a sealed-card `account_id`, disagrees with the session setting | `TENANT SCOPE REJECTED` |
 | Card enables a fact body, tool, packet scan, trusted key, or nested expiry | `UNSAFE CARD REJECTED` or `TRUSTED ENROLLMENT REJECTED` |
 | Card access path is a board scan | `FULL SCAN REJECTED` |
 | Reader or consumer is a synopsis steward | `SECOND READER REJECTED` |
@@ -2020,6 +2061,8 @@ ledger or the card table.
 | Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
 | Card inserted after `COMPLETE` | `SYNOPSIS ALREADY SEALED` |
 | Approved budget mutated, including on revoke | `APPROVED PROFILE IMMUTABLE` |
+| Approved or revoked profile deleted, truncated, or re-keyed | `APPROVED PROFILE IMMUTABLE` |
+| Synopsis digest does not recompute from its columns | `SYNOPSIS DRIFT REJECTED` |
 | Board estimate null or negative | `FULL SCAN REJECTED` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
