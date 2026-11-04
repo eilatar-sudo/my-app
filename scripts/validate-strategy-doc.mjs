@@ -1022,6 +1022,107 @@ try {
   );
   rejectionChecks += 1;
 
+  const rejectionTraceBefore = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_scan_rejection WHERE account_id = 101) AS scans,
+      (SELECT count(*)::int FROM agent_accs_second_reader_rejection WHERE account_id = 101) AS readers
+  `);
+  await expectRejection(
+    "DELETE FROM agent_accs_scan_rejection WHERE account_id = 101",
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_scan_rejection
+     SET board_row_estimate = 1
+     WHERE account_id = 101`,
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_scan_rejection",
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    `INSERT INTO agent_accs_scan_rejection (
+       account_id, rejection_id, board_row_estimate, reason, created_at
+     ) VALUES (
+       101, '70000000-0000-0000-0000-000000000001', 1000000,
+       'FULL SCAN REJECTED', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+     )`,
+    "REJECTION REJECTED",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM reject_agent_accs_board_scan(101, 1000000, TRUE, TRUE);
+       INSERT INTO agent_accs_scan_rejection (
+         account_id, rejection_id, board_row_estimate, reason, created_at
+       ) VALUES (
+         101, '70000000-0000-0000-0000-000000000002', 1000000,
+         'FULL SCAN REJECTED', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+       );
+     END $$;`,
+    "REJECTION REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_second_reader_rejection
+     SET requested_reader_principal_id = 'principal:forged'
+     WHERE account_id = 101`,
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    "DELETE FROM agent_accs_second_reader_rejection WHERE account_id = 101",
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_second_reader_rejection",
+    "REJECTION IMMUTABLE",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.rejecting', 'on', true);
+       INSERT INTO agent_accs_scan_rejection (
+         account_id, rejection_id, board_row_estimate, reason, created_at
+       ) VALUES (
+         202, '70000000-0000-0000-0000-000000000003', NULL,
+         'FULL SCAN REJECTED', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+       );
+     END $$;`,
+    "TENANT SCOPE REJECTED",
+  );
+  const rejectionTraceAfter = await database.query(`
+    SELECT
+      (SELECT count(*)::int FROM agent_accs_scan_rejection WHERE account_id = 101) AS scans,
+      (SELECT count(*)::int FROM agent_accs_second_reader_rejection WHERE account_id = 101) AS readers,
+      (SELECT count(*)::int FROM agent_accs_scan_rejection WHERE account_id = 202) AS neighbor_scans
+  `);
+  assert(
+    Number(rejectionTraceAfter.rows[0]?.scans) ===
+      Number(rejectionTraceBefore.rows[0]?.scans) &&
+      Number(rejectionTraceAfter.rows[0]?.readers) ===
+        Number(rejectionTraceBefore.rows[0]?.readers) &&
+      Number(rejectionTraceAfter.rows[0]?.neighbor_scans) === 0,
+    `rejection trace was rewritten: ${JSON.stringify({
+      before: rejectionTraceBefore.rows[0],
+      after: rejectionTraceAfter.rows[0],
+    })}`,
+  );
+  const rejectionRecorded = await database.query(
+    "SELECT reject_agent_accs_board_scan(101, 1000000, TRUE, TRUE) AS reason",
+  );
+  const rejectionTraceRecorded = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_scan_rejection WHERE account_id = 101",
+  );
+  assert(
+    rejectionRecorded.rows[0]?.reason === "FULL SCAN REJECTED" &&
+      Number(rejectionTraceRecorded.rows[0]?.n) ===
+        Number(rejectionTraceBefore.rows[0]?.scans) + 1,
+    `reject function stopped recording: ${JSON.stringify({
+      recorded: rejectionRecorded.rows[0],
+      trace: rejectionTraceRecorded.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     ${cardInsert({
       day: "2026-10-30",

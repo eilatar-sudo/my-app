@@ -31,7 +31,13 @@ An unknown or negative board estimate is `FULL SCAN REJECTED`. Reviewed
 before the trigger reads a synopsis, so a neighbor's `COMPLETE` day is
 not a different error from an empty day. An approved or revoked profile
 cannot be deleted, truncated, or re-keyed. A synopsis digest that does
-not recompute from its columns is `SYNOPSIS DRIFT REJECTED`.
+not recompute from its columns is `SYNOPSIS DRIFT REJECTED`. Reviewed
+2026-11-04 without a version bump. Update, delete, and truncate of a
+scan rejection or a second-reader rejection are `REJECTION IMMUTABLE`.
+A direct insert is `REJECTION REJECTED`. Each reject function sets
+`accs.rejecting` for that one insert and clears it before return. The
+insert's `account_id` must match `app.account_id`. The trigger does
+not read a card, a ledger, or a board.
 
 ## 1. Why this plane, before how
 
@@ -1629,12 +1635,14 @@ BEGIN
      OR p_board_row_estimate IS NULL
      OR p_board_row_estimate < 0
      OR p_board_row_estimate >= 1000000 THEN
+    PERFORM set_config('accs.rejecting', 'on', true);
     INSERT INTO agent_accs_scan_rejection (
       account_id, rejection_id, board_row_estimate, reason, created_at
     ) VALUES (
       p_account_id, gen_random_uuid(), p_board_row_estimate,
       'FULL SCAN REJECTED', clock_timestamp()
     );
+    PERFORM set_config('accs.rejecting', 'off', true);
     RETURN 'FULL SCAN REJECTED';
   END IF;
   RETURN NULL;
@@ -1649,15 +1657,51 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   PERFORM accs_require_tenant(p_account_id);
+  PERFORM set_config('accs.rejecting', 'on', true);
   INSERT INTO agent_accs_second_reader_rejection (
     account_id, rejection_id, requested_reader_principal_id, reason, created_at
   ) VALUES (
     p_account_id, gen_random_uuid(), p_requested_reader_principal_id,
     'SECOND READER REJECTED', clock_timestamp()
   );
+  PERFORM set_config('accs.rejecting', 'off', true);
   RETURN 'SECOND READER REJECTED';
 END;
 $$;
+
+CREATE FUNCTION protect_agent_accs_rejection()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'REJECTION IMMUTABLE';
+  END IF;
+  IF current_setting('accs.rejecting', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'REJECTION REJECTED';
+  END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_scan_rejection_row
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_scan_rejection
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_rejection();
+
+CREATE TRIGGER protect_agent_accs_scan_rejection_statement
+  BEFORE TRUNCATE ON agent_accs_scan_rejection
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_rejection();
+
+CREATE TRIGGER protect_agent_accs_second_reader_rejection_row
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_second_reader_rejection
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_rejection();
+
+CREATE TRIGGER protect_agent_accs_second_reader_rejection_statement
+  BEFORE TRUNCATE ON agent_accs_second_reader_rejection
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_rejection();
 
 CREATE UNIQUE INDEX agent_accs_card_id_idx ON agent_accs_sealed_card (
   account_id,
@@ -1985,6 +2029,18 @@ neighbor's board query.
   999,999 with both keys returns null and still does not scan.
 - Second reader: `reject_agent_accs_second_reader` records the attempt
   and returns `SECOND READER REJECTED`. There is no grant function.
+- Rejection trace: the alert count is the trace. Purging it would let
+  an agent treat a refused scan as if it had never been asked. Update,
+  delete, and truncate of `agent_accs_scan_rejection` and
+  `agent_accs_second_reader_rejection` raise `REJECTION IMMUTABLE`.
+  A direct insert raises `REJECTION REJECTED`. Each reject function
+  sets `accs.rejecting` for that one insert and clears it before
+  return, so a later statement in the transaction cannot add a row.
+  The trigger compares `account_id` with `app.account_id`. It does not
+  read the card table, the ledger, or a board. A caller who sets
+  `accs.rejecting` by hand can still insert one row for the current
+  tenant. That is the same boundary as a hand-set `accs.auditing`
+  flag. Do not add a ticket for it.
 - Recursive expansion is not representable. The SQL has no recursive
   common table expression and no join.
 - Tool execution, fact bodies, packet scans, trusted enrollment, and
@@ -2064,6 +2120,9 @@ awaiting republish can still leave that copy unchanged.
 | Approved or revoked profile deleted, truncated, or re-keyed | `APPROVED PROFILE IMMUTABLE` |
 | Synopsis digest does not recompute from its columns | `SYNOPSIS DRIFT REJECTED` |
 | Board estimate null or negative | `FULL SCAN REJECTED` |
+| Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
+| Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
+| Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -2073,7 +2132,8 @@ The scan function refuses it and leaves a tenant-scoped rejection row.
 
 Count `AWAITING_PROJECTION` days, `REFUSED_OVER_BUDGET` days, scan
 rejections, and second-reader rejections per `account_id`. Alert on
-those counts. Do not alert by running a board scan, and do not alert
+those counts. A direct delete does not lower them. Do not alert by
+running a board scan, and do not alert
 on a wall-clock age of an awaiting row. `published_at` on an
 `AWAITING_PROJECTION` row is the time publish was attempted, not how
 far the fold is behind. Awaiting freshness is the integer unprojected
@@ -2124,6 +2184,8 @@ lookup.
   later `accs_append_audit` without a new ticket is rejected, and a
   replay does not append a second event.
 - A null or negative board estimate is rejected.
+- A direct rejection insert, update, delete, or truncate is rejected,
+  and a later insert in the same transaction does not add a row.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2141,7 +2203,9 @@ chain rejects a direct insert, update, or delete. Reviewed
 2026-11-02: a later `accs_append_audit` needs a one-shot ticket,
 truncate is rejected on the immutable tables, revoke keeps the
 approved budget, and an unknown or negative board estimate is
-rejected. This contract does
+rejected. Reviewed 2026-11-04: a scan rejection and a second-reader
+rejection cannot be updated, deleted, or truncated, and a direct
+insert is rejected. This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
 board to answer a daily tally.
