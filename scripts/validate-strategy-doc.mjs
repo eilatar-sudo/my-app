@@ -755,6 +755,41 @@ try {
       Number(procedure.rows[0]?.hash_len) === 32,
     `procedure memory mismatch: ${JSON.stringify(procedure.rows)}`,
   );
+  await expectRejection(
+    "DELETE FROM agent_accs_procedure WHERE account_id = 101",
+    "PROCEDURE IMMUTABLE",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_procedure",
+    "PROCEDURE IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET procedure_version = 99
+     WHERE account_id = 101`,
+    "PROCEDURE IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET account_id = 202
+     WHERE account_id = 101`,
+    "PROCEDURE IMMUTABLE",
+  );
+  await database.exec(`
+    UPDATE agent_accs_procedure
+    SET instruction_text = instruction_text
+    WHERE account_id = 101
+  `);
+  const procedureKept = await database.query(`
+    SELECT count(*)::int AS n, min(procedure_version) AS version
+    FROM agent_accs_procedure
+    WHERE account_id = 101
+  `);
+  assert(
+    Number(procedureKept.rows[0]?.n) === 1 &&
+      Number(procedureKept.rows[0]?.version) === 1,
+    `procedure row was removed: ${JSON.stringify(procedureKept.rows[0])}`,
+  );
 
   const projectedEvents = await database.query(`
     SELECT count(*)::int AS n

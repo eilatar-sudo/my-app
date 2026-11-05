@@ -37,7 +37,12 @@ scan rejection or a second-reader rejection are `REJECTION IMMUTABLE`.
 A direct insert is `REJECTION REJECTED`. Each reject function sets
 `accs.rejecting` for that one insert and clears it before return. The
 insert's `account_id` must match `app.account_id`. The trigger does
-not read a card, a ledger, or a board.
+not read a card, a ledger, or a board. Reviewed 2026-11-05 without a
+version bump. Delete and truncate of `agent_accs_procedure` are
+`PROCEDURE IMMUTABLE`. An update that changes `account_id`,
+`procedure_ref`, or `procedure_version` raises the same error.
+Instruction text and its digest stay editable. The engine does not
+eval that text. The trigger does not read a card or a board.
 
 ## 1. Why this plane, before how
 
@@ -1703,6 +1708,33 @@ CREATE TRIGGER protect_agent_accs_second_reader_rejection_statement
   BEFORE TRUNCATE ON agent_accs_second_reader_rejection
   FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_rejection();
 
+CREATE FUNCTION protect_agent_accs_procedure()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'PROCEDURE IMMUTABLE';
+  END IF;
+  IF TG_OP = 'UPDATE' AND (
+    OLD.account_id IS DISTINCT FROM NEW.account_id
+    OR OLD.procedure_ref IS DISTINCT FROM NEW.procedure_ref
+    OR OLD.procedure_version IS DISTINCT FROM NEW.procedure_version
+  ) THEN
+    RAISE EXCEPTION 'PROCEDURE IMMUTABLE';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_procedure_row
+  BEFORE UPDATE OR DELETE ON agent_accs_procedure
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_procedure();
+
+CREATE TRIGGER protect_agent_accs_procedure_statement
+  BEFORE TRUNCATE ON agent_accs_procedure
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_procedure();
+
 CREATE UNIQUE INDEX agent_accs_card_id_idx ON agent_accs_sealed_card (
   account_id,
   ack_hold_card_id
@@ -1907,6 +1939,11 @@ engine does not eval the instruction text, and an agent cannot change
 the bucket rules by editing that sentence. A new instruction is a new
 profile version that stays `DRAFT` until the definition hash is
 approved.
+
+The row approval stored stays on that key. Delete, truncate, and a
+change of `account_id`, `procedure_ref`, or `procedure_version` are
+`PROCEDURE IMMUTABLE`. Editing the instruction text or its digest does
+not change a bucket. The engine still does not eval the sentence.
 
 The upstream hold next action `HOLD_ACKNOWLEDGED_RECEIPT` is not
 stored as an instruction here. This plane does not replay it.
@@ -2123,6 +2160,7 @@ awaiting republish can still leave that copy unchanged.
 | Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
 | Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -2186,6 +2224,8 @@ lookup.
 - A null or negative board estimate is rejected.
 - A direct rejection insert, update, delete, or truncate is rejected,
   and a later insert in the same transaction does not add a row.
+- A procedure row cannot be deleted, truncated, or re-keyed. Editing
+  its instruction text does not change a bucket.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2205,7 +2245,10 @@ truncate is rejected on the immutable tables, revoke keeps the
 approved budget, and an unknown or negative board estimate is
 rejected. Reviewed 2026-11-04: a scan rejection and a second-reader
 rejection cannot be updated, deleted, or truncated, and a direct
-insert is rejected. This contract does
+insert is rejected. Reviewed 2026-11-05: the procedure row approval
+stored cannot be deleted, truncated, or re-keyed. Its instruction
+text can still be edited, and that edit does not change a bucket.
+This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
 board to answer a daily tally.
