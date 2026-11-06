@@ -42,7 +42,12 @@ version bump. Delete and truncate of `agent_accs_procedure` are
 `PROCEDURE IMMUTABLE`. An update that changes `account_id`,
 `procedure_ref`, or `procedure_version` raises the same error.
 Instruction text and its digest stay editable. The engine does not
-eval that text. The trigger does not read a card or a board.
+eval that text. The trigger does not read a card or a board. Reviewed
+2026-11-06 without a version bump. An update of `principal_id` on
+`agent_accs_authorization_evidence` is `EVIDENCE IMMUTABLE`. The
+approved profile keeps the principal recorded at insert. The evidence
+digest stays editable. The trigger compares that column on the row. It
+does not read a card or a board.
 
 ## 1. Why this plane, before how
 
@@ -192,7 +197,12 @@ hash matches. Approved budgets, stewards, and the procedure ref are
 immutable, including on the transition to `REVOKED`. The approved row's
 `account_id`, `profile_id`, and `profile_version` stay with that budget.
 Delete and truncate of an approved or revoked profile are rejected.
-A draft can still be deleted. A session copies
+A draft can still be deleted. The evidence row a profile cites keeps
+the `principal_id` recorded at insert. Changing that principal is
+`EVIDENCE IMMUTABLE`, so an approved profile cannot be left citing a
+different author. A lookup by the original principal still finds that
+evidence row. The evidence digest stays editable. The trigger compares
+`principal_id` on the row. It does not read a card or a board. A session copies
 the budget at open. Projection consumes
 one budget unit per new card. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
@@ -1708,6 +1718,22 @@ CREATE TRIGGER protect_agent_accs_second_reader_rejection_statement
   BEFORE TRUNCATE ON agent_accs_second_reader_rejection
   FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_rejection();
 
+CREATE FUNCTION protect_agent_accs_authorization_evidence()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.principal_id IS DISTINCT FROM NEW.principal_id THEN
+    RAISE EXCEPTION 'EVIDENCE IMMUTABLE';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_authorization_evidence_row
+  BEFORE UPDATE ON agent_accs_authorization_evidence
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_authorization_evidence();
+
 CREATE FUNCTION protect_agent_accs_procedure()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -2161,6 +2187,7 @@ awaiting republish can still leave that copy unchanged.
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
 | Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
+| Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -2226,6 +2253,8 @@ lookup.
   and a later insert in the same transaction does not add a row.
 - A procedure row cannot be deleted, truncated, or re-keyed. Editing
   its instruction text does not change a bucket.
+- An evidence principal cannot be rewritten. Editing the evidence
+  digest does not move that principal.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2248,6 +2277,9 @@ rejection cannot be updated, deleted, or truncated, and a direct
 insert is rejected. Reviewed 2026-11-05: the procedure row approval
 stored cannot be deleted, truncated, or re-keyed. Its instruction
 text can still be edited, and that edit does not change a bucket.
+Reviewed 2026-11-06: the principal on an evidence row cannot be
+rewritten. The evidence digest can still be edited, and that edit
+does not move the principal an approved profile cites.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row

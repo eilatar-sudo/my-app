@@ -791,6 +791,68 @@ try {
     `procedure row was removed: ${JSON.stringify(procedureKept.rows[0])}`,
   );
 
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET principal_id = 'principal:forged'
+     WHERE account_id = 101
+       AND evidence_id = '30000000-0000-0000-0000-000000000001'`,
+    "EVIDENCE IMMUTABLE",
+  );
+  await database.exec(`
+    CREATE ROLE accs_evidence_writer NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_evidence_writer;
+    GRANT SELECT, UPDATE ON agent_accs_authorization_evidence TO accs_evidence_writer;
+  `);
+  await database.exec("SET ROLE accs_evidence_writer");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `UPDATE agent_accs_authorization_evidence
+       SET principal_id = 'principal:forged'
+       WHERE account_id = 101
+         AND evidence_id = '30000000-0000-0000-0000-000000000001'`,
+      "EVIDENCE IMMUTABLE",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(`
+    UPDATE agent_accs_authorization_evidence
+    SET evidence_digest = repeat('d', 32)
+    WHERE account_id = 101
+      AND evidence_id = '30000000-0000-0000-0000-000000000001'
+  `);
+  const evidenceKept = await database.query(`
+    SELECT principal_id, evidence_digest
+    FROM agent_accs_authorization_evidence
+    WHERE account_id = 101
+      AND evidence_id = '30000000-0000-0000-0000-000000000001'
+  `);
+  const evidenceProfile = await database.query(`
+    SELECT status
+    FROM agent_accs_profile
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000001'
+      AND evidence_id = '30000000-0000-0000-0000-000000000001'
+  `);
+  const evidenceByPrincipal = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_authorization_evidence
+    WHERE account_id = 101 AND principal_id = 'principal:operator'
+  `);
+  assert(
+    evidenceKept.rows[0]?.principal_id === "principal:operator" &&
+      evidenceKept.rows[0]?.evidence_digest === "d".repeat(32) &&
+      evidenceProfile.rows[0]?.status === "APPROVED" &&
+      Number(evidenceByPrincipal.rows[0]?.n) === 1,
+    `evidence principal moved: ${JSON.stringify({
+      evidence: evidenceKept.rows[0],
+      profile: evidenceProfile.rows[0],
+      byPrincipal: evidenceByPrincipal.rows[0],
+    })}`,
+  );
+
   const projectedEvents = await database.query(`
     SELECT count(*)::int AS n
     FROM agent_accs_audit_event
