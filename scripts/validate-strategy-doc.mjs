@@ -905,6 +905,92 @@ try {
       '${"a".repeat(32)}', 'ack-hold-card-seal', TIMESTAMPTZ '2026-10-26 00:00:00+00'
     );
   `);
+  await expectRejection(
+    `INSERT INTO agent_accs_profile_embedding (
+      account_id, profile_id, profile_version, embedding_model, embedding_dims,
+      embedding, definition_hash, source_watermark, updated_at
+    ) VALUES (
+      101, '10000000-0000-0000-0000-000000000002', 1,
+      'reference-synopsis-tags-v1', 4, '[0.2,0.2,0.2,0.4]',
+      '${"b".repeat(32)}', 'ack-hold-card-seal', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+    )`,
+    "DEFINITION HASH REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET definition_hash = '${"b".repeat(32)}'
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000001'`,
+    "DEFINITION HASH REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_embedding_writer NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_embedding_writer;
+    GRANT SELECT ON agent_accs_profile TO accs_embedding_writer;
+    GRANT SELECT, INSERT, UPDATE ON agent_accs_profile_embedding TO accs_embedding_writer;
+  `);
+  await database.exec("SET ROLE accs_embedding_writer");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `UPDATE agent_accs_profile_embedding
+       SET definition_hash = '${"b".repeat(32)}'
+       WHERE account_id = 101
+         AND profile_id = '10000000-0000-0000-0000-000000000001'`,
+      "DEFINITION HASH REJECTED",
+    );
+    await expectRejection(
+      `INSERT INTO agent_accs_profile_embedding (
+        account_id, profile_id, profile_version, embedding_model, embedding_dims,
+        embedding, definition_hash, source_watermark, updated_at
+      ) VALUES (
+        101, '10000000-0000-0000-0000-000000000002', 1,
+        'reference-synopsis-tags-v1', 4, '[0.2,0.2,0.2,0.4]',
+        '${"b".repeat(32)}', 'ack-hold-card-seal', TIMESTAMPTZ '2026-10-26 00:00:00+00'
+      )`,
+      "DEFINITION HASH REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(`
+    UPDATE agent_accs_profile_embedding
+    SET embedding = '[0.5,0.5,0,0]'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000001'
+  `);
+  const discovered = await database.query(`
+    SELECT e.profile_id::text AS profile_id,
+           e.definition_hash AS embedding_hash,
+           p.definition_hash AS approved_hash,
+           p.status
+    FROM agent_accs_profile_embedding AS e
+    JOIN agent_accs_profile AS p
+      ON p.account_id = e.account_id
+     AND p.profile_id = e.profile_id
+     AND p.profile_version = e.profile_version
+    WHERE e.account_id = 101
+    ORDER BY e.embedding <-> '[0.5,0.5,0,0]'
+    LIMIT 1
+  `);
+  const mismatchedEmbedding = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_profile_embedding
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000002'
+  `);
+  assert(
+    discovered.rows[0]?.profile_id === "10000000-0000-0000-0000-000000000001" &&
+      discovered.rows[0]?.embedding_hash === "a".repeat(32) &&
+      discovered.rows[0]?.approved_hash === "a".repeat(32) &&
+      discovered.rows[0]?.status === "APPROVED" &&
+      Number(mismatchedEmbedding.rows[0]?.n) === 0,
+    `embedding hash drifted from the approved profile: ${JSON.stringify({
+      discovered: discovered.rows[0],
+      mismatched: mismatchedEmbedding.rows[0],
+    })}`,
+  );
 
   await expectRejection(
     cardInsert({

@@ -47,7 +47,12 @@ eval that text. The trigger does not read a card or a board. Reviewed
 `agent_accs_authorization_evidence` is `EVIDENCE IMMUTABLE`. The
 approved profile keeps the principal recorded at insert. The evidence
 digest stays editable. The trigger compares that column on the row. It
-does not read a card or a board.
+does not read a card or a board. Reviewed 2026-11-07 without a
+version bump. An embedding whose `definition_hash` differs from the
+profile it cites is `DEFINITION HASH REJECTED`. Discovery of that row
+cannot return a profile id with a hash approval would have rejected.
+The trigger reads the profile by primary key. It does not read a card
+or a board.
 
 ## 1. Why this plane, before how
 
@@ -202,7 +207,11 @@ the `principal_id` recorded at insert. Changing that principal is
 `EVIDENCE IMMUTABLE`, so an approved profile cannot be left citing a
 different author. A lookup by the original principal still finds that
 evidence row. The evidence digest stays editable. The trigger compares
-`principal_id` on the row. It does not read a card or a board. A session copies
+`principal_id` on the row. It does not read a card or a board. An
+embedding of that profile stores the same definition hash. A different
+hash is `DEFINITION HASH REJECTED` on insert and on update. The
+comparison reads the profile by primary key. It does not scan a board.
+A session copies
 the budget at open. Projection consumes
 one budget unit per new card. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
@@ -2009,11 +2018,41 @@ ALTER TABLE agent_accs_profile_embedding FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON agent_accs_profile_embedding
   USING (account_id = NULLIF(current_setting('app.account_id', true), '')::BIGINT)
   WITH CHECK (account_id = NULLIF(current_setting('app.account_id', true), '')::BIGINT);
+
+CREATE FUNCTION protect_agent_accs_profile_embedding()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_hash TEXT;
+BEGIN
+  SELECT definition_hash INTO v_hash
+  FROM agent_accs_profile
+  WHERE account_id = NEW.account_id
+    AND profile_id = NEW.profile_id
+    AND profile_version = NEW.profile_version;
+  IF NOT FOUND OR v_hash IS DISTINCT FROM NEW.definition_hash THEN
+    RAISE EXCEPTION 'DEFINITION HASH REJECTED';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_profile_embedding_row
+  BEFORE INSERT OR UPDATE ON agent_accs_profile_embedding
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_profile_embedding();
 ```
 
 An embedding hit returns a profile id. The caller still opens a
 session and projects one card at a time. Discovery never writes
-`agent_accs_day_column`.
+`agent_accs_day_column`. The stored `definition_hash` is the cited
+profile's hash, not a second definition. Insert and update read that
+profile by `(account_id, profile_id, profile_version)` and raise
+`DEFINITION HASH REJECTED` when the hashes differ. That read is the
+primary key. It does not scan a board and it does not count cards.
+A hit therefore returns a profile id with the hash approval already
+accepted. The tag vector can still change. Deleting the row removes
+the hit. It does not store a rejected hash.
 
 ## 12. Agent perception
 
@@ -2188,6 +2227,7 @@ awaiting republish can still leave that copy unchanged.
 | Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
+| Embedding definition hash differs from the cited profile | `DEFINITION HASH REJECTED` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -2255,6 +2295,9 @@ lookup.
   its instruction text does not change a bucket.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
+- An embedding cannot store a definition hash the cited profile does
+  not have. A nearest hit still returns that profile id with the
+  approved hash.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2279,7 +2322,10 @@ stored cannot be deleted, truncated, or re-keyed. Its instruction
 text can still be edited, and that edit does not change a bucket.
 Reviewed 2026-11-06: the principal on an evidence row cannot be
 rewritten. The evidence digest can still be edited, and that edit
-does not move the principal an approved profile cites.
+does not move the principal an approved profile cites. Reviewed
+2026-11-07: an embedding cannot store a definition hash different
+from the profile it cites. Discovery cannot return that profile id
+with a hash approval would have rejected.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
