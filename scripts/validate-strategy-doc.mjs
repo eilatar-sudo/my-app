@@ -1869,7 +1869,101 @@ try {
          AND utc_day = DATE '2026-10-26'
          AND completeness = 'COMPLETE';
      END $$;`,
+    "SYNOPSIS IMMUTABLE",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       UPDATE agent_accs_synopsis
+       SET digest = repeat('a', 32)
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-26'
+         AND completeness = 'COMPLETE';
+     END $$;`,
     "SYNOPSIS DRIFT REJECTED",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       UPDATE agent_accs_synopsis
+       SET utc_day = DATE '2026-12-12',
+           digest = accs_synopsis_digest(
+             account_id, DATE '2026-12-12', profile_id, profile_version, completeness,
+             admitted_tally, refused_tally, omitted_tally, sealed_card_count
+           )
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-02';
+     END $$;`,
+    "SYNOPSIS IMMUTABLE",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       UPDATE agent_accs_synopsis
+       SET profile_id = '10000000-0000-0000-0000-000000000002',
+           profile_version = 1,
+           digest = accs_synopsis_digest(
+             account_id, utc_day, '10000000-0000-0000-0000-000000000002'::uuid, 1,
+             completeness, admitted_tally, refused_tally, omitted_tally, sealed_card_count
+           )
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-02';
+     END $$;`,
+    "SYNOPSIS IMMUTABLE",
+  );
+  await database.exec(`
+    CREATE ROLE accs_synopsis_writer NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_synopsis_writer;
+    GRANT SELECT, UPDATE ON agent_accs_synopsis TO accs_synopsis_writer;
+  `);
+  await database.exec("SET ROLE accs_synopsis_writer");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.publishing', 'on', true);
+       UPDATE agent_accs_synopsis
+       SET utc_day = DATE '2026-12-12',
+           digest = accs_synopsis_digest(
+             account_id, DATE '2026-12-12', profile_id, profile_version, completeness,
+             admitted_tally, refused_tally, omitted_tally, sealed_card_count
+           )
+       WHERE account_id = 101
+         AND utc_day = DATE '2026-10-02';`,
+      "SYNOPSIS IMMUTABLE",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(`
+    SELECT set_config('accs.publishing', 'on', true);
+    UPDATE agent_accs_synopsis
+    SET published_at = TIMESTAMPTZ '2026-10-26 01:00:00+00'
+    WHERE account_id = 101
+      AND utc_day = DATE '2026-10-02';
+    SELECT set_config('accs.publishing', 'off', true);
+  `);
+  const synopsisIdentity = await database.query(`
+    SELECT utc_day::text AS utc_day,
+           profile_id::text AS profile_id,
+           profile_version,
+           completeness::text AS completeness,
+           published_at = TIMESTAMPTZ '2026-10-26 01:00:00+00' AS touched
+    FROM agent_accs_synopsis
+    WHERE account_id = 101
+      AND utc_day = DATE '2026-10-02'
+  `);
+  assert(
+    synopsisIdentity.rows[0]?.utc_day === "2026-10-02" &&
+      synopsisIdentity.rows[0]?.profile_id ===
+        "10000000-0000-0000-0000-000000000001" &&
+      Number(synopsisIdentity.rows[0]?.profile_version) === 1 &&
+      synopsisIdentity.rows[0]?.completeness === "AWAITING_PROJECTION" &&
+      synopsisIdentity.rows[0]?.touched === true,
+    `synopsis identity moved: ${JSON.stringify(synopsisIdentity.rows[0])}`,
   );
   const digestStillMatches = await database.query(`
     SELECT bool_and(
