@@ -52,7 +52,13 @@ version bump. An embedding whose `definition_hash` differs from the
 profile it cites is `DEFINITION HASH REJECTED`. Discovery of that row
 cannot return a profile id with a hash approval would have rejected.
 The trigger reads the profile by primary key. It does not read a card
-or a board.
+or a board. Reviewed 2026-11-08 without a version bump. An update that
+moves `account_id`, `utc_day`, `profile_id`, or `profile_version` on
+`agent_accs_synopsis` is `SYNOPSIS IMMUTABLE`, including when
+`accs.publishing` is on and the digest is recomputed for the new key.
+The trigger compares those columns on the row. It does not read a card
+or a board. A rewrite that keeps the digest, such as `published_at`,
+still commits under that flag.
 
 ## 1. Why this plane, before how
 
@@ -1215,6 +1221,14 @@ BEGIN
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
   END IF;
+  IF TG_OP = 'UPDATE' AND (
+    NEW.account_id IS DISTINCT FROM OLD.account_id
+    OR NEW.utc_day IS DISTINCT FROM OLD.utc_day
+    OR NEW.profile_id IS DISTINCT FROM OLD.profile_id
+    OR NEW.profile_version IS DISTINCT FROM OLD.profile_version
+  ) THEN
+    RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
+  END IF;
   IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
     IF NEW.digest IS DISTINCT FROM accs_synopsis_digest(
       NEW.account_id,
@@ -2199,7 +2213,15 @@ ledger or the card table. A synopsis insert or update whose stored
 digest disagrees with `accs_synopsis_digest` of its columns is
 `SYNOPSIS DRIFT REJECTED`. That comparison is the digest function. It
 does not read the card table. `projected_count` is not an input, so an
-awaiting republish can still leave that copy unchanged.
+awaiting republish can still leave that copy unchanged. The synopsis
+primary key and the profile it cites do not move. An update of
+`account_id`, `utc_day`, `profile_id`, or `profile_version` is
+`SYNOPSIS IMMUTABLE` even when `accs.publishing` is on and the stored
+digest is recomputed for the new key. That comparison is the old row
+against the new row. It does not read the card table. A hand-set
+`accs.publishing` flag can still rewrite an `AWAITING` synopsis when
+the stored digest still matches, including `published_at`. Do not add
+another gate for that rewrite.
 
 ## 17. Threat and failure analysis
 
@@ -2221,6 +2243,7 @@ awaiting republish can still leave that copy unchanged.
 | Approved budget mutated, including on revoke | `APPROVED PROFILE IMMUTABLE` |
 | Approved or revoked profile deleted, truncated, or re-keyed | `APPROVED PROFILE IMMUTABLE` |
 | Synopsis digest does not recompute from its columns | `SYNOPSIS DRIFT REJECTED` |
+| Synopsis day or profile key moved, including under the publish flag | `SYNOPSIS IMMUTABLE` |
 | Board estimate null or negative | `FULL SCAN REJECTED` |
 | Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
@@ -2298,6 +2321,8 @@ lookup.
 - An embedding cannot store a definition hash the cited profile does
   not have. A nearest hit still returns that profile id with the
   approved hash.
+- A synopsis row cannot move its account, day, or profile. A
+  `published_at` touch that keeps the digest still commits.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2325,7 +2350,9 @@ rewritten. The evidence digest can still be edited, and that edit
 does not move the principal an approved profile cites. Reviewed
 2026-11-07: an embedding cannot store a definition hash different
 from the profile it cites. Discovery cannot return that profile id
-with a hash approval would have rejected.
+with a hash approval would have rejected. Reviewed 2026-11-08: the
+synopsis row cannot move to another account, day, or profile. The
+publish flag can still touch `published_at` when the digest matches.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
