@@ -1980,28 +1980,165 @@ try {
     `synopsis digest no longer recomputes: ${JSON.stringify(digestStillMatches.rows[0])}`,
   );
 
+  const forgedComplete = `
+    UPDATE agent_accs_synopsis
+    SET admitted_tally = 9,
+        refused_tally = 0,
+        omitted_tally = 0,
+        sealed_card_count = 9,
+        projected_count = 9,
+        completeness = 'COMPLETE',
+        synopsis_class = 'PUBLISHED',
+        synopsis_reason = 'SEALED_CARDS_TALLIED',
+        trusted_next_action = 'READ_CARD_DAY_SYNOPSIS',
+        digest = accs_synopsis_digest(
+          account_id, utc_day, profile_id, profile_version,
+          'COMPLETE', 9, 0, 0, 9
+        )
+    WHERE account_id = 101
+      AND utc_day = DATE '2026-10-02'
+  `;
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       ${forgedComplete};
+     END $$;`,
+    "SYNOPSIS DRIFT REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_synopsis_folder NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_synopsis_folder;
+    GRANT SELECT, UPDATE ON agent_accs_synopsis TO accs_synopsis_folder;
+  `);
+  await database.exec("SET ROLE accs_synopsis_folder");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.publishing', 'on', true);
+       ${forgedComplete};`,
+      "SYNOPSIS DRIFT REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
   await database.exec(`
     SELECT set_config('accs.publishing', 'on', true);
-    INSERT INTO agent_accs_synopsis (
-      account_id, utc_day, synopsis_id, profile_id, profile_version,
-      admitted_tally, refused_tally, omitted_tally, sealed_card_count,
-      projected_count, max_cards_per_day, completeness, synopsis_class,
-      synopsis_reason, trusted_next_action, body_visibility, access_path,
-      metadata_trust, inlines_fact_body, executes_tool, opens_nested_expiry,
-      packet_scan_used, second_reader_granted, synopsis_steward_a,
-      synopsis_steward_b, digest, published_at
+    UPDATE agent_accs_synopsis
+    SET projected_count = 1
+    WHERE account_id = 101
+      AND utc_day = DATE '2026-10-02';
+    SELECT set_config('accs.publishing', 'off', true);
+    ${cardInsert({
+      day: "2026-11-09",
+      consumer: "principal:consumer-fold",
+      cardId: "40000000-0000-0000-0000-000000000109",
+    })}
+  `);
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.publishing', 'on', true);
+       INSERT INTO agent_accs_synopsis (
+         account_id, utc_day, synopsis_id, profile_id, profile_version,
+         admitted_tally, refused_tally, omitted_tally, sealed_card_count,
+         projected_count, max_cards_per_day, completeness, synopsis_class,
+         synopsis_reason, trusted_next_action, body_visibility, access_path,
+         metadata_trust, inlines_fact_body, executes_tool, opens_nested_expiry,
+         packet_scan_used, second_reader_granted, synopsis_steward_a,
+         synopsis_steward_b, digest, published_at
+       ) VALUES (
+         101, DATE '2026-11-09', '50000000-0000-0000-0000-000000000109',
+         '10000000-0000-0000-0000-000000000001', 1,
+         9, 0, 0, 9, 9, 100, 'COMPLETE', 'PUBLISHED', 'SEALED_CARDS_TALLIED',
+         'READ_CARD_DAY_SYNOPSIS', 'OMITTED', 'COLUMN_PRUNE', 'UNTRUSTED_METADATA',
+         FALSE, FALSE, FALSE, FALSE, FALSE, 'principal:accs-a', 'principal:accs-b',
+         accs_synopsis_digest(
+           101, DATE '2026-11-09', '10000000-0000-0000-0000-000000000001', 1,
+           'COMPLETE', 9, 0, 0, 9
+         ),
+         TIMESTAMPTZ '2026-11-09 00:00:00+00'
+       );
+     END $$;`,
+    "SYNOPSIS DRIFT REJECTED",
+  );
+  const forgedInsertAbsent = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-09'
+  `);
+  const foldPublish = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      101, '10000000-0000-0000-0000-000000000001', 1, DATE '2026-11-09',
+      '50000000-0000-0000-0000-000000000110'
+    ) AS digest
+  `);
+  const foldRow = await database.query(`
+    SELECT completeness::text AS completeness, admitted_tally, projected_count
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-09'
+  `);
+  const foldRollup = await database.query(
+    "SELECT count(*)::int AS n FROM read_agent_accs_rollup(101, DATE '2026-11-09')",
+  );
+  const awaitingAfterForge = await database.query(`
+    SELECT completeness::text AS completeness,
+           admitted_tally,
+           projected_count,
+           utc_day::text AS utc_day
+    FROM agent_accs_synopsis
+    WHERE account_id = 101 AND utc_day = DATE '2026-10-02'
+  `);
+  const awaitingRollup = await database.query(
+    "SELECT count(*)::int AS n FROM read_agent_accs_rollup(101, DATE '2026-10-02')",
+  );
+  assert(
+    Number(forgedInsertAbsent.rows[0]?.n) === 0 &&
+      foldRow.rows[0]?.completeness === "AWAITING_PROJECTION" &&
+      foldRow.rows[0]?.admitted_tally === null &&
+      Number(foldRollup.rows[0]?.n) === 0 &&
+      typeof foldPublish.rows[0]?.digest === "string" &&
+      awaitingAfterForge.rows[0]?.completeness === "AWAITING_PROJECTION" &&
+      awaitingAfterForge.rows[0]?.admitted_tally === null &&
+      Number(awaitingAfterForge.rows[0]?.projected_count) === 1 &&
+      Number(awaitingRollup.rows[0]?.n) === 0,
+    `forged synopsis became agent-visible: ${JSON.stringify({
+      insert: forgedInsertAbsent.rows[0],
+      fold: foldRow.rows[0],
+      rollup: foldRollup.rows[0],
+      awaiting: awaitingAfterForge.rows[0],
+      awaitingRollup: awaitingRollup.rows[0],
+    })}`,
+  );
+
+  await database.exec(`
+    SELECT set_config('app.account_id', '202', false);
+    INSERT INTO agent_accs_authorization_evidence (
+      account_id, evidence_id, principal_id, evidence_digest, created_at
     ) VALUES (
-      202, DATE '2026-12-01', '50000000-0000-0000-0000-000000000202',
-      '10000000-0000-0000-0000-000000000202', 1,
-      0, 0, 0, 0, 0, 100, 'COMPLETE', 'PUBLISHED', 'SEALED_CARDS_TALLIED',
-      'READ_CARD_DAY_SYNOPSIS', 'OMITTED', 'COLUMN_PRUNE', 'UNTRUSTED_METADATA',
-      FALSE, FALSE, FALSE, FALSE, FALSE, 'principal:accs-a', 'principal:accs-b',
-      accs_synopsis_digest(
-        202, DATE '2026-12-01', '10000000-0000-0000-0000-000000000202', 1,
-        'COMPLETE', 0, 0, 0, 0
-      ),
-      TIMESTAMPTZ '2026-10-26 00:00:00+00'
+      202, '30000000-0000-0000-0000-000000000202', 'principal:operator-202',
+      repeat('b', 32), TIMESTAMPTZ '2026-10-26 00:00:00+00'
     );
+    INSERT INTO agent_accs_profile (
+      account_id, profile_id, profile_version, status, definition_hash,
+      max_cards_per_day, budget_project_units, synopsis_steward_a,
+      synopsis_steward_b, procedure_ref, evidence_id, created_at, approved_at
+    ) VALUES (
+      202, '10000000-0000-0000-0000-000000000202', 1, 'DRAFT', '${"e".repeat(32)}',
+      100, 10, 'principal:accs-a', 'principal:accs-b',
+      'procedure:fold-admitted-count-card-day',
+      '30000000-0000-0000-0000-000000000202',
+      TIMESTAMPTZ '2026-10-26 00:00:00+00', NULL
+    );
+    SELECT approve_agent_accs_profile(
+      202, '10000000-0000-0000-0000-000000000202', 1, '${"e".repeat(32)}'
+    );
+    SELECT publish_agent_accs_day_synopsis(
+      202, '10000000-0000-0000-0000-000000000202', 1, DATE '2026-12-01',
+      '50000000-0000-0000-0000-000000000202'
+    );
+    SELECT set_config('app.account_id', '101', false);
     SELECT set_config('accs.publishing', 'off', true);
     CREATE ROLE accs_writer NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_writer;
