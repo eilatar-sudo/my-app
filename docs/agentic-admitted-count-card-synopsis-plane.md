@@ -58,7 +58,14 @@ moves `account_id`, `utc_day`, `profile_id`, or `profile_version` on
 `accs.publishing` is on and the digest is recomputed for the new key.
 The trigger compares those columns on the row. It does not read a card
 or a board. A rewrite that keeps the digest, such as `published_at`,
-still commits under that flag.
+still commits under that flag. Reviewed 2026-11-09 without a version
+bump. An insert, or an update whose digest changes, must match the day
+fold: the approved profile's budget, the day counter, and at most three
+columnar tallies. Each of those reads is a primary key. A self-consistent
+digest that cites a different tally is `SYNOPSIS DRIFT REJECTED`. A
+profile that is not approved is `PROFILE REJECTED`. The check does not
+read a card or a board. A rewrite that keeps the digest, including
+`published_at`, still does not re-read the fold.
 
 ## 1. Why this plane, before how
 
@@ -1210,7 +1217,21 @@ CREATE TRIGGER protect_agent_accs_projection_ledger_statement
 CREATE FUNCTION protect_agent_accs_synopsis()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
+DECLARE
+  v_status accs_profile_status;
+  v_max INTEGER;
+  v_sealed BIGINT := 0;
+  v_projected BIGINT := 0;
+  v_admitted BIGINT;
+  v_refused BIGINT;
+  v_omitted BIGINT;
+  v_completeness accs_completeness;
+  v_class accs_synopsis_class;
+  v_reason accs_synopsis_reason;
+  v_next accs_synopsis_next;
 BEGIN
   IF TG_OP = 'TRUNCATE' THEN
     RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
@@ -1241,6 +1262,67 @@ BEGIN
       NEW.omitted_tally,
       NEW.sealed_card_count
     ) THEN
+      RAISE EXCEPTION 'SYNOPSIS DRIFT REJECTED';
+    END IF;
+  END IF;
+  IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW.digest IS DISTINCT FROM OLD.digest) THEN
+    SELECT status, max_cards_per_day INTO v_status, v_max
+    FROM agent_accs_profile
+    WHERE account_id = NEW.account_id
+      AND profile_id = NEW.profile_id
+      AND profile_version = NEW.profile_version;
+    IF NOT FOUND OR v_status IS DISTINCT FROM 'APPROVED' THEN
+      RAISE EXCEPTION 'PROFILE REJECTED';
+    END IF;
+    SELECT sealed_card_count, projected_count INTO v_sealed, v_projected
+    FROM agent_accs_day_counter
+    WHERE account_id = NEW.account_id AND utc_day = NEW.utc_day;
+    IF NOT FOUND THEN
+      v_sealed := 0;
+      v_projected := 0;
+    END IF;
+    IF v_sealed > v_max THEN
+      v_completeness := 'REFUSED_OVER_BUDGET';
+      v_class := 'NOT_PUBLISHED';
+      v_reason := 'DAY_OVER_CARD_BUDGET';
+      v_next := 'STOP_CARD_DAY_SYNOPSIS';
+      v_admitted := NULL;
+      v_refused := NULL;
+      v_omitted := NULL;
+    ELSIF v_projected IS DISTINCT FROM v_sealed THEN
+      v_completeness := 'AWAITING_PROJECTION';
+      v_class := 'NOT_PUBLISHED';
+      v_reason := 'PROJECTION_INCOMPLETE';
+      v_next := 'AWAIT_CARD_PROJECTION';
+      v_admitted := NULL;
+      v_refused := NULL;
+      v_omitted := NULL;
+    ELSE
+      SELECT
+        COALESCE(MAX(tally) FILTER (WHERE bucket = 'ADMITTED'), 0),
+        COALESCE(MAX(tally) FILTER (WHERE bucket = 'REFUSED'), 0),
+        COALESCE(MAX(tally) FILTER (WHERE bucket = 'OMITTED'), 0)
+      INTO v_admitted, v_refused, v_omitted
+      FROM agent_accs_day_column
+      WHERE account_id = NEW.account_id AND utc_day = NEW.utc_day;
+      IF v_admitted + v_refused + v_omitted IS DISTINCT FROM v_sealed THEN
+        RAISE EXCEPTION 'SYNOPSIS DRIFT REJECTED';
+      END IF;
+      v_completeness := 'COMPLETE';
+      v_class := 'PUBLISHED';
+      v_reason := 'SEALED_CARDS_TALLIED';
+      v_next := 'READ_CARD_DAY_SYNOPSIS';
+    END IF;
+    IF NEW.completeness IS DISTINCT FROM v_completeness
+       OR NEW.synopsis_class IS DISTINCT FROM v_class
+       OR NEW.synopsis_reason IS DISTINCT FROM v_reason
+       OR NEW.trusted_next_action IS DISTINCT FROM v_next
+       OR NEW.admitted_tally IS DISTINCT FROM v_admitted
+       OR NEW.refused_tally IS DISTINCT FROM v_refused
+       OR NEW.omitted_tally IS DISTINCT FROM v_omitted
+       OR NEW.sealed_card_count IS DISTINCT FROM v_sealed
+       OR NEW.projected_count IS DISTINCT FROM v_projected
+       OR NEW.max_cards_per_day IS DISTINCT FROM v_max THEN
       RAISE EXCEPTION 'SYNOPSIS DRIFT REJECTED';
     END IF;
   END IF;
@@ -2218,10 +2300,19 @@ primary key and the profile it cites do not move. An update of
 `account_id`, `utc_day`, `profile_id`, or `profile_version` is
 `SYNOPSIS IMMUTABLE` even when `accs.publishing` is on and the stored
 digest is recomputed for the new key. That comparison is the old row
-against the new row. It does not read the card table. A hand-set
+against the new row. It does not read the card table. An insert, or an
+update whose digest changes, must match the day fold. The trigger reads
+the approved profile by `(account_id, profile_id, profile_version)`, the
+day counter by `(account_id, utc_day)`, and, only when that counter is
+closed and inside the budget, at most three columnar tallies by the
+same account and day. A profile that is missing or not approved is
+`PROFILE REJECTED`. A tally, sealed count, projected count, budget, or
+completeness that is not that fold is `SYNOPSIS DRIFT REJECTED`. The
+check does not read the card table and does not scan a board. A
+digest-preserving rewrite does not take those reads. A hand-set
 `accs.publishing` flag can still rewrite an `AWAITING` synopsis when
-the stored digest still matches, including `published_at`. Do not add
-another gate for that rewrite.
+the stored digest still matches, including `published_at` and the
+copied `projected_count`. Do not add another gate for that rewrite.
 
 ## 17. Threat and failure analysis
 
@@ -2244,6 +2335,8 @@ another gate for that rewrite.
 | Approved or revoked profile deleted, truncated, or re-keyed | `APPROVED PROFILE IMMUTABLE` |
 | Synopsis digest does not recompute from its columns | `SYNOPSIS DRIFT REJECTED` |
 | Synopsis day or profile key moved, including under the publish flag | `SYNOPSIS IMMUTABLE` |
+| Synopsis insert or digest-changing update disagrees with the day fold | `SYNOPSIS DRIFT REJECTED` |
+| Synopsis digest change cites a profile that is not approved | `PROFILE REJECTED` |
 | Board estimate null or negative | `FULL SCAN REJECTED` |
 | Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
@@ -2323,6 +2416,9 @@ lookup.
   approved hash.
 - A synopsis row cannot move its account, day, or profile. A
   `published_at` touch that keeps the digest still commits.
+- A synopsis insert or a digest-changing update cannot publish tallies
+  the day fold does not hold. The agent rollup stays empty while the
+  day is awaiting.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2353,6 +2449,9 @@ from the profile it cites. Discovery cannot return that profile id
 with a hash approval would have rejected. Reviewed 2026-11-08: the
 synopsis row cannot move to another account, day, or profile. The
 publish flag can still touch `published_at` when the digest matches.
+Reviewed 2026-11-09: a digest-changing synopsis write has to be the day
+fold. A self-consistent digest cannot publish tallies the columnar
+segment does not hold. A touch that keeps the digest still commits.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
