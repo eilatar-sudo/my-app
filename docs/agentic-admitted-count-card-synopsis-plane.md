@@ -65,7 +65,13 @@ columnar tallies. Each of those reads is a primary key. A self-consistent
 digest that cites a different tally is `SYNOPSIS DRIFT REJECTED`. A
 profile that is not approved is `PROFILE REJECTED`. The check does not
 read a card or a board. A rewrite that keeps the digest, including
-`published_at`, still does not re-read the fold.
+`published_at`, still does not re-read the fold. Reviewed 2026-11-10
+without a version bump. A synopsis insert or update whose `account_id`
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger reads a profile, a day counter, or a columnar tally. A
+neighbor's true fold, a forged tally, and a missing profile return
+that same error. A `published_at` touch that keeps the digest still
+commits for the session account.
 
 ## 1. Why this plane, before how
 
@@ -1239,6 +1245,10 @@ BEGIN
   IF current_setting('accs.publishing', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'SYNOPSIS WRITE REJECTED';
   END IF;
+  IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE')
+     AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'SYNOPSIS IMMUTABLE';
   END IF;
@@ -2215,6 +2225,10 @@ neighbor's board query.
   any read of another tenant's cards. A direct sealed-card insert does
   the same comparison before it locks the day or reads a synopsis, so
   a neighbor's `COMPLETE` day and an empty day return the same error.
+  A direct synopsis insert or update does the same comparison before it
+  reads an approved profile, a day counter, or a columnar tally. A
+  neighbor's true fold, a forged tally, and a missing profile return
+  `TENANT SCOPE REJECTED`.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2308,11 +2322,13 @@ closed and inside the budget, at most three columnar tallies by the
 same account and day. A profile that is missing or not approved is
 `PROFILE REJECTED`. A tally, sealed count, projected count, budget, or
 completeness that is not that fold is `SYNOPSIS DRIFT REJECTED`. The
-check does not read the card table and does not scan a board. A
-digest-preserving rewrite does not take those reads. A hand-set
-`accs.publishing` flag can still rewrite an `AWAITING` synopsis when
-the stored digest still matches, including `published_at` and the
-copied `projected_count`. Do not add another gate for that rewrite.
+check does not read the card table and does not scan a board. Before
+those reads, the trigger compares `account_id` with `app.account_id`.
+A mismatch is `TENANT SCOPE REJECTED`. A digest-preserving rewrite
+does not take those reads. A hand-set `accs.publishing` flag can still
+rewrite an `AWAITING` synopsis of the session account when the stored
+digest still matches, including `published_at` and the copied
+`projected_count`. Do not add another gate for that rewrite.
 
 ## 17. Threat and failure analysis
 
@@ -2337,6 +2353,7 @@ copied `projected_count`. Do not add another gate for that rewrite.
 | Synopsis day or profile key moved, including under the publish flag | `SYNOPSIS IMMUTABLE` |
 | Synopsis insert or digest-changing update disagrees with the day fold | `SYNOPSIS DRIFT REJECTED` |
 | Synopsis digest change cites a profile that is not approved | `PROFILE REJECTED` |
+| Synopsis insert or update whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Board estimate null or negative | `FULL SCAN REJECTED` |
 | Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
@@ -2419,6 +2436,9 @@ lookup.
 - A synopsis insert or a digest-changing update cannot publish tallies
   the day fold does not hold. The agent rollup stays empty while the
   day is awaiting.
+- A synopsis insert or update for another account is `TENANT SCOPE REJECTED`
+  before the trigger reads that account's fold. A `published_at` touch
+  on the session account still commits.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2452,6 +2472,11 @@ publish flag can still touch `published_at` when the digest matches.
 Reviewed 2026-11-09: a digest-changing synopsis write has to be the day
 fold. A self-consistent digest cannot publish tallies the columnar
 segment does not hold. A touch that keeps the digest still commits.
+Reviewed 2026-11-10: a synopsis insert or update whose account
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger reads a profile, a counter, or a tally. A neighbor's true fold
+is the same error as a forged tally. A `published_at` touch that keeps
+the digest still commits for the session account.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row

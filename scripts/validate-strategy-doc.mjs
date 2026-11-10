@@ -2144,6 +2144,103 @@ try {
     GRANT USAGE ON SCHEMA public TO accs_writer;
     GRANT INSERT ON agent_accs_sealed_card TO accs_writer;
   `);
+  const neighborSynopsisBefore = await database.query(`
+    SELECT count(*)::int AS n, min(published_at)::text AS published_at
+    FROM agent_accs_synopsis
+    WHERE account_id = 202
+  `);
+  function crossTenantSynopsis(account, day, profileId, admitted, sealed) {
+    return `
+      SELECT set_config('accs.publishing', 'on', true);
+      INSERT INTO agent_accs_synopsis (
+        account_id, utc_day, synopsis_id, profile_id, profile_version,
+        admitted_tally, refused_tally, omitted_tally, sealed_card_count,
+        projected_count, max_cards_per_day, completeness, synopsis_class,
+        synopsis_reason, trusted_next_action, body_visibility, access_path,
+        metadata_trust, inlines_fact_body, executes_tool, opens_nested_expiry,
+        packet_scan_used, second_reader_granted, synopsis_steward_a,
+        synopsis_steward_b, digest, published_at
+      ) VALUES (
+        ${account}, DATE '${day}', gen_random_uuid(),
+        '${profileId}', 1,
+        ${admitted}, 0, 0, ${sealed}, ${sealed}, 100, 'COMPLETE', 'PUBLISHED',
+        'SEALED_CARDS_TALLIED', 'READ_CARD_DAY_SYNOPSIS', 'OMITTED', 'COLUMN_PRUNE',
+        'UNTRUSTED_METADATA', FALSE, FALSE, FALSE, FALSE, FALSE,
+        'principal:accs-a', 'principal:accs-b',
+        accs_synopsis_digest(
+          ${account}, DATE '${day}', '${profileId}', 1,
+          'COMPLETE', ${admitted}, 0, 0, ${sealed}
+        ),
+        TIMESTAMPTZ '2026-11-10 00:00:00+00'
+      );
+    `;
+  }
+  const neighborProfile = "10000000-0000-0000-0000-000000000202";
+  const unknownProfile = "10000000-0000-0000-0000-000000000303";
+  await expectRejection(
+    crossTenantSynopsis(202, "2026-12-02", neighborProfile, 0, 0),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    crossTenantSynopsis(202, "2026-12-03", neighborProfile, 9, 9),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    crossTenantSynopsis(303, "2026-12-04", unknownProfile, 0, 0),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.publishing', 'on', true);
+     UPDATE agent_accs_synopsis
+     SET published_at = TIMESTAMPTZ '2026-11-10 01:00:00+00'
+     WHERE account_id = 202 AND utc_day = DATE '2026-12-01';`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_synopsis_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_synopsis_scope;
+    GRANT INSERT, UPDATE ON agent_accs_synopsis TO accs_synopsis_scope;
+  `);
+  await database.exec("SET ROLE accs_synopsis_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      crossTenantSynopsis(202, "2026-12-05", neighborProfile, 0, 0),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      crossTenantSynopsis(202, "2026-12-06", neighborProfile, 9, 9),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      crossTenantSynopsis(303, "2026-12-07", unknownProfile, 0, 0),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await database.exec("SELECT set_config('accs.publishing', 'off', false);");
+  }
+  const neighborSynopsisAfter = await database.query(`
+    SELECT count(*)::int AS n, min(published_at)::text AS published_at
+    FROM agent_accs_synopsis
+    WHERE account_id = 202
+  `);
+  const unknownSynopsis = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_synopsis WHERE account_id = 303",
+  );
+  assert(
+    Number(neighborSynopsisBefore.rows[0]?.n) === 1 &&
+      Number(neighborSynopsisAfter.rows[0]?.n) === 1 &&
+      neighborSynopsisAfter.rows[0]?.published_at ===
+        neighborSynopsisBefore.rows[0]?.published_at &&
+      Number(unknownSynopsis.rows[0]?.n) === 0,
+    `cross-tenant synopsis write landed: ${JSON.stringify({
+      before: neighborSynopsisBefore.rows[0],
+      after: neighborSynopsisAfter.rows[0],
+      unknown: unknownSynopsis.rows[0],
+    })}`,
+  );
   await database.exec("SET ROLE accs_writer");
   try {
     await database.exec("SELECT set_config('app.account_id', '101', false);");
