@@ -2267,6 +2267,175 @@ try {
     await database.exec("SELECT set_config('app.account_id', '101', false);");
   }
 
+  const neighborCounterBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_counter WHERE account_id = 202 AND utc_day = DATE '2026-11-11'",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.sealing', 'on', true);
+     INSERT INTO agent_accs_day_counter (
+       account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
+     ) VALUES (
+       202, DATE '2026-11-11', 1, 0,
+       TIMESTAMPTZ '2026-11-11 00:00:00+00', TIMESTAMPTZ '2026-11-11 00:00:00+00'
+     );`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const emptyNeighborPublish = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      202, '10000000-0000-0000-0000-000000000202', 1, DATE '2026-11-11',
+      '50000000-0000-0000-0000-000000000211'
+    ) AS digest
+  `);
+  const emptyNeighborRow = await database.query(`
+    SELECT completeness::text AS completeness,
+           admitted_tally,
+           sealed_card_count,
+           projected_count
+    FROM agent_accs_synopsis
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-11'
+  `);
+  const emptyNeighborRollup = await database.query(`
+    SELECT coalesce(sum(tally), 0)::int AS tally
+    FROM read_agent_accs_rollup(202, DATE '2026-11-11')
+  `);
+  const neighborCounterAfterInsert = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_counter WHERE account_id = 202 AND utc_day = DATE '2026-11-11'",
+  );
+  await database.exec(`
+    ${cardInsert({
+      day: "2026-11-16",
+      consumer: "principal:consumer-counter-202",
+      cardId: "40000000-0000-0000-0000-000000000216",
+      account: 202,
+    })}
+  `);
+  const neighborCounterSealed = await database.query(`
+    SELECT sealed_card_count, projected_count, updated_at::text AS updated_at
+    FROM agent_accs_day_counter
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-16'
+  `);
+  await database.exec(`
+    SELECT set_config('app.account_id', '101', false);
+    SELECT set_config('accs.sealing', 'off', false);
+  `);
+  await expectRejection(
+    `SELECT set_config('accs.sealing', 'on', true);
+     UPDATE agent_accs_day_counter
+     SET sealed_card_count = sealed_card_count + 1
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-16';`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_day_counter
+     SET updated_at = TIMESTAMPTZ '2026-11-11 01:00:00+00'
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-16'`,
+    "TENANT SCOPE REJECTED",
+  );
+  const neighborCounterKept = await database.query(`
+    SELECT sealed_card_count, projected_count, updated_at::text AS updated_at
+    FROM agent_accs_day_counter
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-16'
+  `);
+  assert(
+    Number(neighborCounterBefore.rows[0]?.n) === 0 &&
+      Number(neighborCounterAfterInsert.rows[0]?.n) === 0 &&
+      emptyNeighborRow.rows[0]?.completeness === "COMPLETE" &&
+      Number(emptyNeighborRow.rows[0]?.admitted_tally) === 0 &&
+      Number(emptyNeighborRow.rows[0]?.sealed_card_count) === 0 &&
+      Number(emptyNeighborRow.rows[0]?.projected_count) === 0 &&
+      Number(emptyNeighborRollup.rows[0]?.tally) === 0 &&
+      typeof emptyNeighborPublish.rows[0]?.digest === "string" &&
+      Number(neighborCounterSealed.rows[0]?.sealed_card_count) === 1 &&
+      Number(neighborCounterKept.rows[0]?.sealed_card_count) === 1 &&
+      Number(neighborCounterKept.rows[0]?.projected_count) === 0 &&
+      neighborCounterKept.rows[0]?.updated_at ===
+        neighborCounterSealed.rows[0]?.updated_at,
+    `cross-tenant day counter changed the neighbor fold: ${JSON.stringify({
+      before: neighborCounterBefore.rows[0],
+      afterInsert: neighborCounterAfterInsert.rows[0],
+      publish: emptyNeighborRow.rows[0],
+      rollup: emptyNeighborRollup.rows[0],
+      sealed: neighborCounterSealed.rows[0],
+      kept: neighborCounterKept.rows[0],
+    })}`,
+  );
+  await database.exec(`
+    CREATE ROLE accs_counter_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_counter_scope;
+    GRANT INSERT, UPDATE ON agent_accs_day_counter TO accs_counter_scope;
+  `);
+  await database.exec("SET ROLE accs_counter_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.sealing', 'on', true);
+       INSERT INTO agent_accs_day_counter (
+         account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
+       ) VALUES (
+         202, DATE '2026-11-17', 1, 0,
+         TIMESTAMPTZ '2026-11-11 00:00:00+00', TIMESTAMPTZ '2026-11-11 00:00:00+00'
+       );`,
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      `SELECT set_config('accs.sealing', 'on', true);
+       INSERT INTO agent_accs_day_counter (
+         account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
+       ) VALUES (
+         202, DATE '2026-11-16', 1, 0,
+         TIMESTAMPTZ '2026-11-11 00:00:00+00', TIMESTAMPTZ '2026-11-11 00:00:00+00'
+       );`,
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await database.exec("SELECT set_config('accs.sealing', 'off', false);");
+  }
+  await database.exec(`
+    SELECT set_config('accs.sealing', 'on', true);
+    INSERT INTO agent_accs_day_counter (
+      account_id, utc_day, sealed_card_count, projected_count, created_at, updated_at
+    ) VALUES (
+      101, DATE '2026-11-11', 1, 0,
+      TIMESTAMPTZ '2026-11-11 00:00:00+00', TIMESTAMPTZ '2026-11-11 00:00:00+00'
+    );
+    UPDATE agent_accs_day_counter
+    SET sealed_card_count = sealed_card_count + 1,
+        updated_at = TIMESTAMPTZ '2026-11-11 00:00:00+00'
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-11';
+    SELECT set_config('accs.sealing', 'off', true);
+    UPDATE agent_accs_day_counter
+    SET updated_at = TIMESTAMPTZ '2026-11-11 02:00:00+00'
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-11';
+  `);
+  const sessionCounter = await database.query(`
+    SELECT sealed_card_count,
+           projected_count,
+           updated_at = TIMESTAMPTZ '2026-11-11 02:00:00+00' AS touched
+    FROM agent_accs_day_counter
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-11'
+  `);
+  await expectRejection(
+    `DELETE FROM agent_accs_day_counter
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-16'`,
+    "DAY COUNTER IMMUTABLE",
+  );
+  const neighborCounterSurvived = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_counter WHERE account_id = 202 AND utc_day = DATE '2026-11-16'",
+  );
+  assert(
+    Number(sessionCounter.rows[0]?.sealed_card_count) === 2 &&
+      Number(sessionCounter.rows[0]?.projected_count) === 0 &&
+      sessionCounter.rows[0]?.touched === true &&
+      Number(neighborCounterSurvived.rows[0]?.n) === 1,
+    `session sealing boundary moved: ${JSON.stringify({
+      session: sessionCounter.rows[0],
+      neighbor: neighborCounterSurvived.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;

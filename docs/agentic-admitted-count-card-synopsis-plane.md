@@ -71,7 +71,13 @@ disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
 trigger reads a profile, a day counter, or a columnar tally. A
 neighbor's true fold, a forged tally, and a missing profile return
 that same error. A `published_at` touch that keeps the digest still
-commits for the session account.
+commits for the session account. Reviewed 2026-11-11
+without a version bump. A day-counter insert or update whose
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
+before the trigger checks `accs.sealing` or `accs.projecting`. The
+check is the session setting. It does not read a card or a board. A
+hand-set `accs.sealing` insert for the session account still commits,
+and that neighbor's empty day still publishes zeros.
 
 ## 1. Why this plane, before how
 
@@ -1121,6 +1127,9 @@ AS $$
 BEGIN
   IF TG_OP = 'TRUNCATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'DAY COUNTER IMMUTABLE';
+  END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
   END IF;
   IF TG_OP = 'INSERT' THEN
     IF current_setting('accs.sealing', true) IS DISTINCT FROM 'on'
@@ -2228,7 +2237,9 @@ neighbor's board query.
   A direct synopsis insert or update does the same comparison before it
   reads an approved profile, a day counter, or a columnar tally. A
   neighbor's true fold, a forged tally, and a missing profile return
-  `TENANT SCOPE REJECTED`.
+  `TENANT SCOPE REJECTED`. A day-counter insert or update does the same
+  comparison before it checks `accs.sealing` or `accs.projecting`. A
+  neighbor counter and a missing day return `TENANT SCOPE REJECTED`.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2342,6 +2353,7 @@ digest still matches, including `published_at` and the copied
 | Day cardinality over budget | null tallies, `STOP_CARD_DAY_SYNOPSIS` |
 | Direct tally, projected increment, or synopsis write, including one after project returns | `COLUMN TALLY REJECTED` or `SYNOPSIS WRITE REJECTED` |
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
+| Day-counter insert or update whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Direct audit insert, a call to `accs_append_audit` without a ticket, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
 | Audit update, delete, or truncate | `AUDIT CHAIN IMMUTABLE` |
 | Truncate of a sealed card, day counter, columnar tally, ledger, or synopsis | the same immutability error as delete |
@@ -2385,7 +2397,13 @@ copies `projected_count` only when the digest changes, so a later
 projection that leaves the day awaiting does not move that copy.
 Operators read the counter. The sealed increment is the card-insert
 trigger, and it adds one. A direct insert or a direct change of
-`sealed_card_count` is `DAY COUNTER IMMUTABLE`. The projected
+`sealed_card_count` is `DAY COUNTER IMMUTABLE` when the row's account
+is the session account. An insert or update whose `account_id`
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger checks `accs.sealing` or `accs.projecting`. That comparison
+does not read a card or a board. A hand-set `accs.sealing` insert for
+the session account still commits. Delete and truncate stay
+`DAY COUNTER IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2439,6 +2457,10 @@ lookup.
 - A synopsis insert or update for another account is `TENANT SCOPE REJECTED`
   before the trigger reads that account's fold. A `published_at` touch
   on the session account still commits.
+- A day-counter insert or update for another account is `TENANT SCOPE REJECTED`
+  before the sealing or projecting flag is checked. The neighbor's empty
+  day still publishes zeros. A hand-set `accs.sealing` insert for the
+  session account still commits.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2476,7 +2498,12 @@ Reviewed 2026-11-10: a synopsis insert or update whose account
 disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
 trigger reads a profile, a counter, or a tally. A neighbor's true fold
 is the same error as a forged tally. A `published_at` touch that keeps
-the digest still commits for the session account.
+the digest still commits for the session account. Reviewed
+2026-11-11: a day-counter insert or update whose account disagrees
+with `app.account_id` is `TENANT SCOPE REJECTED` before the trigger
+checks the sealing or projecting flag. The neighbor's empty day still
+publishes zeros. A hand-set `accs.sealing` insert for the session
+account still commits.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
