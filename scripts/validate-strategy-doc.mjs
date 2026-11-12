@@ -2436,6 +2436,211 @@ try {
     })}`,
   );
 
+  const neighborColumnBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_column WHERE account_id = 202 AND utc_day = DATE '2026-11-12'",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     INSERT INTO agent_accs_day_column (
+       account_id, utc_day, bucket, tally, updated_at
+     ) VALUES (
+       202, DATE '2026-11-12', 'ADMITTED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+     );`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `INSERT INTO agent_accs_day_column (
+       account_id, utc_day, bucket, tally, updated_at
+     ) VALUES (
+       202, DATE '2026-11-20', 'ADMITTED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+     )`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const emptyColumnPublish = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      202, '10000000-0000-0000-0000-000000000202', 1, DATE '2026-11-12',
+      '50000000-0000-0000-0000-000000000212'
+    ) AS digest
+  `);
+  const emptyColumnRow = await database.query(`
+    SELECT completeness::text AS completeness,
+           admitted_tally,
+           refused_tally,
+           omitted_tally
+    FROM agent_accs_synopsis
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-12'
+  `);
+  const emptyColumnRollup = await database.query(`
+    SELECT coalesce(sum(tally), 0)::int AS tally
+    FROM read_agent_accs_rollup(202, DATE '2026-11-12')
+  `);
+  await database.exec(`
+    SELECT set_config('accs.projecting', 'on', true);
+    INSERT INTO agent_accs_day_column (
+      account_id, utc_day, bucket, tally, updated_at
+    ) VALUES (
+      202, DATE '2026-11-18', 'ADMITTED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+    );
+    SELECT set_config('accs.projecting', 'off', true);
+  `);
+  const neighborTallyPlanted = await database.query(`
+    SELECT tally, updated_at::text AS updated_at
+    FROM agent_accs_day_column
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED'
+  `);
+  await database.exec(`
+    SELECT set_config('app.account_id', '101', false);
+    SELECT set_config('accs.projecting', 'off', false);
+  `);
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     UPDATE agent_accs_day_column
+     SET tally = tally + 1
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED';`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_day_column
+     SET updated_at = TIMESTAMPTZ '2026-11-12 01:00:00+00'
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     UPDATE agent_accs_day_column
+     SET account_id = 101, utc_day = DATE '2026-11-19', tally = tally + 1
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED';`,
+    "TENANT SCOPE REJECTED",
+  );
+  const neighborTallyKept = await database.query(`
+    SELECT tally, updated_at::text AS updated_at
+    FROM agent_accs_day_column
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED'
+  `);
+  const neighborColumnAfter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_column WHERE account_id = 202 AND utc_day = DATE '2026-11-12'",
+  );
+  assert(
+    Number(neighborColumnBefore.rows[0]?.n) === 0 &&
+      Number(neighborColumnAfter.rows[0]?.n) === 0 &&
+      emptyColumnRow.rows[0]?.completeness === "COMPLETE" &&
+      Number(emptyColumnRow.rows[0]?.admitted_tally) === 0 &&
+      Number(emptyColumnRow.rows[0]?.refused_tally) === 0 &&
+      Number(emptyColumnRow.rows[0]?.omitted_tally) === 0 &&
+      Number(emptyColumnRollup.rows[0]?.tally) === 0 &&
+      typeof emptyColumnPublish.rows[0]?.digest === "string" &&
+      Number(neighborTallyPlanted.rows[0]?.tally) === 1 &&
+      Number(neighborTallyKept.rows[0]?.tally) === 1 &&
+      neighborTallyKept.rows[0]?.updated_at ===
+        neighborTallyPlanted.rows[0]?.updated_at,
+    `cross-tenant columnar write changed the neighbor fold: ${JSON.stringify({
+      before: neighborColumnBefore.rows[0],
+      after: neighborColumnAfter.rows[0],
+      publish: emptyColumnRow.rows[0],
+      rollup: emptyColumnRollup.rows[0],
+      planted: neighborTallyPlanted.rows[0],
+      kept: neighborTallyKept.rows[0],
+    })}`,
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_day_column
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-18' AND bucket = 'ADMITTED'`,
+    "COLUMN TALLY REJECTED",
+  );
+  const neighborColumnSurvived = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_column WHERE account_id = 202 AND utc_day = DATE '2026-11-18'",
+  );
+  await database.exec(`
+    CREATE ROLE accs_column_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_column_scope;
+    GRANT INSERT, UPDATE ON agent_accs_day_column TO accs_column_scope;
+  `);
+  await database.exec("SET ROLE accs_column_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.projecting', 'on', true);
+       INSERT INTO agent_accs_day_column (
+         account_id, utc_day, bucket, tally, updated_at
+       ) VALUES (
+         202, DATE '2026-11-19', 'ADMITTED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+       );`,
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      `SELECT set_config('accs.projecting', 'on', true);
+       INSERT INTO agent_accs_day_column (
+         account_id, utc_day, bucket, tally, updated_at
+       ) VALUES (
+         202, DATE '2026-11-18', 'REFUSED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+       );`,
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await database.exec("SELECT set_config('accs.projecting', 'off', false);");
+  }
+  await database.exec(`
+    SELECT set_config('accs.projecting', 'on', true);
+    INSERT INTO agent_accs_day_column (
+      account_id, utc_day, bucket, tally, updated_at
+    ) VALUES (
+      101, DATE '2026-11-12', 'ADMITTED', 1, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+    );
+    UPDATE agent_accs_day_column
+    SET utc_day = DATE '2026-11-13',
+        bucket = 'REFUSED',
+        tally = tally + 1,
+        updated_at = TIMESTAMPTZ '2026-11-12 03:00:00+00'
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-12' AND bucket = 'ADMITTED';
+    SELECT set_config('accs.projecting', 'off', true);
+  `);
+  const movedColumn = await database.query(`
+    SELECT utc_day::text AS utc_day, bucket::text AS bucket, tally
+    FROM agent_accs_day_column
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-13' AND bucket = 'REFUSED'
+  `);
+  const movedColumnLeft = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_day_column WHERE account_id = 101 AND utc_day = DATE '2026-11-12'",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     UPDATE agent_accs_day_column
+     SET account_id = 202, tally = tally + 1
+     WHERE account_id = 101 AND utc_day = DATE '2026-11-13' AND bucket = 'REFUSED';`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     INSERT INTO agent_accs_day_column (
+       account_id, utc_day, bucket, tally, updated_at
+     ) VALUES (
+       101, DATE '2026-11-14', 'ADMITTED', 2, TIMESTAMPTZ '2026-11-12 00:00:00+00'
+     );`,
+    "COLUMN TALLY REJECTED",
+  );
+  const sessionColumnKept = await database.query(`
+    SELECT tally
+    FROM agent_accs_day_column
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-13' AND bucket = 'REFUSED'
+  `);
+  assert(
+    Number(neighborColumnSurvived.rows[0]?.n) === 1 &&
+      movedColumn.rows[0]?.utc_day === "2026-11-13" &&
+      movedColumn.rows[0]?.bucket === "REFUSED" &&
+      Number(movedColumn.rows[0]?.tally) === 2 &&
+      Number(movedColumnLeft.rows[0]?.n) === 0 &&
+      Number(sessionColumnKept.rows[0]?.tally) === 2,
+    `session projecting boundary moved: ${JSON.stringify({
+      neighbor: neighborColumnSurvived.rows[0],
+      moved: movedColumn.rows[0],
+      left: movedColumnLeft.rows[0],
+      kept: sessionColumnKept.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
