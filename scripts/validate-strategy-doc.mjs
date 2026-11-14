@@ -2642,6 +2642,197 @@ try {
   );
 
   await database.exec(`
+    SELECT set_config('app.account_id', '202', false);
+    SELECT set_config('accs.projecting', 'off', false);
+    SELECT set_config('accs.publishing', 'off', false);
+    SELECT open_agent_accs_session(
+      202, '20000000-0000-0000-0000-000000000220',
+      '10000000-0000-0000-0000-000000000202', 1, 'principal:operator-202'
+    );
+    ${cardInsert({
+      day: "2026-11-20",
+      consumer: "principal:consumer-ledger-202",
+      cardId: "40000000-0000-0000-0000-000000000220",
+      account: 202,
+      reader: "principal:reader-202",
+    })}
+    SELECT set_config('app.account_id', '101', false);
+  `);
+  const ledgerInsert = (account, day, consumer, cardId, bucket) => `
+    INSERT INTO agent_accs_projection_ledger (
+      account_id, utc_day, consumer_principal_id, ack_hold_card_id, bucket, projected_at
+    ) VALUES (
+      ${account}, DATE '${day}', '${consumer}', '${cardId}', '${bucket}',
+      TIMESTAMPTZ '2026-11-14 00:00:00+00'
+    );
+  `;
+  const neighborLedgerBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_projection_ledger WHERE account_id = 202 AND utc_day = DATE '2026-11-20'",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     ${ledgerInsert(202, "2026-11-20", "principal:consumer-ledger-202", "40000000-0000-0000-0000-000000000220", "REFUSED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'off', true);
+     ${ledgerInsert(202, "2026-11-20", "principal:consumer-ledger-202", "40000000-0000-0000-0000-000000000220", "REFUSED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     ${ledgerInsert(202, "2026-11-22", "principal:consumer-ledger-missing", "40000000-0000-0000-0000-000000000222", "ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.projecting', 'on', true);
+     ${ledgerInsert(303, "2026-11-20", "principal:consumer-ledger-202", "40000000-0000-0000-0000-000000000220", "ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_ledger_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_ledger_scope;
+    GRANT INSERT ON agent_accs_projection_ledger TO accs_ledger_scope;
+  `);
+  await database.exec("SET ROLE accs_ledger_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.projecting', 'on', true);
+       ${ledgerInsert(202, "2026-11-20", "principal:consumer-ledger-202", "40000000-0000-0000-0000-000000000220", "REFUSED")}`,
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      `SELECT set_config('accs.projecting', 'on', true);
+       ${ledgerInsert(303, "2026-11-20", "principal:consumer-ledger-none", "40000000-0000-0000-0000-000000000303", "ADMITTED")}`,
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '202', false);");
+    await database.exec("SELECT set_config('accs.projecting', 'off', false);");
+  }
+  const neighborLedgerAfter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_projection_ledger WHERE account_id = 202 AND utc_day = DATE '2026-11-20'",
+  );
+  const neighborProject = await database.query(`
+    SELECT project_agent_accs_card(
+      202, '20000000-0000-0000-0000-000000000220', DATE '2026-11-20',
+      'principal:consumer-ledger-202'
+    ) AS bucket
+  `);
+  const neighborLedgerBucket = await database.query(`
+    SELECT bucket::text AS bucket
+    FROM agent_accs_projection_ledger
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-20'
+  `);
+  const neighborLedgerCounter = await database.query(`
+    SELECT sealed_card_count, projected_count
+    FROM agent_accs_day_counter
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-20'
+  `);
+  const neighborLedgerColumn = await database.query(`
+    SELECT bucket::text AS bucket, tally
+    FROM agent_accs_day_column
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-20'
+  `);
+  const neighborLedgerPublish = await database.query(`
+    SELECT publish_agent_accs_day_synopsis(
+      202, '10000000-0000-0000-0000-000000000202', 1, DATE '2026-11-20',
+      '50000000-0000-0000-0000-000000000220'
+    ) AS digest
+  `);
+  const neighborLedgerSynopsis = await database.query(`
+    SELECT completeness::text AS completeness, admitted_tally, refused_tally, omitted_tally
+    FROM agent_accs_synopsis
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-20'
+  `);
+  const neighborLedgerRollup = await database.query(`
+    SELECT coalesce(sum(tally), 0)::int AS tally
+    FROM read_agent_accs_rollup(202, DATE '2026-11-20')
+  `);
+  assert(
+    Number(neighborLedgerBefore.rows[0]?.n) === 0 &&
+      Number(neighborLedgerAfter.rows[0]?.n) === 0 &&
+      neighborProject.rows[0]?.bucket === "ADMITTED" &&
+      neighborLedgerBucket.rows[0]?.bucket === "ADMITTED" &&
+      Number(neighborLedgerCounter.rows[0]?.sealed_card_count) === 1 &&
+      Number(neighborLedgerCounter.rows[0]?.projected_count) === 1 &&
+      neighborLedgerColumn.rows.length === 1 &&
+      neighborLedgerColumn.rows[0]?.bucket === "ADMITTED" &&
+      Number(neighborLedgerColumn.rows[0]?.tally) === 1 &&
+      neighborLedgerSynopsis.rows[0]?.completeness === "COMPLETE" &&
+      Number(neighborLedgerSynopsis.rows[0]?.admitted_tally) === 1 &&
+      Number(neighborLedgerSynopsis.rows[0]?.refused_tally) === 0 &&
+      Number(neighborLedgerSynopsis.rows[0]?.omitted_tally) === 0 &&
+      Number(neighborLedgerRollup.rows[0]?.tally) === 1 &&
+      typeof neighborLedgerPublish.rows[0]?.digest === "string",
+    `cross-tenant ledger write changed the neighbor fold: ${JSON.stringify({
+      before: neighborLedgerBefore.rows[0],
+      after: neighborLedgerAfter.rows[0],
+      project: neighborProject.rows[0],
+      ledger: neighborLedgerBucket.rows[0],
+      counter: neighborLedgerCounter.rows[0],
+      column: neighborLedgerColumn.rows,
+      synopsis: neighborLedgerSynopsis.rows[0],
+      rollup: neighborLedgerRollup.rows[0],
+    })}`,
+  );
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  await expectRejection(
+    `UPDATE agent_accs_projection_ledger
+     SET bucket = 'REFUSED'
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-20'`,
+    "PROJECTION LEDGER IMMUTABLE",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_projection_ledger
+     WHERE account_id = 202 AND utc_day = DATE '2026-11-20'`,
+    "PROJECTION LEDGER IMMUTABLE",
+  );
+  const neighborLedgerKept = await database.query(`
+    SELECT bucket::text AS bucket
+    FROM agent_accs_projection_ledger
+    WHERE account_id = 202 AND utc_day = DATE '2026-11-20'
+  `);
+  await database.exec(`
+    SELECT set_config('app.account_id', '101', false);
+    SELECT set_config('accs.projecting', 'off', false);
+    ${cardInsert({
+      day: "2026-11-21",
+      consumer: "principal:consumer-ledger-101",
+      cardId: "40000000-0000-0000-0000-000000000221",
+    })}
+    SELECT set_config('accs.projecting', 'on', true);
+    ${ledgerInsert(101, "2026-11-21", "principal:consumer-ledger-101", "40000000-0000-0000-0000-000000000221", "ADMITTED")}
+    SELECT set_config('accs.projecting', 'off', true);
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_projection_ledger
+     SET bucket = 'REFUSED'
+     WHERE account_id = 101 AND utc_day = DATE '2026-11-21'`,
+    "PROJECTION LEDGER IMMUTABLE",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_projection_ledger
+     WHERE account_id = 101 AND utc_day = DATE '2026-11-21'`,
+    "PROJECTION LEDGER IMMUTABLE",
+  );
+  const sessionLedgerKept = await database.query(`
+    SELECT bucket::text AS bucket
+    FROM agent_accs_projection_ledger
+    WHERE account_id = 101 AND utc_day = DATE '2026-11-21'
+  `);
+  assert(
+    neighborLedgerKept.rows[0]?.bucket === "ADMITTED" &&
+      sessionLedgerKept.rows[0]?.bucket === "ADMITTED",
+    `session ledger boundary moved: ${JSON.stringify({
+      neighbor: neighborLedgerKept.rows[0],
+      session: sessionLedgerKept.rows[0],
+    })}`,
+  );
+
+  await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
     GRANT SELECT ON agent_accs_synopsis TO accs_reader;
