@@ -86,6 +86,14 @@ check is the session setting. It does not read a card or a board. A
 hand-set `accs.projecting` insert for the session account still commits,
 and a same-tenant update can still move the bucket or the day while
 adding 1 to the tally. That neighbor's empty day still publishes zeros.
+Reviewed 2026-11-14 without a version bump. A projection-ledger insert
+whose `account_id` disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before the trigger checks `accs.projecting`. The check is the
+session setting. It does not read a card or a board. Update, delete,
+and truncate stay `PROJECTION LEDGER IMMUTABLE`. A hand-set
+`accs.projecting` insert for the session account still commits. The
+neighbor's project still returns that card's bucket, and the day can
+publish `COMPLETE`.
 
 ## 1. Why this plane, before how
 
@@ -1226,6 +1234,9 @@ BEGIN
   IF TG_OP = 'TRUNCATE' OR TG_OP <> 'INSERT' THEN
     RAISE EXCEPTION 'PROJECTION LEDGER IMMUTABLE';
   END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF current_setting('accs.projecting', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'PROJECTION LEDGER REJECTED';
   END IF;
@@ -2213,7 +2224,9 @@ rolls all five back, so a tally cannot move without a ledger row.
 increment, and the projected-count increment. The function turns it
 off before the session write and the audit append. A following
 statement in that transaction is `COLUMN TALLY REJECTED` or
-`PROJECTION LEDGER REJECTED`.
+`PROJECTION LEDGER REJECTED`. A ledger insert whose account disagrees
+with the session is `TENANT SCOPE REJECTED` before that flag is
+checked.
 
 Publish holds the tenant-day lock from the counter read through the
 synopsis write. Card insert and projection take that lock first. A
@@ -2257,6 +2270,11 @@ neighbor's board query.
   account. A neighbor tally and a missing day return `TENANT SCOPE
   REJECTED`. A same-tenant update can still move the bucket or the day
   while adding 1. Delete and truncate stay `COLUMN TALLY REJECTED`.
+  A projection-ledger insert does the same comparison before it checks
+  `accs.projecting`. A neighbor card and a missing card return `TENANT
+  SCOPE REJECTED`. Update, delete, and truncate stay `PROJECTION LEDGER
+  IMMUTABLE`. A hand-set `accs.projecting` insert for the session
+  account still commits.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2372,6 +2390,7 @@ digest still matches, including `published_at` and the copied
 | Direct day-counter insert or sealed increment | `DAY COUNTER IMMUTABLE` |
 | Day-counter insert or update whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Columnar insert or update whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Projection-ledger insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Direct audit insert, a call to `accs_append_audit` without a ticket, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
 | Audit update, delete, or truncate | `AUDIT CHAIN IMMUTABLE` |
 | Truncate of a sealed card, day counter, columnar tally, ledger, or synopsis | the same immutability error as delete |
@@ -2427,7 +2446,12 @@ before the trigger checks `accs.projecting`. That comparison does not
 read a card or a board. A hand-set `accs.projecting` insert for the
 session account still commits. A same-tenant update can still move the
 bucket or the day while adding 1. Delete and truncate stay
-`COLUMN TALLY REJECTED`. The projected
+`COLUMN TALLY REJECTED`. A projection-ledger insert whose
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
+before the trigger checks `accs.projecting`. That comparison does not
+read a card or a board. A hand-set `accs.projecting` insert for the
+session account still commits. Update, delete, and truncate stay
+`PROJECTION LEDGER IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2490,6 +2514,11 @@ lookup.
   publishes zeros. A hand-set `accs.projecting` insert for the session
   account still commits, and that update can still move the bucket or
   the day while adding 1.
+- A projection-ledger insert for another account is `TENANT SCOPE REJECTED`
+  before the projecting flag is checked. The neighbor's project returns
+  that card's bucket, and the day can publish `COMPLETE`. A hand-set
+  `accs.projecting` insert for the session account still commits.
+  Update, delete, and truncate stay `PROJECTION LEDGER IMMUTABLE`.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2537,7 +2566,14 @@ whose account disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
 before the trigger checks the projecting flag. The neighbor's empty day
 still publishes zeros. A hand-set `accs.projecting` insert for the
 session account still commits, and a same-tenant update can still move
-the bucket or the day while adding 1.
+the bucket or the day while adding 1. Reviewed 2026-11-14: a
+projection-ledger insert whose account disagrees with `app.account_id`
+is `TENANT SCOPE REJECTED` before the trigger checks the projecting
+flag. The neighbor's `projectAdmittedCountCard` returns that card's
+bucket. A `COMPLETE` synopsis of that day is the three columnar
+tallies. A hand-set `accs.projecting` insert for the session account
+still commits. Update, delete, and truncate stay `PROJECTION LEDGER
+IMMUTABLE`.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
