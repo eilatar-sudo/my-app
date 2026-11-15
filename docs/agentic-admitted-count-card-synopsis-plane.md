@@ -93,7 +93,14 @@ session setting. It does not read a card or a board. Update, delete,
 and truncate stay `PROJECTION LEDGER IMMUTABLE`. A hand-set
 `accs.projecting` insert for the session account still commits. The
 neighbor's project still returns that card's bucket, and the day can
-publish `COMPLETE`.
+publish `COMPLETE`. Reviewed 2026-11-15 without a version bump. An
+audit insert whose `account_id` disagrees with `app.account_id` is
+`TENANT SCOPE REJECTED` before the trigger checks `accs.auditing`,
+locks the chain, or reads the tip. The check is the session setting.
+It does not read a card or a board. Update, delete, and truncate stay
+`AUDIT CHAIN IMMUTABLE`. A hand-set `accs.auditing` insert for the
+session account still commits when the link is well-formed. The
+neighbor's next append is genesis for that account.
 
 ## 1. Why this plane, before how
 
@@ -935,6 +942,9 @@ DECLARE
 BEGIN
   IF TG_OP = 'TRUNCATE' OR TG_OP = 'UPDATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'AUDIT CHAIN IMMUTABLE';
+  END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
   END IF;
   IF current_setting('accs.auditing', true) IS DISTINCT FROM 'on' THEN
     RAISE EXCEPTION 'AUDIT CHAIN REJECTED';
@@ -2238,7 +2248,9 @@ publish set `accs.audit_ticket` to `accs_audit_ticket` for that one
 link. The append checks the ticket and clears it before the insert.
 A following call to `accs_append_audit` is `AUDIT CHAIN REJECTED`.
 A following statement cannot insert, update, delete, or truncate that
-chain. The
+chain. An audit insert whose account disagrees with the session is
+`TENANT SCOPE REJECTED` before that flag is checked and before the
+trigger locks or reads the other account's tip. The tenant-day
 lock key is one account and one day. Board reads do not take it, and
 another account's day uses another key. Writers of that tenant-day
 wait so a `COMPLETE` tally cannot tear. That wait is the consistency
@@ -2275,6 +2287,12 @@ neighbor's board query.
   SCOPE REJECTED`. Update, delete, and truncate stay `PROJECTION LEDGER
   IMMUTABLE`. A hand-set `accs.projecting` insert for the session
   account still commits.
+  An audit insert does the same comparison before it checks
+  `accs.auditing`, locks the chain, or reads the tip. A well-formed
+  link, a malformed digest, and a missing account return `TENANT SCOPE
+  REJECTED`. Update, delete, and truncate stay `AUDIT CHAIN IMMUTABLE`.
+  A hand-set `accs.auditing` insert for the session account still
+  commits when the link is well-formed.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2345,7 +2363,15 @@ and does not change the digest. An auditor recomputes
 entity key, and the sequence. The append reads that tip by primary
 key `(account_id, seq)`. It does not walk a board. `accs.auditing` is
 on only for that insert. Update, delete, and truncate are rejected
-even if the flag is on. The append consumes `accs.audit_ticket` before
+even if the flag is on. An insert whose `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before that flag is
+checked and before the trigger locks or reads the tip. That
+comparison is the session setting. It does not read a card or a
+board. A hand-set `accs.auditing` insert for the session account
+still commits when the link is well-formed. The neighbor's next
+append is genesis for that account, so
+`admittedCountCardSynopsisAudit` of sequence 1 is that account's own
+event. The append consumes `accs.audit_ticket` before
 it writes. A later call without a new ticket, or a later insert in
 the same transaction, is `AUDIT CHAIN REJECTED`. A caller who sets
 `accs.audit_ticket` by hand can still append one well-formed link.
@@ -2392,6 +2418,7 @@ digest still matches, including `published_at` and the copied
 | Columnar insert or update whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Projection-ledger insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Direct audit insert, a call to `accs_append_audit` without a ticket, or an audit insert after the append returns | `AUDIT CHAIN REJECTED` |
+| Audit insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Audit update, delete, or truncate | `AUDIT CHAIN IMMUTABLE` |
 | Truncate of a sealed card, day counter, columnar tally, ledger, or synopsis | the same immutability error as delete |
 | Card insert while publish holds the day | `SYNOPSIS PUBLISH IN PROGRESS` |
@@ -2451,7 +2478,13 @@ bucket or the day while adding 1. Delete and truncate stay
 before the trigger checks `accs.projecting`. That comparison does not
 read a card or a board. A hand-set `accs.projecting` insert for the
 session account still commits. Update, delete, and truncate stay
-`PROJECTION LEDGER IMMUTABLE`. The projected
+`PROJECTION LEDGER IMMUTABLE`. An audit insert whose `account_id`
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger checks `accs.auditing`, locks the chain, or reads the tip.
+That comparison does not read a card or a board. A hand-set
+`accs.auditing` insert for the session account still commits when the
+link is well-formed. Update, delete, and truncate stay `AUDIT CHAIN
+IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2519,6 +2552,11 @@ lookup.
   that card's bucket, and the day can publish `COMPLETE`. A hand-set
   `accs.projecting` insert for the session account still commits.
   Update, delete, and truncate stay `PROJECTION LEDGER IMMUTABLE`.
+- An audit insert for another account is `TENANT SCOPE REJECTED`
+  before the auditing flag is checked. The neighbor's next append is
+  genesis for that account. A hand-set `accs.auditing` insert for the
+  session account still commits when the link is well-formed. Update,
+  delete, and truncate stay `AUDIT CHAIN IMMUTABLE`.
 - Revoking a profile does not change its approved budget.
 - A reader role under row-level security sees only its `account_id`.
 
@@ -2573,7 +2611,14 @@ flag. The neighbor's `projectAdmittedCountCard` returns that card's
 bucket. A `COMPLETE` synopsis of that day is the three columnar
 tallies. A hand-set `accs.projecting` insert for the session account
 still commits. Update, delete, and truncate stay `PROJECTION LEDGER
-IMMUTABLE`.
+IMMUTABLE`. Reviewed 2026-11-15: an audit insert whose account
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger checks the auditing flag, locks the chain, or reads the tip.
+The neighbor's next append is genesis for that account.
+`admittedCountCardSynopsisAudit` of that first sequence is the
+neighbor's own event. A hand-set `accs.auditing` insert for the
+session account still commits when the link is well-formed. Update,
+delete, and truncate stay `AUDIT CHAIN IMMUTABLE`.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
