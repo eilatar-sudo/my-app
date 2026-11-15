@@ -1579,6 +1579,23 @@ try {
       auditInsertAt < auditOffAt,
     "audit append must scope the tenant, lock the chain, and clear the gate before return",
   );
+  const auditProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_audit_event'
+  `);
+  const auditProtectBody = auditProtectDef.rows[0]?.def ?? "";
+  const auditProtectTenantAt = auditProtectBody.indexOf("TENANT SCOPE REJECTED");
+  const auditProtectFlagAt = auditProtectBody.indexOf("accs.auditing");
+  const auditProtectLockAt = auditProtectBody.indexOf("pg_advisory_xact_lock");
+  assert(
+    auditProtectTenantAt !== -1 &&
+      auditProtectFlagAt !== -1 &&
+      auditProtectLockAt !== -1 &&
+      auditProtectTenantAt < auditProtectFlagAt &&
+      auditProtectFlagAt < auditProtectLockAt,
+    "audit trigger must reject a foreign account before the flag and the chain lock",
+  );
 
   await expectRejection(
     `DELETE FROM agent_accs_audit_event WHERE account_id = 101 AND seq = 1`,
@@ -2829,6 +2846,213 @@ try {
     `session ledger boundary moved: ${JSON.stringify({
       neighbor: neighborLedgerKept.rows[0],
       session: sessionLedgerKept.rows[0],
+    })}`,
+  );
+
+  const auditPlant = (account, digest, entity) => `
+    INSERT INTO agent_accs_audit_event (
+      account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
+    ) VALUES (
+      ${account}, 1, DATE '2026-11-15', 'CARD_PROJECTED', '${entity}', NULL, '${digest}',
+      TIMESTAMPTZ '2026-11-15 00:00:00+00'
+    );
+  `;
+  const plantedDigest = await database.query(
+    "SELECT accs_audit_digest(NULL, 'CARD_PROJECTED', 'planted|ADMITTED', 1) AS digest",
+  );
+  const planted = plantedDigest.rows[0]?.digest;
+  const neighborAuditBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 404",
+  );
+  const chainedAuditBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 202",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.auditing', 'on', true);
+     ${auditPlant(404, planted, "planted|ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.auditing', 'off', true);
+     ${auditPlant(404, planted, "planted|ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.auditing', 'on', true);
+     ${auditPlant(404, "f".repeat(32), "planted|ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `SELECT set_config('accs.auditing', 'on', true);
+     ${auditPlant(303, planted, "planted|ADMITTED")}`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `DO $$
+     DECLARE
+       v_prev TEXT;
+       v_seq BIGINT;
+       v_digest TEXT;
+     BEGIN
+       PERFORM set_config('accs.auditing', 'on', true);
+       SELECT digest, seq INTO v_prev, v_seq
+       FROM agent_accs_audit_event
+       WHERE account_id = 202
+       ORDER BY seq DESC
+       LIMIT 1;
+       v_seq := COALESCE(v_seq, 0) + 1;
+       v_digest := accs_audit_digest(v_prev, 'CARD_PROJECTED', 'planted|ADMITTED', v_seq);
+       INSERT INTO agent_accs_audit_event (
+         account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
+       ) VALUES (
+         202, v_seq, DATE '2026-11-15', 'CARD_PROJECTED', 'planted|ADMITTED', v_prev,
+         v_digest, TIMESTAMPTZ '2026-11-15 00:00:00+00'
+       );
+     END $$;`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_audit_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_audit_scope;
+    GRANT INSERT ON agent_accs_audit_event TO accs_audit_scope;
+  `);
+  await database.exec("SET ROLE accs_audit_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      `SELECT set_config('accs.auditing', 'on', true);
+       ${auditPlant(404, planted, "planted|ADMITTED")}`,
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      `SELECT set_config('accs.auditing', 'on', true);
+       ${auditPlant(303, planted, "planted|ADMITTED")}`,
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await database.exec("SELECT set_config('accs.auditing', 'off', false);");
+  }
+  const neighborAuditAfter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 404",
+  );
+  const chainedAuditAfter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_audit_event WHERE account_id = 202",
+  );
+  await database.exec(`
+    SELECT set_config('app.account_id', '404', false);
+    SELECT set_config(
+      'accs.audit_ticket',
+      accs_audit_ticket(404, DATE '2026-11-15', 'CARD_PROJECTED', 'real|ADMITTED'),
+      true
+    );
+    SELECT accs_append_audit(404, DATE '2026-11-15', 'CARD_PROJECTED', 'real|ADMITTED');
+  `);
+  const neighborAuditChain = await database.query(`
+    SELECT seq, entity_key, prev_digest IS NULL AS genesis
+    FROM agent_accs_audit_event
+    WHERE account_id = 404
+    ORDER BY seq
+  `);
+  await database.exec(`
+    SELECT set_config('app.account_id', '101', false);
+    SELECT set_config('accs.auditing', 'off', false);
+    DO $$
+    DECLARE
+      v_prev TEXT;
+      v_seq BIGINT;
+      v_digest TEXT;
+    BEGIN
+      PERFORM set_config('accs.auditing', 'on', true);
+      SELECT digest, seq INTO v_prev, v_seq
+      FROM agent_accs_audit_event
+      WHERE account_id = 101
+      ORDER BY seq DESC
+      LIMIT 1;
+      v_seq := COALESCE(v_seq, 0) + 1;
+      v_digest := accs_audit_digest(v_prev, 'CARD_PROJECTED', 'session-plant|ADMITTED', v_seq);
+      INSERT INTO agent_accs_audit_event (
+        account_id, seq, utc_day, event_kind, entity_key, prev_digest, digest, created_at
+      ) VALUES (
+        101, v_seq, DATE '2026-11-15', 'CARD_PROJECTED', 'session-plant|ADMITTED', v_prev,
+        v_digest, TIMESTAMPTZ '2026-11-15 00:00:00+00'
+      );
+      PERFORM set_config('accs.auditing', 'off', true);
+    END $$;
+  `);
+  const sessionAuditPlant = await database.query(`
+    SELECT seq, prev_digest IS NOT NULL AS linked
+    FROM agent_accs_audit_event
+    WHERE account_id = 101 AND entity_key = 'session-plant|ADMITTED'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_audit_event
+     SET entity_key = 'forged'
+     WHERE account_id = 404 AND seq = 1`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_audit_event WHERE account_id = 404 AND seq = 1`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `DO $$
+     BEGIN
+       PERFORM set_config('accs.auditing', 'on', true);
+       UPDATE agent_accs_audit_event
+       SET entity_key = 'forged'
+       WHERE account_id = 404 AND seq = 1;
+     END $$;`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_audit_event
+     SET entity_key = 'forged'
+     WHERE account_id = 101 AND entity_key = 'session-plant|ADMITTED'`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_audit_event
+     WHERE account_id = 101 AND entity_key = 'session-plant|ADMITTED'`,
+    "AUDIT CHAIN IMMUTABLE",
+  );
+  const neighborAuditKept = await database.query(`
+    SELECT seq, entity_key, prev_digest IS NULL AS genesis
+    FROM agent_accs_audit_event
+    WHERE account_id = 404
+    ORDER BY seq
+  `);
+  const sessionAuditKept = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_audit_event
+    WHERE account_id = 101 AND entity_key = 'session-plant|ADMITTED'
+  `);
+  assert(
+    planted.length === 32 &&
+      Number(neighborAuditBefore.rows[0]?.n) === 0 &&
+      Number(neighborAuditAfter.rows[0]?.n) === 0 &&
+      Number(chainedAuditAfter.rows[0]?.n) === Number(chainedAuditBefore.rows[0]?.n) &&
+      neighborAuditChain.rows.length === 1 &&
+      Number(neighborAuditChain.rows[0]?.seq) === 1 &&
+      neighborAuditChain.rows[0]?.entity_key === "real|ADMITTED" &&
+      neighborAuditChain.rows[0]?.genesis === true &&
+      Number(sessionAuditPlant.rows[0]?.seq) > 0 &&
+      sessionAuditPlant.rows[0]?.linked === true &&
+      neighborAuditKept.rows.length === 1 &&
+      neighborAuditKept.rows[0]?.entity_key === "real|ADMITTED" &&
+      neighborAuditKept.rows[0]?.genesis === true &&
+      Number(sessionAuditKept.rows[0]?.n) === 1,
+    `cross-tenant audit write changed the neighbor chain: ${JSON.stringify({
+      planted,
+      before: neighborAuditBefore.rows[0],
+      after: neighborAuditAfter.rows[0],
+      chainedBefore: chainedAuditBefore.rows[0],
+      chainedAfter: chainedAuditAfter.rows[0],
+      chain: neighborAuditChain.rows,
+      session: sessionAuditPlant.rows[0],
+      kept: neighborAuditKept.rows,
+      sessionKept: sessionAuditKept.rows[0],
     })}`,
   );
 
