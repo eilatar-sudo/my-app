@@ -3056,6 +3056,232 @@ try {
     })}`,
   );
 
+  const embeddingProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_profile_embedding'
+  `);
+  const embeddingProtectBody = embeddingProtectDef.rows[0]?.def ?? "";
+  const embeddingScopeAt = embeddingProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+  );
+  const embeddingHashReadAt = embeddingProtectBody.indexOf(
+    "FROM agent_accs_profile",
+  );
+  const embeddingTrigger = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_profile_embedding_row'
+      AND NOT tgisinternal
+  `);
+  const embeddingTriggerDef = embeddingTrigger.rows[0]?.def ?? "";
+  assert(
+    embeddingScopeAt !== -1 &&
+      embeddingHashReadAt !== -1 &&
+      embeddingScopeAt < embeddingHashReadAt &&
+      embeddingProtectBody.includes("TG_OP = 'DELETE'") &&
+      embeddingTriggerDef.includes("DELETE"),
+    "embedding trigger must reject a foreign account before the profile read",
+  );
+  await database.exec(`
+    SELECT set_config('app.account_id', '202', false);
+    INSERT INTO agent_accs_profile_embedding (
+      account_id, profile_id, profile_version, embedding_model, embedding_dims,
+      embedding, definition_hash, source_watermark, updated_at
+    ) VALUES (
+      202, '10000000-0000-0000-0000-000000000202', 1,
+      'reference-synopsis-tags-v1', 4, '[1,0,0,0]',
+      '${"e".repeat(32)}', 'ack-hold-card-seal', TIMESTAMPTZ '2026-11-16 00:00:00+00'
+    );
+    SELECT set_config('app.account_id', '101', false);
+  `);
+  const neighborEmbeddingBefore = await database.query(`
+    SELECT embedding::text AS embedding, definition_hash
+    FROM agent_accs_profile_embedding
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000202'
+  `);
+  const embeddingInsert = (account, profileId, vectorLiteral, hash) => `
+    INSERT INTO agent_accs_profile_embedding (
+      account_id, profile_id, profile_version, embedding_model, embedding_dims,
+      embedding, definition_hash, source_watermark, updated_at
+    ) VALUES (
+      ${account}, '${profileId}', 1,
+      'reference-synopsis-tags-v1', 4, '${vectorLiteral}',
+      '${hash}', 'ack-hold-card-seal', TIMESTAMPTZ '2026-11-16 00:00:00+00'
+    );
+  `;
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET embedding = '[0,1,0,0]'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET definition_hash = '${"b".repeat(32)}'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET account_id = 101
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_profile_embedding
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    embeddingInsert(
+      202,
+      "10000000-0000-0000-0000-000000000202",
+      "[0,0,1,0]",
+      "e".repeat(32),
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    embeddingInsert(
+      202,
+      "10000000-0000-0000-0000-000000000203",
+      "[0,0,1,0]",
+      "b".repeat(32),
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    embeddingInsert(
+      303,
+      "10000000-0000-0000-0000-000000000303",
+      "[0,0,0,1]",
+      "e".repeat(32),
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_embedding_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_embedding_scope;
+    GRANT SELECT ON agent_accs_profile TO accs_embedding_scope;
+    GRANT INSERT, UPDATE, DELETE ON agent_accs_profile_embedding TO accs_embedding_scope;
+  `);
+  await database.exec("SET ROLE accs_embedding_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      embeddingInsert(
+        202,
+        "10000000-0000-0000-0000-000000000202",
+        "[0,0,1,0]",
+        "e".repeat(32),
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      embeddingInsert(
+        303,
+        "10000000-0000-0000-0000-000000000303",
+        "[0,0,0,1]",
+        "e".repeat(32),
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  const neighborEmbeddingKept = await database.query(`
+    SELECT embedding::text AS embedding, definition_hash
+    FROM agent_accs_profile_embedding
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000202'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborEmbeddingRead = await database.query(`
+    SELECT e.profile_id::text AS profile_id,
+           e.embedding::text AS embedding,
+           e.definition_hash AS embedding_hash,
+           p.definition_hash AS approved_hash
+    FROM agent_accs_profile_embedding AS e
+    JOIN agent_accs_profile AS p
+      ON p.account_id = e.account_id
+     AND p.profile_id = e.profile_id
+     AND p.profile_version = e.profile_version
+    WHERE e.account_id = 202
+    ORDER BY e.embedding <-> '[1,0,0,0]'
+    LIMIT 1
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET account_id = 202
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000001'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile_embedding
+    SET profile_id = '10000000-0000-0000-0000-000000000002',
+        definition_hash = '${"c".repeat(32)}',
+        embedding = '[0.2,0.2,0.2,0.4]'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000001'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_profile_embedding
+     SET definition_hash = '${"b".repeat(32)}'
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000002'`,
+    "DEFINITION HASH REJECTED",
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile_embedding
+    SET embedding = '[0.5,0.5,0,0]'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000002';
+    DELETE FROM agent_accs_profile_embedding
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000002';
+  `);
+  const sessionEmbeddingGone = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_profile_embedding WHERE account_id = 101",
+  );
+  const neighborEmbeddingSurvived = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_profile_embedding WHERE account_id = 202",
+  );
+  await database.exec("TRUNCATE agent_accs_profile_embedding");
+  const embeddingAfterTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_profile_embedding",
+  );
+  assert(
+    neighborEmbeddingBefore.rows[0]?.embedding === "[1,0,0,0]" &&
+      neighborEmbeddingBefore.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborEmbeddingKept.rows[0]?.embedding === "[1,0,0,0]" &&
+      neighborEmbeddingKept.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborEmbeddingRead.rows[0]?.profile_id ===
+        "10000000-0000-0000-0000-000000000202" &&
+      neighborEmbeddingRead.rows[0]?.embedding === "[1,0,0,0]" &&
+      neighborEmbeddingRead.rows[0]?.embedding_hash === "e".repeat(32) &&
+      neighborEmbeddingRead.rows[0]?.approved_hash === "e".repeat(32) &&
+      Number(sessionEmbeddingGone.rows[0]?.n) === 0 &&
+      Number(neighborEmbeddingSurvived.rows[0]?.n) === 1 &&
+      Number(embeddingAfterTruncate.rows[0]?.n) === 0,
+    `cross-tenant embedding write changed the neighbor hit: ${JSON.stringify({
+      before: neighborEmbeddingBefore.rows[0],
+      kept: neighborEmbeddingKept.rows[0],
+      read: neighborEmbeddingRead.rows[0],
+      session: sessionEmbeddingGone.rows[0],
+      survived: neighborEmbeddingSurvived.rows[0],
+      truncated: embeddingAfterTruncate.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;

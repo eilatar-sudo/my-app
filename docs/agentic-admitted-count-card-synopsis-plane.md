@@ -100,7 +100,16 @@ locks the chain, or reads the tip. The check is the session setting.
 It does not read a card or a board. Update, delete, and truncate stay
 `AUDIT CHAIN IMMUTABLE`. A hand-set `accs.auditing` insert for the
 session account still commits when the link is well-formed. The
-neighbor's next append is genesis for that account.
+neighbor's next append is genesis for that account. Reviewed
+2026-11-16 without a version bump. An embedding insert, update, or
+delete whose `account_id` disagrees with `app.account_id` is `TENANT
+SCOPE REJECTED` before the trigger reads the cited profile. On update
+the old account is compared too, so the row cannot move onto the
+session account. The check is the session setting. It does not read a
+card or a board. A neighbor vector, a planted vector, and a missing
+profile return that same error. A same-tenant tag-vector change still
+commits. A delete of the session account's own row still removes the
+hit. Truncate still commits.
 
 ## 1. Why this plane, before how
 
@@ -259,6 +268,10 @@ evidence row. The evidence digest stays editable. The trigger compares
 embedding of that profile stores the same definition hash. A different
 hash is `DEFINITION HASH REJECTED` on insert and on update. The
 comparison reads the profile by primary key. It does not scan a board.
+That read happens only after the row's account matches `app.account_id`.
+A foreign account is `TENANT SCOPE REJECTED` before the profile lookup.
+A same-tenant tag-vector change still commits, and deleting the session
+account's own row still removes the hit.
 A session copies
 the budget at open. Projection consumes
 one budget unit per new card. The ledger is insert-only. A `COMPLETE`
@@ -2174,6 +2187,19 @@ AS $$
 DECLARE
   v_hash TEXT;
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+      RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+     OR (
+       TG_OP = 'UPDATE'
+       AND OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+     ) THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   SELECT definition_hash INTO v_hash
   FROM agent_accs_profile
   WHERE account_id = NEW.account_id
@@ -2187,7 +2213,7 @@ END;
 $$;
 
 CREATE TRIGGER protect_agent_accs_profile_embedding_row
-  BEFORE INSERT OR UPDATE ON agent_accs_profile_embedding
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_profile_embedding
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_profile_embedding();
 ```
 
@@ -2200,7 +2226,16 @@ profile by `(account_id, profile_id, profile_version)` and raise
 primary key. It does not scan a board and it does not count cards.
 A hit therefore returns a profile id with the hash approval already
 accepted. The tag vector can still change. Deleting the row removes
-the hit. It does not store a rejected hash.
+the hit. It does not store a rejected hash. An insert, update, or
+delete whose account disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before that profile read. On update the old account is
+compared too, so the row cannot move onto the session account. The
+check is the session setting. It does not read a card or a board. A
+neighbor vector, a planted vector, and a missing profile return that
+same error. A same-tenant tag-vector change still commits. A delete of
+the session account's own row still removes the hit. Truncate still
+commits. An update that moves the embedding onto another profile of
+the same account still commits when the hash matches that profile.
 
 ## 12. Agent perception
 
@@ -2293,6 +2328,13 @@ neighbor's board query.
   REJECTED`. Update, delete, and truncate stay `AUDIT CHAIN IMMUTABLE`.
   A hand-set `accs.auditing` insert for the session account still
   commits when the link is well-formed.
+  An embedding insert, update, or delete does the same comparison
+  before it reads the cited profile. On update it compares the old
+  account and the new account. A neighbor vector, a planted vector,
+  and a missing profile return `TENANT SCOPE REJECTED`. A same-tenant
+  tag-vector change still commits. A delete of the session account's
+  own row still removes the hit. Truncate still commits. The profile
+  key can still move when the hash matches that profile.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2437,6 +2479,7 @@ digest still matches, including `published_at` and the copied
 | Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Embedding definition hash differs from the cited profile | `DEFINITION HASH REJECTED` |
+| Embedding insert, update, or delete whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 
 A stolen agent prompt cannot widen `app.account_id`. The resolver sets
 that value from the credential. The prompt can still ask for a scan.
@@ -2484,7 +2527,13 @@ trigger checks `accs.auditing`, locks the chain, or reads the tip.
 That comparison does not read a card or a board. A hand-set
 `accs.auditing` insert for the session account still commits when the
 link is well-formed. Update, delete, and truncate stay `AUDIT CHAIN
-IMMUTABLE`. The projected
+IMMUTABLE`. An embedding insert, update, or delete whose old or new
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
+before the trigger reads the cited profile. That comparison does not
+read a card or a board. A same-tenant tag-vector change still commits.
+A delete of the session account's own row still removes the hit.
+Truncate still commits. An update can still move the embedding onto
+another profile of the same account when the hash matches. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2530,6 +2579,12 @@ lookup.
 - An embedding cannot store a definition hash the cited profile does
   not have. A nearest hit still returns that profile id with the
   approved hash.
+- An embedding insert, update, or delete for another account is
+  `TENANT SCOPE REJECTED` before the trigger reads that profile. The
+  neighbor's stored vector stays the one that account wrote. A
+  same-tenant tag-vector change still commits, and a delete of the
+  session account's own row still removes the hit. Truncate still
+  commits.
 - A synopsis row cannot move its account, day, or profile. A
   `published_at` touch that keeps the digest still commits.
 - A synopsis insert or a digest-changing update cannot publish tallies
@@ -2618,7 +2673,14 @@ The neighbor's next append is genesis for that account.
 `admittedCountCardSynopsisAudit` of that first sequence is the
 neighbor's own event. A hand-set `accs.auditing` insert for the
 session account still commits when the link is well-formed. Update,
-delete, and truncate stay `AUDIT CHAIN IMMUTABLE`.
+delete, and truncate stay `AUDIT CHAIN IMMUTABLE`. Reviewed
+2026-11-16: an embedding insert, update, or delete whose account
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger reads the cited profile. The neighbor's own read still returns
+the vector that account stored. A same-tenant tag-vector change still
+commits, and a delete of the session account's own row still removes
+the hit. Truncate still commits. Discovery of the neighbor is that
+profile id with the approved hash.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
