@@ -3282,6 +3282,162 @@ try {
     })}`,
   );
 
+  const evidenceProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_authorization_evidence'
+  `);
+  const evidenceProtectBody = evidenceProtectDef.rows[0]?.def ?? "";
+  const evidenceScopeAt = evidenceProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+  );
+  const evidenceImmutableAt = evidenceProtectBody.indexOf("EVIDENCE IMMUTABLE");
+  const evidenceTrigger = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_authorization_evidence_row'
+      AND NOT tgisinternal
+  `);
+  const evidenceTriggerDef = evidenceTrigger.rows[0]?.def ?? "";
+  assert(
+    evidenceScopeAt !== -1 &&
+      evidenceImmutableAt !== -1 &&
+      evidenceScopeAt < evidenceImmutableAt &&
+      !evidenceProtectBody.includes("FROM agent_accs_") &&
+      evidenceTriggerDef.includes("INSERT"),
+    "evidence trigger must reject a foreign account before the principal check",
+  );
+  const neighborEvidenceBefore = await database.query(`
+    SELECT principal_id, evidence_digest, count(*)::int AS n
+    FROM agent_accs_authorization_evidence
+    WHERE account_id = 202
+    GROUP BY principal_id, evidence_digest
+  `);
+  const evidenceInsert = (account, evidenceId, principal, digest) => `
+    INSERT INTO agent_accs_authorization_evidence (
+      account_id, evidence_id, principal_id, evidence_digest, created_at
+    ) VALUES (
+      ${account}, '${evidenceId}', '${principal}',
+      '${digest}', TIMESTAMPTZ '2026-11-18 00:00:00+00'
+    );
+  `;
+  await expectRejection(
+    evidenceInsert(
+      202,
+      "30000000-0000-0000-0000-000000000218",
+      "principal:planted",
+      "a".repeat(32),
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    evidenceInsert(
+      303,
+      "30000000-0000-0000-0000-000000000303",
+      "principal:missing",
+      "a".repeat(32),
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_evidence_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_evidence_scope;
+    GRANT INSERT ON agent_accs_authorization_evidence TO accs_evidence_scope;
+  `);
+  await database.exec("SET ROLE accs_evidence_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      evidenceInsert(
+        202,
+        "30000000-0000-0000-0000-000000000218",
+        "principal:planted",
+        "a".repeat(32),
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      evidenceInsert(
+        303,
+        "30000000-0000-0000-0000-000000000303",
+        "principal:missing",
+        "a".repeat(32),
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  const sessionEvidenceBefore = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_authorization_evidence WHERE account_id = 101",
+  );
+  await database.exec(
+    evidenceInsert(
+      101,
+      "30000000-0000-0000-0000-000000000118",
+      "principal:operator",
+      "c".repeat(32),
+    ),
+  );
+  await database.exec(`
+    UPDATE agent_accs_authorization_evidence
+    SET evidence_digest = '${"d".repeat(32)}',
+        created_at = TIMESTAMPTZ '2026-11-18 01:00:00+00'
+    WHERE account_id = 101
+      AND evidence_id = '30000000-0000-0000-0000-000000000118'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET principal_id = 'principal:forged'
+     WHERE account_id = 101
+       AND evidence_id = '30000000-0000-0000-0000-000000000118'`,
+    "EVIDENCE IMMUTABLE",
+  );
+  await database.exec(`
+    DELETE FROM agent_accs_authorization_evidence
+    WHERE account_id = 101
+      AND evidence_id = '30000000-0000-0000-0000-000000000118'
+  `);
+  const sessionEvidenceAfter = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_authorization_evidence WHERE account_id = 101",
+  );
+  const neighborEvidenceKept = await database.query(`
+    SELECT principal_id, evidence_digest, count(*)::int AS n
+    FROM agent_accs_authorization_evidence
+    WHERE account_id = 202
+    GROUP BY principal_id, evidence_digest
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborEvidenceRead = await database.query(`
+    SELECT principal_id, evidence_digest
+    FROM agent_accs_authorization_evidence
+    WHERE account_id = 202
+      AND evidence_id = '30000000-0000-0000-0000-000000000202'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  assert(
+    neighborEvidenceBefore.rows.length === 1 &&
+      neighborEvidenceBefore.rows[0]?.principal_id === "principal:operator-202" &&
+      neighborEvidenceBefore.rows[0]?.evidence_digest === "b".repeat(32) &&
+      Number(neighborEvidenceBefore.rows[0]?.n) === 1 &&
+      neighborEvidenceKept.rows.length === 1 &&
+      neighborEvidenceKept.rows[0]?.principal_id === "principal:operator-202" &&
+      neighborEvidenceKept.rows[0]?.evidence_digest === "b".repeat(32) &&
+      Number(neighborEvidenceKept.rows[0]?.n) === 1 &&
+      neighborEvidenceRead.rows[0]?.principal_id === "principal:operator-202" &&
+      neighborEvidenceRead.rows[0]?.evidence_digest === "b".repeat(32) &&
+      Number(sessionEvidenceBefore.rows[0]?.n) ===
+        Number(sessionEvidenceAfter.rows[0]?.n),
+    `cross-tenant evidence insert changed the neighbor principal: ${JSON.stringify({
+      before: neighborEvidenceBefore.rows[0],
+      kept: neighborEvidenceKept.rows[0],
+      read: neighborEvidenceRead.rows[0],
+      sessionBefore: sessionEvidenceBefore.rows[0],
+      sessionAfter: sessionEvidenceAfter.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
