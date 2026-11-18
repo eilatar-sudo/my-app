@@ -109,7 +109,17 @@ session account. The check is the session setting. It does not read a
 card or a board. A neighbor vector, a planted vector, and a missing
 profile return that same error. A same-tenant tag-vector change still
 commits. A delete of the session account's own row still removes the
-hit. Truncate still commits.
+hit. Truncate still commits. Reviewed 2026-11-18 without a version
+bump. An evidence insert whose `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the trigger
+compares `principal_id`. The check is the session setting. It does
+not read a profile, a card, or a board. A planted principal and a
+missing account return that same error. A same-tenant insert still
+commits, including a second row that repeats `principal_id`. A
+same-tenant principal rewrite stays `EVIDENCE IMMUTABLE`. A
+same-tenant digest edit still commits. A delete of the session
+account's own uncited row still removes it. Truncate still raises
+`APPROVED PROFILE IMMUTABLE`.
 
 ## 1. Why this plane, before how
 
@@ -265,6 +275,10 @@ the `principal_id` recorded at insert. Changing that principal is
 different author. A lookup by the original principal still finds that
 evidence row. The evidence digest stays editable. The trigger compares
 `principal_id` on the row. It does not read a card or a board. An
+insert whose `account_id` disagrees with `app.account_id` is `TENANT
+SCOPE REJECTED` before that comparison. The check is the session
+setting. It does not read a profile, a card, or a board. A same-tenant
+insert still commits, and a second row may repeat `principal_id`. An
 embedding of that profile stores the same definition hash. A different
 hash is `DEFINITION HASH REJECTED` on insert and on update. The
 comparison reads the profile by primary key. It does not scan a board.
@@ -1893,6 +1907,10 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'INSERT'
+     AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'UPDATE' AND OLD.principal_id IS DISTINCT FROM NEW.principal_id THEN
     RAISE EXCEPTION 'EVIDENCE IMMUTABLE';
   END IF;
@@ -1901,7 +1919,7 @@ END;
 $$;
 
 CREATE TRIGGER protect_agent_accs_authorization_evidence_row
-  BEFORE UPDATE ON agent_accs_authorization_evidence
+  BEFORE INSERT OR UPDATE ON agent_accs_authorization_evidence
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_authorization_evidence();
 
 CREATE FUNCTION protect_agent_accs_procedure()
@@ -2335,6 +2353,14 @@ neighbor's board query.
   tag-vector change still commits. A delete of the session account's
   own row still removes the hit. Truncate still commits. The profile
   key can still move when the hash matches that profile.
+  An evidence insert does the same comparison before it compares
+  `principal_id`. A planted principal and a missing account return
+  `TENANT SCOPE REJECTED`. A same-tenant insert still commits,
+  including a second row that repeats `principal_id`. A same-tenant
+  principal rewrite stays `EVIDENCE IMMUTABLE`. A same-tenant digest
+  edit still commits. A delete of the session account's own uncited
+  row still removes it. Truncate still raises `APPROVED PROFILE
+  IMMUTABLE`.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2478,6 +2504,7 @@ digest still matches, including `published_at` and the copied
 | Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
+| Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Embedding definition hash differs from the cited profile | `DEFINITION HASH REJECTED` |
 | Embedding insert, update, or delete whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 
@@ -2533,7 +2560,15 @@ before the trigger reads the cited profile. That comparison does not
 read a card or a board. A same-tenant tag-vector change still commits.
 A delete of the session account's own row still removes the hit.
 Truncate still commits. An update can still move the embedding onto
-another profile of the same account when the hash matches. The projected
+another profile of the same account when the hash matches. An evidence
+insert whose `account_id` disagrees with `app.account_id` is `TENANT
+SCOPE REJECTED` before the trigger compares `principal_id`. That
+comparison does not read a profile, a card, or a board. A same-tenant
+insert still commits, including a second row that repeats
+`principal_id`. A same-tenant principal rewrite stays `EVIDENCE
+IMMUTABLE`. A same-tenant digest edit still commits. A delete of the
+session account's own uncited row still removes it. Truncate still
+raises `APPROVED PROFILE IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2576,6 +2611,13 @@ lookup.
   its instruction text does not change a bucket.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
+- An evidence insert for another account is `TENANT SCOPE REJECTED`
+  before the trigger compares `principal_id`. The neighbor's own read
+  still returns the principal that account stored. A same-tenant insert
+  still commits, including a second row that repeats `principal_id`. A
+  same-tenant digest edit still commits, and a delete of the session
+  account's own uncited row still removes it. Truncate still raises
+  `APPROVED PROFILE IMMUTABLE`.
 - An embedding cannot store a definition hash the cited profile does
   not have. A nearest hit still returns that profile id with the
   approved hash.
@@ -2680,7 +2722,14 @@ trigger reads the cited profile. The neighbor's own read still returns
 the vector that account stored. A same-tenant tag-vector change still
 commits, and a delete of the session account's own row still removes
 the hit. Truncate still commits. Discovery of the neighbor is that
-profile id with the approved hash.
+profile id with the approved hash. Reviewed 2026-11-18: an evidence
+insert whose account disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before the trigger compares `principal_id`. The neighbor's
+own read still returns the principal that account stored. A same-tenant
+insert still commits, including a second row that repeats
+`principal_id`. A same-tenant digest edit still commits, and a delete
+of the session account's own uncited row still removes it. Truncate
+still raises `APPROVED PROFILE IMMUTABLE`.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
