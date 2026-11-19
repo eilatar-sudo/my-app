@@ -3291,6 +3291,9 @@ try {
   const evidenceScopeAt = evidenceProtectBody.indexOf(
     "NEW.account_id IS DISTINCT FROM",
   );
+  const evidenceOldScopeAt = evidenceProtectBody.indexOf(
+    "OLD.account_id IS DISTINCT FROM",
+  );
   const evidenceImmutableAt = evidenceProtectBody.indexOf("EVIDENCE IMMUTABLE");
   const evidenceTrigger = await database.query(`
     SELECT pg_get_triggerdef(oid) AS def
@@ -3301,10 +3304,14 @@ try {
   const evidenceTriggerDef = evidenceTrigger.rows[0]?.def ?? "";
   assert(
     evidenceScopeAt !== -1 &&
+      evidenceOldScopeAt !== -1 &&
       evidenceImmutableAt !== -1 &&
       evidenceScopeAt < evidenceImmutableAt &&
+      evidenceOldScopeAt < evidenceImmutableAt &&
       !evidenceProtectBody.includes("FROM agent_accs_") &&
-      evidenceTriggerDef.includes("INSERT"),
+      evidenceTriggerDef.includes("INSERT") &&
+      evidenceTriggerDef.includes("UPDATE") &&
+      !evidenceTriggerDef.includes("DELETE"),
     "evidence trigger must reject a foreign account before the principal check",
   );
   const neighborEvidenceBefore = await database.query(`
@@ -3337,6 +3344,35 @@ try {
       "principal:missing",
       "a".repeat(32),
     ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET evidence_digest = '${"c".repeat(32)}'
+     WHERE account_id = 202
+       AND evidence_id = '30000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET created_at = TIMESTAMPTZ '2026-11-19 00:00:00+00'
+     WHERE account_id = 202
+       AND evidence_id = '30000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET account_id = 101
+     WHERE account_id = 202
+       AND evidence_id = '30000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET principal_id = 'principal:forged',
+         evidence_digest = '${"c".repeat(32)}'
+     WHERE account_id = 202
+       AND evidence_id = '30000000-0000-0000-0000-000000000202'`,
     "TENANT SCOPE REJECTED",
   );
   await database.exec(`
@@ -3393,6 +3429,13 @@ try {
      WHERE account_id = 101
        AND evidence_id = '30000000-0000-0000-0000-000000000118'`,
     "EVIDENCE IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_authorization_evidence
+     SET account_id = 202
+     WHERE account_id = 101
+       AND evidence_id = '30000000-0000-0000-0000-000000000118'`,
+    "TENANT SCOPE REJECTED",
   );
   await database.exec(`
     DELETE FROM agent_accs_authorization_evidence
