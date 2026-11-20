@@ -3481,6 +3481,141 @@ try {
     })}`,
   );
 
+  const procedureProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_procedure'
+  `);
+  const procedureProtectBody = procedureProtectDef.rows[0]?.def ?? "";
+  const procedureScopeAt = procedureProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+  );
+  const procedureImmutableAt = procedureProtectBody.indexOf(
+    "PROCEDURE IMMUTABLE",
+  );
+  const procedureTrigger = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_procedure_row'
+      AND NOT tgisinternal
+  `);
+  const procedureTriggerDef = procedureTrigger.rows[0]?.def ?? "";
+  assert(
+    procedureScopeAt !== -1 &&
+      procedureImmutableAt !== -1 &&
+      procedureScopeAt < procedureImmutableAt &&
+      !procedureProtectBody.includes("FROM agent_accs_") &&
+      procedureTriggerDef.includes("INSERT") &&
+      procedureTriggerDef.includes("UPDATE") &&
+      procedureTriggerDef.includes("DELETE"),
+    "procedure trigger must reject a foreign account before the immutability check",
+  );
+  const neighborProcedureBefore = await database.query(`
+    SELECT procedure_version, instruction_text, engine_executes_instruction
+    FROM agent_accs_procedure
+    WHERE account_id = 202
+    ORDER BY procedure_version
+  `);
+  const procedureInsert = (account, version, text, digest) => `
+    INSERT INTO agent_accs_procedure (
+      account_id, procedure_ref, procedure_version, instruction_text,
+      instruction_digest, engine_executes_instruction, created_at
+    ) VALUES (
+      ${account}, 'procedure:fold-admitted-count-card-day', ${version},
+      '${text}', '${digest}', FALSE,
+      TIMESTAMPTZ '2026-11-20 00:00:00+00'
+    );
+  `;
+  await expectRejection(
+    procedureInsert(202, 9, "planted instruction", "a".repeat(32)),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    procedureInsert(303, 9, "missing instruction", "a".repeat(32)),
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_procedure_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_procedure_scope;
+    GRANT INSERT ON agent_accs_procedure TO accs_procedure_scope;
+  `);
+  await database.exec("SET ROLE accs_procedure_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      procedureInsert(202, 9, "planted instruction", "a".repeat(32)),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      procedureInsert(303, 9, "missing instruction", "a".repeat(32)),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(
+    procedureInsert(101, 9, "session instruction", "f".repeat(32)),
+  );
+  await database.exec(`
+    UPDATE agent_accs_procedure
+    SET instruction_text = 'session instruction edited',
+        instruction_digest = '${"e".repeat(32)}'
+    WHERE account_id = 101 AND procedure_version = 9
+  `);
+  await expectRejection(
+    `DELETE FROM agent_accs_procedure
+     WHERE account_id = 101 AND procedure_version = 9`,
+    "PROCEDURE IMMUTABLE",
+  );
+  const sessionProcedure = await database.query(`
+    SELECT procedure_version, instruction_text, instruction_digest,
+           engine_executes_instruction
+    FROM agent_accs_procedure
+    WHERE account_id = 101 AND procedure_version = 9
+  `);
+  const neighborProcedureKept = await database.query(`
+    SELECT procedure_version, instruction_text, engine_executes_instruction
+    FROM agent_accs_procedure
+    WHERE account_id = 202
+    ORDER BY procedure_version
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborProcedureRead = await database.query(`
+    SELECT procedure_version, instruction_text, engine_executes_instruction
+    FROM agent_accs_procedure
+    WHERE account_id = 202
+    ORDER BY procedure_version
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  assert(
+    neighborProcedureBefore.rows.length === 1 &&
+      Number(neighborProcedureBefore.rows[0]?.procedure_version) === 1 &&
+      neighborProcedureBefore.rows[0]?.instruction_text.startsWith(
+        "Point-look up",
+      ) &&
+      neighborProcedureBefore.rows[0]?.engine_executes_instruction === false &&
+      neighborProcedureKept.rows.length === 1 &&
+      Number(neighborProcedureKept.rows[0]?.procedure_version) === 1 &&
+      neighborProcedureKept.rows[0]?.instruction_text ===
+        neighborProcedureBefore.rows[0]?.instruction_text &&
+      neighborProcedureRead.rows.length === 1 &&
+      neighborProcedureRead.rows[0]?.instruction_text ===
+        neighborProcedureBefore.rows[0]?.instruction_text &&
+      neighborProcedureRead.rows[0]?.engine_executes_instruction === false &&
+      Number(sessionProcedure.rows[0]?.procedure_version) === 9 &&
+      sessionProcedure.rows[0]?.instruction_text ===
+        "session instruction edited" &&
+      sessionProcedure.rows[0]?.instruction_digest === "e".repeat(32) &&
+      sessionProcedure.rows[0]?.engine_executes_instruction === false,
+    `cross-tenant procedure insert changed the neighbor instruction: ${JSON.stringify({
+      before: neighborProcedureBefore.rows[0],
+      kept: neighborProcedureKept.rows[0],
+      read: neighborProcedureRead.rows[0],
+      session: sessionProcedure.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
