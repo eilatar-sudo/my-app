@@ -139,7 +139,20 @@ same-tenant insert still commits, including a later
 `procedure_version`. Editing the instruction text or its digest still
 commits. Delete, truncate, and a change of `account_id`,
 `procedure_ref`, or `procedure_version` stay `PROCEDURE IMMUTABLE`.
-The engine does not eval the instruction text.
+The engine does not eval the instruction text. Reviewed
+2026-11-24 without a version bump. A procedure update whose old or
+new `account_id` disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before the trigger checks delete, truncate, or a key
+change. The check is the session setting. It does not read a profile,
+a card, or a board. A rewritten instruction, a digest change, a
+`created_at` touch, and a move onto the session account return that
+same error. A key change on that foreign row returns `TENANT SCOPE
+REJECTED`, not `PROCEDURE IMMUTABLE`. A same-tenant insert still
+commits, including a later `procedure_version`. Editing the
+instruction text or its digest still commits. A same-tenant
+`created_at` touch still commits. Delete, truncate, and a same-tenant
+change of `procedure_ref` or `procedure_version` stay `PROCEDURE
+IMMUTABLE`. The engine does not eval the instruction text.
 
 ## 1. Why this plane, before how
 
@@ -1961,6 +1974,13 @@ BEGIN
      AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
     RAISE EXCEPTION 'TENANT SCOPE REJECTED';
   END IF;
+  IF TG_OP = 'UPDATE'
+     AND (
+       OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+       OR NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+     ) THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'TRUNCATE' OR TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'PROCEDURE IMMUTABLE';
   END IF;
@@ -2189,15 +2209,21 @@ profile version that stays `DRAFT` until the definition hash is
 approved.
 
 The row approval stored stays on that key. Delete, truncate, and a
-change of `account_id`, `procedure_ref`, or `procedure_version` are
-`PROCEDURE IMMUTABLE`. Editing the instruction text or its digest does
+change of `procedure_ref` or `procedure_version` are `PROCEDURE
+IMMUTABLE`. A change of `account_id` is `TENANT SCOPE REJECTED`
+before that check. Editing the instruction text or its digest does
 not change a bucket. The engine still does not eval the sentence. An
 insert whose `account_id` disagrees with `app.account_id` is `TENANT
-SCOPE REJECTED` before that immutability check. The check is the
-session setting. It does not read a profile, a card, or a board. A
+SCOPE REJECTED` before that immutability check. An update whose old
+or new `account_id` disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before that same check. The check is the session setting.
+It does not read a profile, a card, or a board. A rewritten
+instruction, a digest change, a `created_at` touch, and a move onto
+the session account return that error. A key change on that foreign
+row returns `TENANT SCOPE REJECTED`, not `PROCEDURE IMMUTABLE`. A
 same-tenant insert still commits, including a later
 `procedure_version`. Editing the instruction text or its digest still
-commits.
+commits. A same-tenant `created_at` touch still commits.
 
 The upstream hold next action `HOLD_ACKNOWLEDGED_RECEIPT` is not
 stored as an instruction here. This plane does not replay it.
@@ -2405,12 +2431,18 @@ neighbor's board query.
   session account's own uncited row still removes it. Truncate still
   raises `APPROVED PROFILE IMMUTABLE`.
   A procedure insert does the same comparison before it checks delete,
-  truncate, or a key change. A planted instruction and a missing
-  account return `TENANT SCOPE REJECTED`. A same-tenant insert still
-  commits, including a later `procedure_version`. Editing the
-  instruction text or its digest still commits. Delete, truncate, and
-  a re-key stay `PROCEDURE IMMUTABLE`. The engine does not eval the
-  instruction text.
+  truncate, or a key change. A procedure update compares the old
+  account and the new account before that same check. A planted
+  instruction, a rewritten instruction, a digest change, a
+  `created_at` touch, a move onto the session account, and a missing
+  account return `TENANT SCOPE REJECTED`. A key change on that foreign
+  row returns `TENANT SCOPE REJECTED`, not `PROCEDURE IMMUTABLE`. A
+  same-tenant insert still commits, including a later
+  `procedure_version`. Editing the instruction text or its digest
+  still commits. A same-tenant `created_at` touch still commits.
+  Delete, truncate, and a same-tenant change of `procedure_ref` or
+  `procedure_version` stay `PROCEDURE IMMUTABLE`. The engine does not
+  eval the instruction text.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2552,8 +2584,9 @@ digest still matches, including `published_at` and the copied
 | Direct rejection update, delete, or truncate | `REJECTION IMMUTABLE` |
 | Direct rejection insert, or one after the reject function returns | `REJECTION REJECTED` |
 | Rejection insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
-| Procedure row deleted, truncated, or re-keyed | `PROCEDURE IMMUTABLE` |
+| Procedure row deleted, truncated, or re-keyed on the session account | `PROCEDURE IMMUTABLE` |
 | Procedure insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Procedure update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
@@ -2622,12 +2655,14 @@ rewrite stays `EVIDENCE IMMUTABLE`. A same-tenant digest edit still
 commits. A same-tenant `created_at` touch still commits. A delete of
 the session account's own uncited row still removes it. Truncate still
 raises `APPROVED PROFILE IMMUTABLE`. A procedure
-insert whose `account_id` disagrees with `app.account_id` is `TENANT
-SCOPE REJECTED` before the trigger checks delete, truncate, or a key
-change. That comparison does not read a profile, a card, or a board.
-A same-tenant insert still commits, including a later
-`procedure_version`. Editing the instruction text or its digest still
-commits. Delete, truncate, and a re-key stay `PROCEDURE IMMUTABLE`.
+insert or update whose old or new `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the trigger checks
+delete, truncate, or a key change. That comparison does not read a
+profile, a card, or a board. A same-tenant insert still commits,
+including a later `procedure_version`. Editing the instruction text
+or its digest still commits. A same-tenant `created_at` touch still
+commits. Delete, truncate, and a same-tenant change of
+`procedure_ref` or `procedure_version` stay `PROCEDURE IMMUTABLE`.
 The engine does not eval the instruction text. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
@@ -2667,8 +2702,10 @@ lookup.
 - A null or negative board estimate is rejected.
 - A direct rejection insert, update, delete, or truncate is rejected,
   and a later insert in the same transaction does not add a row.
-- A procedure row cannot be deleted, truncated, or re-keyed. Editing
-  its instruction text does not change a bucket.
+- A procedure row cannot be deleted or truncated. A same-tenant
+  change of `procedure_version` stays `PROCEDURE IMMUTABLE`. Moving
+  `account_id` is `TENANT SCOPE REJECTED`. Editing its instruction
+  text does not change a bucket.
 - A procedure insert for another account is `TENANT SCOPE REJECTED`
   before the trigger checks delete, truncate, or a key change. The
   neighbor's own read still returns the instruction that account
@@ -2676,6 +2713,13 @@ lookup.
   `procedure_version`. Editing the instruction text or its digest
   still commits. Delete, truncate, and a re-key stay `PROCEDURE
   IMMUTABLE`. The engine does not eval the instruction text.
+- A procedure update for another account is `TENANT SCOPE REJECTED`
+  before the trigger checks delete, truncate, or a key change. The
+  neighbor's stored instruction and digest stay the ones that account
+  wrote. A same-tenant text or digest edit still commits, and a
+  same-tenant `created_at` touch still commits. A same-tenant change
+  of `procedure_version` stays `PROCEDURE IMMUTABLE`. A delete of
+  that neighbor row stays `PROCEDURE IMMUTABLE`.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
 - An evidence insert for another account is `TENANT SCOPE REJECTED`
@@ -2815,6 +2859,14 @@ returns the instruction that account stored. A same-tenant insert
 still commits, including a later `procedure_version`. Editing the
 instruction text or its digest still commits. Delete, truncate, and a
 re-key stay `PROCEDURE IMMUTABLE`. The engine does not eval that text.
+Reviewed 2026-11-24: a procedure update whose old or new account
+disagrees with `app.account_id` is `TENANT SCOPE REJECTED` before the
+trigger checks delete, truncate, or a key change. The neighbor's own
+read still returns the instruction and digest that account stored. A
+same-tenant text or digest edit still commits, and a same-tenant
+`created_at` touch still commits. A same-tenant change of
+`procedure_version` stays `PROCEDURE IMMUTABLE`. The engine does not
+eval that text.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row

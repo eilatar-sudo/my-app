@@ -773,7 +773,7 @@ try {
     `UPDATE agent_accs_procedure
      SET account_id = 202
      WHERE account_id = 101`,
-    "PROCEDURE IMMUTABLE",
+    "TENANT SCOPE REJECTED",
   );
   await database.exec(`
     UPDATE agent_accs_procedure
@@ -3490,6 +3490,9 @@ try {
   const procedureScopeAt = procedureProtectBody.indexOf(
     "NEW.account_id IS DISTINCT FROM",
   );
+  const procedureOldScopeAt = procedureProtectBody.indexOf(
+    "OLD.account_id IS DISTINCT FROM",
+  );
   const procedureImmutableAt = procedureProtectBody.indexOf(
     "PROCEDURE IMMUTABLE",
   );
@@ -3502,8 +3505,10 @@ try {
   const procedureTriggerDef = procedureTrigger.rows[0]?.def ?? "";
   assert(
     procedureScopeAt !== -1 &&
+      procedureOldScopeAt !== -1 &&
       procedureImmutableAt !== -1 &&
       procedureScopeAt < procedureImmutableAt &&
+      procedureOldScopeAt < procedureImmutableAt &&
       !procedureProtectBody.includes("FROM agent_accs_") &&
       procedureTriggerDef.includes("INSERT") &&
       procedureTriggerDef.includes("UPDATE") &&
@@ -3511,7 +3516,8 @@ try {
     "procedure trigger must reject a foreign account before the immutability check",
   );
   const neighborProcedureBefore = await database.query(`
-    SELECT procedure_version, instruction_text, engine_executes_instruction
+    SELECT procedure_version, instruction_text, instruction_digest,
+           created_at, engine_executes_instruction
     FROM agent_accs_procedure
     WHERE account_id = 202
     ORDER BY procedure_version
@@ -3533,6 +3539,38 @@ try {
   await expectRejection(
     procedureInsert(303, 9, "missing instruction", "a".repeat(32)),
     "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET instruction_text = 'rewritten instruction',
+         instruction_digest = '${"c".repeat(32)}'
+     WHERE account_id = 202 AND procedure_version = 1`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET created_at = TIMESTAMPTZ '2026-11-24 00:00:00+00'
+     WHERE account_id = 202 AND procedure_version = 1`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET account_id = 101
+     WHERE account_id = 202 AND procedure_version = 1`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET procedure_version = 9,
+         instruction_text = 'rewritten instruction',
+         instruction_digest = '${"c".repeat(32)}'
+     WHERE account_id = 202 AND procedure_version = 1`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_procedure
+     WHERE account_id = 202 AND procedure_version = 1`,
+    "PROCEDURE IMMUTABLE",
   );
   await database.exec(`
     CREATE ROLE accs_procedure_scope NOLOGIN;
@@ -3560,9 +3598,22 @@ try {
   await database.exec(`
     UPDATE agent_accs_procedure
     SET instruction_text = 'session instruction edited',
-        instruction_digest = '${"e".repeat(32)}'
+        instruction_digest = '${"e".repeat(32)}',
+        created_at = TIMESTAMPTZ '2026-11-24 01:00:00+00'
     WHERE account_id = 101 AND procedure_version = 9
   `);
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET procedure_version = 10
+     WHERE account_id = 101 AND procedure_version = 9`,
+    "PROCEDURE IMMUTABLE",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_procedure
+     SET account_id = 202
+     WHERE account_id = 101 AND procedure_version = 9`,
+    "TENANT SCOPE REJECTED",
+  );
   await expectRejection(
     `DELETE FROM agent_accs_procedure
      WHERE account_id = 101 AND procedure_version = 9`,
@@ -3570,19 +3621,21 @@ try {
   );
   const sessionProcedure = await database.query(`
     SELECT procedure_version, instruction_text, instruction_digest,
-           engine_executes_instruction
+           created_at, engine_executes_instruction
     FROM agent_accs_procedure
     WHERE account_id = 101 AND procedure_version = 9
   `);
   const neighborProcedureKept = await database.query(`
-    SELECT procedure_version, instruction_text, engine_executes_instruction
+    SELECT procedure_version, instruction_text, instruction_digest,
+           created_at, engine_executes_instruction
     FROM agent_accs_procedure
     WHERE account_id = 202
     ORDER BY procedure_version
   `);
   await database.exec("SELECT set_config('app.account_id', '202', false);");
   const neighborProcedureRead = await database.query(`
-    SELECT procedure_version, instruction_text, engine_executes_instruction
+    SELECT procedure_version, instruction_text, instruction_digest,
+           created_at, engine_executes_instruction
     FROM agent_accs_procedure
     WHERE account_id = 202
     ORDER BY procedure_version
@@ -3599,14 +3652,22 @@ try {
       Number(neighborProcedureKept.rows[0]?.procedure_version) === 1 &&
       neighborProcedureKept.rows[0]?.instruction_text ===
         neighborProcedureBefore.rows[0]?.instruction_text &&
+      neighborProcedureKept.rows[0]?.instruction_digest ===
+        neighborProcedureBefore.rows[0]?.instruction_digest &&
+      neighborProcedureKept.rows[0]?.created_at?.toISOString() ===
+        neighborProcedureBefore.rows[0]?.created_at?.toISOString() &&
       neighborProcedureRead.rows.length === 1 &&
       neighborProcedureRead.rows[0]?.instruction_text ===
         neighborProcedureBefore.rows[0]?.instruction_text &&
+      neighborProcedureRead.rows[0]?.instruction_digest ===
+        neighborProcedureBefore.rows[0]?.instruction_digest &&
       neighborProcedureRead.rows[0]?.engine_executes_instruction === false &&
       Number(sessionProcedure.rows[0]?.procedure_version) === 9 &&
       sessionProcedure.rows[0]?.instruction_text ===
         "session instruction edited" &&
       sessionProcedure.rows[0]?.instruction_digest === "e".repeat(32) &&
+      sessionProcedure.rows[0]?.created_at?.toISOString() ===
+        "2026-11-24T01:00:00.000Z" &&
       sessionProcedure.rows[0]?.engine_executes_instruction === false,
     `cross-tenant procedure insert changed the neighbor instruction: ${JSON.stringify({
       before: neighborProcedureBefore.rows[0],
