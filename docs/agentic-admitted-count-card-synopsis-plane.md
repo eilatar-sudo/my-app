@@ -152,7 +152,19 @@ commits, including a later `procedure_version`. Editing the
 instruction text or its digest still commits. A same-tenant
 `created_at` touch still commits. Delete, truncate, and a same-tenant
 change of `procedure_ref` or `procedure_version` stay `PROCEDURE
-IMMUTABLE`. The engine does not eval the instruction text.
+IMMUTABLE`. The engine does not eval the instruction text. Reviewed
+2026-11-25 without a version bump. A profile insert whose
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before the trigger checks that the row starts `DRAFT`. The
+check is the session setting. It does not read a profile, a card, or
+a board. A planted draft and a missing account return that same
+error. A non-`DRAFT` insert for another account returns `TENANT SCOPE
+REJECTED`, not `PROFILE MUST START DRAFT`. A same-tenant insert still
+commits when the row starts `DRAFT`. A same-tenant insert that is
+already `APPROVED` stays `PROFILE MUST START DRAFT`. A same-tenant
+direct `DRAFT` to `APPROVED` update still commits. Delete of a draft
+on the session account still removes it. Truncate stays `APPROVED
+PROFILE IMMUTABLE`.
 
 ## 1. Why this plane, before how
 
@@ -302,7 +314,19 @@ hash matches. Approved budgets, stewards, and the procedure ref are
 immutable, including on the transition to `REVOKED`. The approved row's
 `account_id`, `profile_id`, and `profile_version` stay with that budget.
 Delete and truncate of an approved or revoked profile are rejected.
-A draft can still be deleted. The evidence row a profile cites keeps
+A draft can still be deleted. Reviewed 2026-11-25 without a version
+bump. A profile insert whose `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the trigger checks
+that the row starts `DRAFT`. The check is the session setting. It
+does not read a profile, a card, or a board. A planted draft and a
+missing account return that same error. A non-`DRAFT` insert for
+another account returns `TENANT SCOPE REJECTED`, not `PROFILE MUST
+START DRAFT`. A same-tenant insert still commits when the row starts
+`DRAFT`. A same-tenant insert that is already `APPROVED` stays
+`PROFILE MUST START DRAFT`. A same-tenant direct `DRAFT` to
+`APPROVED` update still commits. Delete of a draft on the session
+account still removes it. Truncate stays `APPROVED PROFILE
+IMMUTABLE`. The evidence row a profile cites keeps
 the `principal_id` recorded at insert. Changing that principal is
 `EVIDENCE IMMUTABLE`, so an approved profile cannot be left citing a
 different author. A lookup by the original principal still finds that
@@ -1047,6 +1071,10 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'INSERT'
+     AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'TRUNCATE' THEN
     RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
   END IF;
@@ -2341,7 +2369,10 @@ The card does not include a consumer list, a reader principal, a fact
 body, the upstream observation triple, or the unprojected card count.
 A tag is not an authorization decision. Operators may read that gap
 from `agent_accs_day_counter` by primary key. The perception card
-must not copy it into a tally.
+must not copy it into a tally. The profile id behind that card is the
+approved row that account stored. A draft another account tried to
+plant is not a profile id the agent can read. The insert check is the
+session setting. It does not read a card or a board.
 
 ## 13. ACID and consistency
 
@@ -2443,6 +2474,17 @@ neighbor's board query.
   Delete, truncate, and a same-tenant change of `procedure_ref` or
   `procedure_version` stay `PROCEDURE IMMUTABLE`. The engine does not
   eval the instruction text.
+  A profile insert does the same comparison before it checks that the
+  row starts `DRAFT`. A planted draft and a missing account return
+  `TENANT SCOPE REJECTED`. A non-`DRAFT` insert for another account
+  returns `TENANT SCOPE REJECTED`, not `PROFILE MUST START DRAFT`. A
+  same-tenant insert still commits when the row starts `DRAFT`. A
+  same-tenant insert that is already `APPROVED` stays `PROFILE MUST
+  START DRAFT`. A same-tenant direct `DRAFT` to `APPROVED` update
+  still commits. Delete of a draft on the session account still
+  removes it. Truncate stays `APPROVED PROFILE IMMUTABLE`. The check
+  is the session setting. It does not read a profile, a card, or a
+  board.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2587,6 +2629,7 @@ digest still matches, including `published_at` and the copied
 | Procedure row deleted, truncated, or re-keyed on the session account | `PROCEDURE IMMUTABLE` |
 | Procedure insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Procedure update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Profile insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
@@ -2663,7 +2706,18 @@ including a later `procedure_version`. Editing the instruction text
 or its digest still commits. A same-tenant `created_at` touch still
 commits. Delete, truncate, and a same-tenant change of
 `procedure_ref` or `procedure_version` stay `PROCEDURE IMMUTABLE`.
-The engine does not eval the instruction text. The projected
+The engine does not eval the instruction text. A profile insert whose
+`account_id` disagrees with `app.account_id` is `TENANT SCOPE
+REJECTED` before the trigger checks that the row starts `DRAFT`. That
+comparison does not read a profile, a card, or a board. A planted
+draft and a missing account return that same error. A non-`DRAFT`
+insert for another account returns `TENANT SCOPE REJECTED`, not
+`PROFILE MUST START DRAFT`. A same-tenant insert still commits when
+the row starts `DRAFT`. A same-tenant insert that is already
+`APPROVED` stays `PROFILE MUST START DRAFT`. A same-tenant direct
+`DRAFT` to `APPROVED` update still commits. Delete of a draft on the
+session account still removes it. Truncate stays `APPROVED PROFILE
+IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2720,6 +2774,15 @@ lookup.
   same-tenant `created_at` touch still commits. A same-tenant change
   of `procedure_version` stays `PROCEDURE IMMUTABLE`. A delete of
   that neighbor row stays `PROCEDURE IMMUTABLE`.
+- A profile insert for another account is `TENANT SCOPE REJECTED`
+  before the trigger checks that the row starts `DRAFT`. The
+  neighbor's own read still returns the approved profile that account
+  stored. A planted draft is not a profile id on that account. A
+  same-tenant insert still commits when the row starts `DRAFT`. A
+  same-tenant insert that is already `APPROVED` stays `PROFILE MUST
+  START DRAFT`. A same-tenant direct `DRAFT` to `APPROVED` update
+  still commits. Delete of a draft on the session account still
+  removes it. Truncate stays `APPROVED PROFILE IMMUTABLE`.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
 - An evidence insert for another account is `TENANT SCOPE REJECTED`
@@ -2867,6 +2930,17 @@ same-tenant text or digest edit still commits, and a same-tenant
 `created_at` touch still commits. A same-tenant change of
 `procedure_version` stays `PROCEDURE IMMUTABLE`. The engine does not
 eval that text.
+Reviewed 2026-11-25: a profile insert whose account disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the trigger checks
+that the row starts `DRAFT`. The neighbor's own read still returns
+the approved profile and definition hash that account stored. A
+planted draft is not a profile id an agent can perceive for that
+account. A same-tenant insert still commits when the row starts
+`DRAFT`. A same-tenant insert that is already `APPROVED` stays
+`PROFILE MUST START DRAFT`. A same-tenant direct `DRAFT` to
+`APPROVED` update still commits. Delete of a draft on the session
+account still removes it. Truncate stays `APPROVED PROFILE
+IMMUTABLE`.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row

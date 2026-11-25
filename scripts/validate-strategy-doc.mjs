@@ -3677,6 +3677,229 @@ try {
     })}`,
   );
 
+  const profileProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_profile'
+  `);
+  const profileProtectBody = profileProtectDef.rows[0]?.def ?? "";
+  const profileScopeAt = profileProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+  );
+  const profileDraftAt = profileProtectBody.indexOf("PROFILE MUST START DRAFT");
+  const profileTrigger = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_profile_row'
+      AND NOT tgisinternal
+  `);
+  const profileTriggerDef = profileTrigger.rows[0]?.def ?? "";
+  assert(
+    profileScopeAt !== -1 &&
+      profileDraftAt !== -1 &&
+      profileScopeAt < profileDraftAt &&
+      !profileProtectBody.includes("FROM agent_accs_") &&
+      profileTriggerDef.includes("INSERT") &&
+      profileTriggerDef.includes("UPDATE") &&
+      profileTriggerDef.includes("DELETE"),
+    "profile trigger must reject a foreign account before the draft check",
+  );
+  const neighborProfileBefore = await database.query(`
+    SELECT profile_id::text AS profile_id, profile_version, status::text AS status,
+           definition_hash
+    FROM agent_accs_profile
+    WHERE account_id = 202
+    ORDER BY profile_id
+  `);
+  const profileInsert = (account, id, status, hash, evidence, approvedAt) => `
+    INSERT INTO agent_accs_profile (
+      account_id, profile_id, profile_version, status, definition_hash,
+      max_cards_per_day, budget_project_units, synopsis_steward_a,
+      synopsis_steward_b, procedure_ref, evidence_id, created_at, approved_at
+    ) VALUES (
+      ${account}, '${id}', 1, '${status}', '${hash}',
+      100, 10, 'principal:accs-a', 'principal:accs-b',
+      'procedure:fold-admitted-count-card-day',
+      '${evidence}',
+      TIMESTAMPTZ '2026-11-25 00:00:00+00', ${approvedAt}
+    );
+  `;
+  await expectRejection(
+    profileInsert(
+      202,
+      "10000000-0000-0000-0000-000000000125",
+      "DRAFT",
+      "a".repeat(32),
+      "30000000-0000-0000-0000-000000000202",
+      "NULL",
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    profileInsert(
+      202,
+      "10000000-0000-0000-0000-000000000125",
+      "APPROVED",
+      "a".repeat(32),
+      "30000000-0000-0000-0000-000000000202",
+      "TIMESTAMPTZ '2026-11-25 00:00:00+00'",
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    profileInsert(
+      303,
+      "10000000-0000-0000-0000-000000000303",
+      "DRAFT",
+      "a".repeat(32),
+      "30000000-0000-0000-0000-000000000303",
+      "NULL",
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_profile_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_profile_scope;
+    GRANT INSERT ON agent_accs_profile TO accs_profile_scope;
+  `);
+  await database.exec("SET ROLE accs_profile_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      profileInsert(
+        202,
+        "10000000-0000-0000-0000-000000000125",
+        "DRAFT",
+        "a".repeat(32),
+        "30000000-0000-0000-0000-000000000202",
+        "NULL",
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      profileInsert(
+        303,
+        "10000000-0000-0000-0000-000000000303",
+        "DRAFT",
+        "a".repeat(32),
+        "30000000-0000-0000-0000-000000000303",
+        "NULL",
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(
+    profileInsert(
+      101,
+      "10000000-0000-0000-0000-000000000126",
+      "DRAFT",
+      "d".repeat(32),
+      "30000000-0000-0000-0000-000000000001",
+      "NULL",
+    ),
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile
+    SET status = 'APPROVED',
+        approved_at = TIMESTAMPTZ '2026-11-25 01:00:00+00',
+        definition_hash = '${"f".repeat(32)}'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000126'
+  `);
+  await expectRejection(
+    profileInsert(
+      101,
+      "10000000-0000-0000-0000-000000000128",
+      "APPROVED",
+      "a".repeat(32),
+      "30000000-0000-0000-0000-000000000001",
+      "TIMESTAMPTZ '2026-11-25 00:00:00+00'",
+    ),
+    "PROFILE MUST START DRAFT",
+  );
+  await database.exec(
+    profileInsert(
+      101,
+      "10000000-0000-0000-0000-000000000127",
+      "DRAFT",
+      "c".repeat(32),
+      "30000000-0000-0000-0000-000000000001",
+      "NULL",
+    ),
+  );
+  await database.exec(`
+    DELETE FROM agent_accs_profile
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000127'
+  `);
+  const sessionProfile = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at
+    FROM agent_accs_profile
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000126'
+  `);
+  const plantedProfile = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000125'
+  `);
+  const deletedDraft = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000127'
+  `);
+  const neighborProfileKept = await database.query(`
+    SELECT profile_id::text AS profile_id, profile_version, status::text AS status,
+           definition_hash
+    FROM agent_accs_profile
+    WHERE account_id = 202
+    ORDER BY profile_id
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborProfileRead = await database.query(`
+    SELECT profile_id::text AS profile_id, profile_version, status::text AS status,
+           definition_hash
+    FROM agent_accs_profile
+    WHERE account_id = 202
+    ORDER BY profile_id
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  assert(
+    neighborProfileBefore.rows.length === 1 &&
+      neighborProfileBefore.rows[0]?.profile_id ===
+        "10000000-0000-0000-0000-000000000202" &&
+      Number(neighborProfileBefore.rows[0]?.profile_version) === 1 &&
+      neighborProfileBefore.rows[0]?.status === "APPROVED" &&
+      neighborProfileBefore.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborProfileKept.rows.length === 1 &&
+      neighborProfileKept.rows[0]?.profile_id ===
+        neighborProfileBefore.rows[0]?.profile_id &&
+      neighborProfileKept.rows[0]?.status === "APPROVED" &&
+      neighborProfileKept.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborProfileRead.rows.length === 1 &&
+      neighborProfileRead.rows[0]?.profile_id ===
+        neighborProfileBefore.rows[0]?.profile_id &&
+      neighborProfileRead.rows[0]?.status === "APPROVED" &&
+      neighborProfileRead.rows[0]?.definition_hash === "e".repeat(32) &&
+      Number(plantedProfile.rows[0]?.n) === 0 &&
+      Number(deletedDraft.rows[0]?.n) === 0 &&
+      sessionProfile.rows[0]?.status === "APPROVED" &&
+      sessionProfile.rows[0]?.definition_hash === "f".repeat(32) &&
+      sessionProfile.rows[0]?.approved_at?.toISOString() ===
+        "2026-11-25T01:00:00.000Z",
+    `cross-tenant profile insert changed the neighbor profile: ${JSON.stringify({
+      before: neighborProfileBefore.rows[0],
+      kept: neighborProfileKept.rows[0],
+      read: neighborProfileRead.rows[0],
+      planted: plantedProfile.rows[0],
+      deleted: deletedDraft.rows[0],
+      session: sessionProfile.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
