@@ -164,7 +164,24 @@ commits when the row starts `DRAFT`. A same-tenant insert that is
 already `APPROVED` stays `PROFILE MUST START DRAFT`. A same-tenant
 direct `DRAFT` to `APPROVED` update still commits. Delete of a draft
 on the session account still removes it. Truncate stays `APPROVED
-PROFILE IMMUTABLE`.
+PROFILE IMMUTABLE`. Reviewed 2026-11-26 without a version bump. A
+profile update whose old `account_id` disagrees with `app.account_id`
+is `TENANT SCOPE REJECTED` before the trigger checks the status
+transition. A `DRAFT` to `APPROVED` update whose new `account_id`
+disagrees with `app.account_id` is that same error, and that
+comparison runs only on that transition. An account move of the
+session account's approved profile stays `APPROVED PROFILE
+IMMUTABLE`. The check is the session setting. It does not read a
+profile, a card, or a board. A neighbor-authored draft approval, an
+`approved_at` touch, a `created_at` touch, and a revoke return that
+error. A key change on that foreign row returns `TENANT SCOPE
+REJECTED`, not `APPROVED PROFILE IMMUTABLE`. A same-tenant direct
+`DRAFT` to `APPROVED` update still commits, including a definition
+hash rewrite. A same-tenant `approved_at` touch still commits. A
+same-tenant `created_at` touch still commits. A same-tenant revoke
+still commits. Delete of a draft on the session account still removes
+it. Delete of another account's approved profile stays `APPROVED
+PROFILE IMMUTABLE`. Truncate stays `APPROVED PROFILE IMMUTABLE`.
 
 ## 1. Why this plane, before how
 
@@ -326,7 +343,25 @@ START DRAFT`. A same-tenant insert still commits when the row starts
 `PROFILE MUST START DRAFT`. A same-tenant direct `DRAFT` to
 `APPROVED` update still commits. Delete of a draft on the session
 account still removes it. Truncate stays `APPROVED PROFILE
-IMMUTABLE`. The evidence row a profile cites keeps
+IMMUTABLE`. Reviewed 2026-11-26 without a version bump. A profile
+update whose old `account_id` disagrees with `app.account_id` is
+`TENANT SCOPE REJECTED` before the trigger checks the status
+transition. A `DRAFT` to `APPROVED` update whose new `account_id`
+disagrees with `app.account_id` is that same error, and that
+comparison runs only on that transition. An account move of the
+session account's approved profile stays `APPROVED PROFILE
+IMMUTABLE`. The check is the session setting. It does not read a
+profile, a card, or a board. A neighbor-authored draft approval, an
+`approved_at` touch, a `created_at` touch, and a revoke return that
+error. A key change on that foreign row returns `TENANT SCOPE
+REJECTED`, not `APPROVED PROFILE IMMUTABLE`. A same-tenant direct
+`DRAFT` to `APPROVED` update still commits, including a definition
+hash rewrite. A same-tenant `approved_at` touch still commits. A
+same-tenant `created_at` touch still commits. A same-tenant revoke
+still commits. Delete of a draft on the session account still removes
+it. Delete of another account's approved profile stays `APPROVED
+PROFILE IMMUTABLE`. Truncate stays `APPROVED PROFILE IMMUTABLE`.
+The evidence row a profile cites keeps
 the `principal_id` recorded at insert. Changing that principal is
 `EVIDENCE IMMUTABLE`, so an approved profile cannot be left citing a
 different author. A lookup by the original principal still finds that
@@ -1075,6 +1110,10 @@ BEGIN
      AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
     RAISE EXCEPTION 'TENANT SCOPE REJECTED';
   END IF;
+  IF TG_OP = 'UPDATE'
+     AND OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'TRUNCATE' THEN
     RAISE EXCEPTION 'APPROVED PROFILE IMMUTABLE';
   END IF;
@@ -1089,7 +1128,9 @@ BEGIN
   END IF;
   IF TG_OP = 'UPDATE' THEN
     IF OLD.status = 'DRAFT' AND NEW.status = 'APPROVED' THEN
-      NULL;
+      IF NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+        RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+      END IF;
     ELSIF OLD.status = 'APPROVED' AND (
       NEW.status = 'REVOKED' OR NEW.status = 'APPROVED'
     ) THEN
@@ -2484,7 +2525,18 @@ neighbor's board query.
   still commits. Delete of a draft on the session account still
   removes it. Truncate stays `APPROVED PROFILE IMMUTABLE`. The check
   is the session setting. It does not read a profile, a card, or a
-  board.
+  board. A profile update compares the old account before the status
+  transition. A neighbor-authored draft approval, an `approved_at`
+  touch, a `created_at` touch, a revoke, and a missing account return
+  `TENANT SCOPE REJECTED`. A key change on that foreign row returns
+  `TENANT SCOPE REJECTED`, not `APPROVED PROFILE IMMUTABLE`. A
+  `DRAFT` to `APPROVED` update whose new account disagrees with the
+  session returns `TENANT SCOPE REJECTED` on that transition only. An
+  account move of the session account's approved profile stays
+  `APPROVED PROFILE IMMUTABLE`. A same-tenant `approved_at` touch, a
+  same-tenant `created_at` touch, and a same-tenant revoke still
+  commit. Delete of another account's approved profile stays
+  `APPROVED PROFILE IMMUTABLE`.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2630,6 +2682,8 @@ digest still matches, including `published_at` and the copied
 | Procedure insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Procedure update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Profile insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Profile update whose old account disagrees with the session, including a key change, an approved_at touch, a created_at touch, or a revoke | `TENANT SCOPE REJECTED` |
+| Draft approval whose new account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
@@ -2717,7 +2771,17 @@ the row starts `DRAFT`. A same-tenant insert that is already
 `APPROVED` stays `PROFILE MUST START DRAFT`. A same-tenant direct
 `DRAFT` to `APPROVED` update still commits. Delete of a draft on the
 session account still removes it. Truncate stays `APPROVED PROFILE
-IMMUTABLE`. The projected
+IMMUTABLE`. A profile update whose old `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the trigger checks
+the status transition. A `DRAFT` to `APPROVED` update whose new
+`account_id` disagrees is that same error on that transition only.
+An account move of the session account's approved profile stays
+`APPROVED PROFILE IMMUTABLE`. A neighbor-authored draft approval, an
+`approved_at` touch, a `created_at` touch, and a revoke return
+`TENANT SCOPE REJECTED`. A same-tenant `approved_at` touch, a
+same-tenant `created_at` touch, and a same-tenant revoke still
+commit. Delete of another account's approved profile stays `APPROVED
+PROFILE IMMUTABLE`. The projected
 increment is the projection function, and it adds one for the ledger
 row it just inserted. The function clears `accs.projecting` before
 return. A later statement in that transaction cannot move
@@ -2780,9 +2844,21 @@ lookup.
   stored. A planted draft is not a profile id on that account. A
   same-tenant insert still commits when the row starts `DRAFT`. A
   same-tenant insert that is already `APPROVED` stays `PROFILE MUST
-  START DRAFT`. A same-tenant direct `DRAFT` to `APPROVED` update
+  START DRAFT`. A same-tenant direct   `DRAFT` to `APPROVED` update
   still commits. Delete of a draft on the session account still
   removes it. Truncate stays `APPROVED PROFILE IMMUTABLE`.
+- A profile update for another account is `TENANT SCOPE REJECTED`
+  before the trigger checks the status transition. The neighbor's
+  stored definition hash, `approved_at`, `created_at`, and status stay
+  the ones that account wrote. A neighbor-authored draft stays
+  `DRAFT`. A key change on that foreign row returns `TENANT SCOPE
+  REJECTED`, not `APPROVED PROFILE IMMUTABLE`. A `DRAFT` to
+  `APPROVED` update that moves the row onto another account returns
+  `TENANT SCOPE REJECTED`. An account move of the session account's
+  approved profile stays `APPROVED PROFILE IMMUTABLE`. A same-tenant
+  `approved_at` touch, a same-tenant `created_at` touch, and a
+  same-tenant revoke still commit. Delete of that neighbor's approved
+  profile stays `APPROVED PROFILE IMMUTABLE`.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
 - An evidence insert for another account is `TENANT SCOPE REJECTED`
@@ -2941,6 +3017,17 @@ account. A same-tenant insert still commits when the row starts
 `APPROVED` update still commits. Delete of a draft on the session
 account still removes it. Truncate stays `APPROVED PROFILE
 IMMUTABLE`.
+Reviewed 2026-11-26: a profile update whose old account disagrees
+with `app.account_id` is `TENANT SCOPE REJECTED` before the trigger
+checks the status transition. A `DRAFT` to `APPROVED` update whose
+new account disagrees is that same error on that transition only.
+The neighbor's own read still returns the approved profile and
+definition hash that account stored, and a neighbor-authored draft
+stays `DRAFT`. An account move of the session account's approved
+profile stays `APPROVED PROFILE IMMUTABLE`. A same-tenant
+`approved_at` touch, a same-tenant `created_at` touch, and a
+same-tenant revoke still commit. Delete of another account's
+approved profile stays `APPROVED PROFILE IMMUTABLE`.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
