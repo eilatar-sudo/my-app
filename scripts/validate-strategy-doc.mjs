@@ -3687,6 +3687,23 @@ try {
     "NEW.account_id IS DISTINCT FROM",
   );
   const profileDraftAt = profileProtectBody.indexOf("PROFILE MUST START DRAFT");
+  const profileOldScopeAt = profileProtectBody.indexOf(
+    "OLD.account_id IS DISTINCT FROM NULLIF",
+  );
+  const profileDraftApprovalAt = profileProtectBody.indexOf(
+    "OLD.status = 'DRAFT' AND NEW.status = 'APPROVED'",
+  );
+  const profileApprovalScopeAt = profileProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+    profileDraftApprovalAt === -1 ? profileProtectBody.length : profileDraftApprovalAt,
+  );
+  const profileTransitionAt = profileProtectBody.indexOf(
+    "PROFILE TRANSITION REJECTED",
+  );
+  const profileUpdateImmutableAt = profileProtectBody.indexOf(
+    "APPROVED PROFILE IMMUTABLE",
+    profileDraftApprovalAt === -1 ? profileProtectBody.length : profileDraftApprovalAt,
+  );
   const profileTrigger = await database.query(`
     SELECT pg_get_triggerdef(oid) AS def
     FROM pg_trigger
@@ -3697,12 +3714,21 @@ try {
   assert(
     profileScopeAt !== -1 &&
       profileDraftAt !== -1 &&
+      profileOldScopeAt !== -1 &&
+      profileDraftApprovalAt !== -1 &&
+      profileApprovalScopeAt !== -1 &&
+      profileTransitionAt !== -1 &&
+      profileUpdateImmutableAt !== -1 &&
       profileScopeAt < profileDraftAt &&
+      profileOldScopeAt < profileDraftAt &&
+      profileDraftApprovalAt < profileApprovalScopeAt &&
+      profileApprovalScopeAt < profileUpdateImmutableAt &&
+      profileApprovalScopeAt < profileTransitionAt &&
       !profileProtectBody.includes("FROM agent_accs_") &&
       profileTriggerDef.includes("INSERT") &&
       profileTriggerDef.includes("UPDATE") &&
       profileTriggerDef.includes("DELETE"),
-    "profile trigger must reject a foreign account before the draft check",
+    "profile trigger must reject a foreign account before the draft check and a foreign update before the transition",
   );
   const neighborProfileBefore = await database.query(`
     SELECT profile_id::text AS profile_id, profile_version, status::text AS status,
@@ -3900,6 +3926,208 @@ try {
     })}`,
   );
 
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  await database.exec(
+    profileInsert(
+      202,
+      "10000000-0000-0000-0000-000000000226",
+      "DRAFT",
+      "d".repeat(32),
+      "30000000-0000-0000-0000-000000000202",
+      "NULL",
+    ),
+  );
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  const neighborApprovedBefore = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000202'
+  `);
+  const neighborDraftBefore = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000226'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET status = 'APPROVED',
+         approved_at = TIMESTAMPTZ '2026-11-26 01:00:00+00',
+         definition_hash = '${"f".repeat(32)}'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000226'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET definition_hash = '${"a".repeat(32)}'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000226'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET approved_at = TIMESTAMPTZ '2026-11-26 02:00:00+00'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET created_at = TIMESTAMPTZ '2026-11-26 02:00:00+00'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET status = 'REVOKED'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET account_id = 101
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET definition_hash = '${"f".repeat(32)}'
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_profile
+     WHERE account_id = 202
+       AND profile_id = '10000000-0000-0000-0000-000000000202'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await database.exec(
+    profileInsert(
+      101,
+      "10000000-0000-0000-0000-000000000129",
+      "DRAFT",
+      "b".repeat(32),
+      "30000000-0000-0000-0000-000000000001",
+      "NULL",
+    ),
+  );
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET account_id = 202,
+         status = 'APPROVED',
+         approved_at = TIMESTAMPTZ '2026-11-26 04:00:00+00',
+         definition_hash = '${"f".repeat(32)}',
+         evidence_id = '30000000-0000-0000-0000-000000000202'
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000129'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile
+    SET approved_at = TIMESTAMPTZ '2026-11-26 03:00:00+00',
+        created_at = TIMESTAMPTZ '2026-11-26 03:00:00+00'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000126'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_profile
+     SET account_id = 202
+     WHERE account_id = 101
+       AND profile_id = '10000000-0000-0000-0000-000000000126'`,
+    "APPROVED PROFILE IMMUTABLE",
+  );
+  await database.exec(`
+    UPDATE agent_accs_profile
+    SET status = 'REVOKED'
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000126'
+  `);
+  const sessionProfileAfter = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 101
+      AND profile_id = '10000000-0000-0000-0000-000000000126'
+  `);
+  const sessionDraftKept = await database.query(`
+    SELECT status::text AS status, definition_hash, account_id::text AS account_id
+    FROM agent_accs_profile
+    WHERE profile_id = '10000000-0000-0000-0000-000000000129'
+  `);
+  const neighborApprovedKept = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000202'
+  `);
+  const neighborDraftKept = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000226'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborApprovedRead = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000202'
+  `);
+  const neighborDraftRead = await database.query(`
+    SELECT status::text AS status, definition_hash, approved_at, created_at
+    FROM agent_accs_profile
+    WHERE account_id = 202
+      AND profile_id = '10000000-0000-0000-0000-000000000226'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  assert(
+    neighborApprovedBefore.rows.length === 1 &&
+      neighborApprovedBefore.rows[0]?.status === "APPROVED" &&
+      neighborApprovedBefore.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborDraftBefore.rows.length === 1 &&
+      neighborDraftBefore.rows[0]?.status === "DRAFT" &&
+      neighborDraftBefore.rows[0]?.definition_hash === "d".repeat(32) &&
+      neighborDraftBefore.rows[0]?.approved_at === null &&
+      neighborApprovedKept.rows[0]?.status === "APPROVED" &&
+      neighborApprovedKept.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborApprovedKept.rows[0]?.approved_at?.toISOString() ===
+        neighborApprovedBefore.rows[0]?.approved_at?.toISOString() &&
+      neighborApprovedKept.rows[0]?.created_at?.toISOString() ===
+        neighborApprovedBefore.rows[0]?.created_at?.toISOString() &&
+      neighborDraftKept.rows[0]?.status === "DRAFT" &&
+      neighborDraftKept.rows[0]?.definition_hash === "d".repeat(32) &&
+      neighborDraftKept.rows[0]?.approved_at === null &&
+      neighborApprovedRead.rows[0]?.status === "APPROVED" &&
+      neighborApprovedRead.rows[0]?.definition_hash === "e".repeat(32) &&
+      neighborDraftRead.rows[0]?.status === "DRAFT" &&
+      neighborDraftRead.rows[0]?.definition_hash === "d".repeat(32) &&
+      sessionProfileAfter.rows[0]?.status === "REVOKED" &&
+      sessionProfileAfter.rows[0]?.definition_hash === "f".repeat(32) &&
+      sessionProfileAfter.rows[0]?.approved_at?.toISOString() ===
+        "2026-11-26T03:00:00.000Z" &&
+      sessionProfileAfter.rows[0]?.created_at?.toISOString() ===
+        "2026-11-26T03:00:00.000Z" &&
+      sessionDraftKept.rows.length === 1 &&
+      sessionDraftKept.rows[0]?.status === "DRAFT" &&
+      sessionDraftKept.rows[0]?.definition_hash === "b".repeat(32) &&
+      sessionDraftKept.rows[0]?.account_id === "101",
+    `cross-tenant profile update changed the neighbor profile: ${JSON.stringify({
+      approvedBefore: neighborApprovedBefore.rows[0],
+      approvedKept: neighborApprovedKept.rows[0],
+      approvedRead: neighborApprovedRead.rows[0],
+      draftBefore: neighborDraftBefore.rows[0],
+      draftKept: neighborDraftKept.rows[0],
+      draftRead: neighborDraftRead.rows[0],
+      session: sessionProfileAfter.rows[0],
+      sessionDraft: sessionDraftKept.rows[0],
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
@@ -3931,6 +4159,7 @@ try {
   console.log(
     `status ok (${sectionCount} sections, ${typeScriptBlocks.length} TypeScript blocks, GraphQL ${queryNames.length} queries / ${mutationNames.length} mutations, ${tableCount} tables, ${indexCount} indexes, ${rejectionChecks} rejection checks)`,
   );
+
 } finally {
   await database.close();
 }
