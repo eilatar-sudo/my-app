@@ -4128,6 +4128,284 @@ try {
     })}`,
   );
 
+  const sessionProtectDef = await database.query(`
+    SELECT pg_get_functiondef(oid) AS def
+    FROM pg_proc
+    WHERE proname = 'protect_agent_accs_session'
+  `);
+  const sessionProtectBody = sessionProtectDef.rows[0]?.def ?? "";
+  const sessionInsertScopeAt = sessionProtectBody.indexOf(
+    "NEW.account_id IS DISTINCT FROM",
+  );
+  const sessionUpdateAt = sessionProtectBody.indexOf("TG_OP = 'UPDATE'");
+  const sessionOldScopeAt = sessionProtectBody.indexOf(
+    "OLD.account_id IS DISTINCT FROM",
+  );
+  const sessionDeleteAt = sessionProtectBody.indexOf("TG_OP = 'DELETE'");
+  const sessionTrigger = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_session_row'
+      AND NOT tgisinternal
+  `);
+  const sessionTriggerDef = sessionTrigger.rows[0]?.def ?? "";
+  assert(
+    sessionInsertScopeAt !== -1 &&
+      sessionUpdateAt !== -1 &&
+      sessionOldScopeAt !== -1 &&
+      sessionDeleteAt !== -1 &&
+      sessionInsertScopeAt < sessionUpdateAt &&
+      sessionUpdateAt < sessionOldScopeAt &&
+      sessionOldScopeAt < sessionDeleteAt &&
+      !sessionProtectBody.includes("FROM agent_accs_") &&
+      !sessionProtectBody.includes("opened_by") &&
+      sessionTriggerDef.includes("INSERT") &&
+      sessionTriggerDef.includes("UPDATE") &&
+      sessionTriggerDef.includes("DELETE"),
+    "session trigger must reject a foreign account before the profile foreign key",
+  );
+  const neighborSessionBefore = await database.query(`
+    SELECT status::text AS status, budget_project_units, consumed_project_units,
+           opened_by, created_at, profile_id::text AS profile_id
+    FROM agent_accs_session
+    WHERE account_id = 202
+      AND session_id = '20000000-0000-0000-0000-000000000220'
+  `);
+  const sessionInsert = (account, id, profile, openedBy) => `
+    INSERT INTO agent_accs_session (
+      account_id, session_id, profile_id, profile_version, status,
+      budget_project_units, consumed_project_units, max_cards_per_day,
+      opened_by, created_at
+    ) VALUES (
+      ${account}, '${id}', '${profile}', 1, 'OPEN',
+      9, 0, 100, '${openedBy}', TIMESTAMPTZ '2026-11-27 00:00:00+00'
+    );
+  `;
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET budget_project_units = 1
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET status = 'SEALED'
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET created_at = TIMESTAMPTZ '2026-11-27 02:00:00+00'
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET opened_by = 'principal:planted'
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET account_id = 101
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET session_id = '20000000-0000-0000-0000-000000000221'
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    sessionInsert(
+      202,
+      "20000000-0000-0000-0000-000000000226",
+      "10000000-0000-0000-0000-000000000202",
+      "principal:planted",
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    sessionInsert(
+      303,
+      "20000000-0000-0000-0000-000000000303",
+      "10000000-0000-0000-0000-000000000303",
+      "principal:planted",
+    ),
+    "TENANT SCOPE REJECTED",
+  );
+  await expectRejection(
+    `DELETE FROM agent_accs_session
+     WHERE account_id = 202
+       AND session_id = '20000000-0000-0000-0000-000000000220'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    CREATE ROLE accs_session_scope NOLOGIN;
+    GRANT USAGE ON SCHEMA public TO accs_session_scope;
+    GRANT INSERT, UPDATE, DELETE ON agent_accs_session TO accs_session_scope;
+  `);
+  await database.exec("SET ROLE accs_session_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      sessionInsert(
+        202,
+        "20000000-0000-0000-0000-000000000226",
+        "10000000-0000-0000-0000-000000000202",
+        "principal:planted",
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+    await expectRejection(
+      sessionInsert(
+        303,
+        "20000000-0000-0000-0000-000000000303",
+        "10000000-0000-0000-0000-000000000303",
+        "principal:planted",
+      ),
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(
+    sessionInsert(
+      101,
+      "20000000-0000-0000-0000-000000000127",
+      "10000000-0000-0000-0000-000000000001",
+      "principal:operator",
+    ),
+  );
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET budget_project_units = 12
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET budget_project_units = 10
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET status = 'SEALED'
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET status = 'OPEN'
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET created_at = TIMESTAMPTZ '2026-11-27 03:00:00+00',
+        opened_by = 'principal:operator-reset'
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await database.exec(`
+    UPDATE agent_accs_session
+    SET session_id = '20000000-0000-0000-0000-000000000128'
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000127'
+  `);
+  await expectRejection(
+    `UPDATE agent_accs_session
+     SET account_id = 202
+     WHERE account_id = 101
+       AND session_id = '20000000-0000-0000-0000-000000000128'`,
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    DELETE FROM agent_accs_session
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000128'
+  `);
+  await database.exec(`
+    SELECT open_agent_accs_session(
+      101, '20000000-0000-0000-0000-000000000129',
+      '10000000-0000-0000-0000-000000000001', 1, 'principal:operator'
+    );
+  `);
+  await database.exec(`
+    DELETE FROM agent_accs_session
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000129'
+  `);
+  const sessionRow = await database.query(`
+    SELECT status::text AS status, budget_project_units, opened_by, created_at,
+           account_id::text AS account_id
+    FROM agent_accs_session
+    WHERE session_id = '20000000-0000-0000-0000-000000000128'
+       OR session_id = '20000000-0000-0000-0000-000000000127'
+       OR session_id = '20000000-0000-0000-0000-000000000129'
+  `);
+  const plantedSession = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_session
+    WHERE session_id = '20000000-0000-0000-0000-000000000226'
+       OR session_id = '20000000-0000-0000-0000-000000000303'
+  `);
+  const neighborSessionKept = await database.query(`
+    SELECT status::text AS status, budget_project_units, consumed_project_units,
+           opened_by, created_at, profile_id::text AS profile_id
+    FROM agent_accs_session
+    WHERE account_id = 202
+      AND session_id = '20000000-0000-0000-0000-000000000220'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '202', false);");
+  const neighborSessionRead = await database.query(`
+    SELECT status::text AS status, budget_project_units, consumed_project_units,
+           opened_by, created_at, profile_id::text AS profile_id
+    FROM agent_accs_session
+    WHERE account_id = 202
+      AND session_id = '20000000-0000-0000-0000-000000000220'
+  `);
+  await database.exec("SELECT set_config('app.account_id', '101', false);");
+  assert(
+    neighborSessionBefore.rows.length === 1 &&
+      neighborSessionBefore.rows[0]?.status === "OPEN" &&
+      Number(neighborSessionBefore.rows[0]?.budget_project_units) === 10 &&
+      Number(neighborSessionBefore.rows[0]?.consumed_project_units) === 1 &&
+      neighborSessionBefore.rows[0]?.opened_by === "principal:operator-202" &&
+      neighborSessionKept.rows.length === 1 &&
+      neighborSessionKept.rows[0]?.status === "OPEN" &&
+      Number(neighborSessionKept.rows[0]?.budget_project_units) === 10 &&
+      Number(neighborSessionKept.rows[0]?.consumed_project_units) === 1 &&
+      neighborSessionKept.rows[0]?.opened_by === "principal:operator-202" &&
+      neighborSessionKept.rows[0]?.created_at?.toISOString() ===
+        neighborSessionBefore.rows[0]?.created_at?.toISOString() &&
+      neighborSessionKept.rows[0]?.profile_id ===
+        neighborSessionBefore.rows[0]?.profile_id &&
+      neighborSessionRead.rows.length === 1 &&
+      neighborSessionRead.rows[0]?.status === "OPEN" &&
+      Number(neighborSessionRead.rows[0]?.budget_project_units) === 10 &&
+      Number(neighborSessionRead.rows[0]?.consumed_project_units) === 1 &&
+      neighborSessionRead.rows[0]?.opened_by === "principal:operator-202" &&
+      Number(plantedSession.rows[0]?.n) === 0 &&
+      sessionRow.rows.length === 0,
+    `cross-tenant session write changed the neighbor session: ${JSON.stringify({
+      before: neighborSessionBefore.rows[0],
+      kept: neighborSessionKept.rows[0],
+      read: neighborSessionRead.rows[0],
+      planted: plantedSession.rows[0],
+      session: sessionRow.rows,
+    })}`,
+  );
+
   await database.exec(`
     CREATE ROLE accs_reader NOLOGIN;
     GRANT USAGE ON SCHEMA public TO accs_reader;
