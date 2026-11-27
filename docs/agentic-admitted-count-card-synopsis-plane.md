@@ -182,6 +182,21 @@ same-tenant `created_at` touch still commits. A same-tenant revoke
 still commits. Delete of a draft on the session account still removes
 it. Delete of another account's approved profile stays `APPROVED
 PROFILE IMMUTABLE`. Truncate stays `APPROVED PROFILE IMMUTABLE`.
+Reviewed 2026-11-27 without a version bump. A session insert, update,
+or delete whose `account_id` disagrees with `app.account_id` is
+`TENANT SCOPE REJECTED` before the profile foreign key. On update the
+old account and the new account are both compared. The check is the
+session setting. It does not read a profile, a card, or a board. A
+budget rewrite, a status change, a `created_at` touch, a planted
+session, a missing account, and a delete of another account's session
+return that error. A key change on that foreign row returns `TENANT
+SCOPE REJECTED`, not the profile foreign key. A same-tenant budget
+reset or widen still commits. A same-tenant status change still
+commits. A same-tenant `created_at` touch still commits. A same-tenant
+`opened_by` edit still commits. A same-tenant `session_id` rekey still
+commits. A same-tenant insert still commits. A same-tenant delete
+still removes the row. Projection still adds one consumed unit on the
+session account. `opened_by` is not read by project or publish.
 
 ## 1. Why this plane, before how
 
@@ -383,7 +398,22 @@ A same-tenant tag-vector change still commits, and deleting the session
 account's own row still removes the hit.
 A session copies
 the budget at open. Projection consumes
-one budget unit per new card. The ledger is insert-only. A `COMPLETE`
+one budget unit per new card. Reviewed 2026-11-27 without a version
+bump. A session insert whose `account_id` disagrees with
+`app.account_id` is `TENANT SCOPE REJECTED` before the profile
+foreign key. An update compares the old account and the new account.
+A delete compares the old account. The check is the session setting.
+It does not read a profile, a card, or a board. A budget rewrite, a
+status change, a `created_at` touch, a planted session, a missing
+account, and a delete return that error. A key change on that foreign
+row returns `TENANT SCOPE REJECTED`, not the profile foreign key. A
+same-tenant budget reset or widen still commits. A same-tenant status
+change still commits. A same-tenant `created_at` touch still commits.
+A same-tenant `opened_by` edit still commits. A same-tenant
+`session_id` rekey still commits. A same-tenant insert still commits.
+A same-tenant delete still removes the row. Projection still adds one
+consumed unit on the session account. `opened_by` is not read by
+project or publish. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
 `SYNOPSIS ALREADY SEALED`. The next day is a new key.
 
@@ -1579,6 +1609,37 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION protect_agent_accs_session()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT'
+     AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
+  IF TG_OP = 'UPDATE'
+     AND (
+       OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+       OR NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT
+     ) THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
+  IF TG_OP = 'DELETE'
+     AND OLD.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER protect_agent_accs_session_row
+  BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_session
+  FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_session();
+
 CREATE FUNCTION open_agent_accs_session(
   p_account_id BIGINT,
   p_session_id UUID,
@@ -2413,7 +2474,11 @@ from `agent_accs_day_counter` by primary key. The perception card
 must not copy it into a tally. The profile id behind that card is the
 approved row that account stored. A draft another account tried to
 plant is not a profile id the agent can read. The insert check is the
-session setting. It does not read a card or a board.
+session setting. It does not read a card or a board. The session
+budget behind a projection is the budget that account opened. A
+budget another account rewrote, a status it sealed, and a session it
+planted are not that budget or that session id. That check is the
+same session setting. It does not read a profile, a card, or a board.
 
 ## 13. ACID and consistency
 
@@ -2427,7 +2492,10 @@ off before the session write and the audit append. A following
 statement in that transaction is `COLUMN TALLY REJECTED` or
 `PROJECTION LEDGER REJECTED`. A ledger insert whose account disagrees
 with the session is `TENANT SCOPE REJECTED` before that flag is
-checked.
+checked. A session insert, update, or delete whose account disagrees
+with the session is `TENANT SCOPE REJECTED` before the profile
+foreign key. The projection function's consumed increment is the
+session account, and that update still commits.
 
 Publish holds the tenant-day lock from the counter read through the
 synopsis write. Card insert and projection take that lock first. A
@@ -2537,6 +2605,20 @@ neighbor's board query.
   same-tenant `created_at` touch, and a same-tenant revoke still
   commit. Delete of another account's approved profile stays
   `APPROVED PROFILE IMMUTABLE`.
+  A session insert, update, or delete does the same comparison before
+  the profile foreign key. On update it compares the old account and
+  the new account. A budget rewrite, a status change, a `created_at`
+  touch, a planted session, a missing account, and a delete return
+  `TENANT SCOPE REJECTED`. A key change on that foreign row returns
+  `TENANT SCOPE REJECTED`, not the profile foreign key. A same-tenant
+  budget reset or widen still commits. A same-tenant status change
+  still commits. A same-tenant `created_at` touch still commits. A
+  same-tenant `opened_by` edit still commits. A same-tenant
+  `session_id` rekey still commits. A same-tenant insert still
+  commits. A same-tenant delete still removes the row. Projection
+  still adds one consumed unit on the session account. The check is
+  the session setting. It does not read a profile, a card, or a
+  board.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2591,7 +2673,10 @@ counter and at most three tally rows by primary key. The counter is
 maintained on insert. A tenant that seals more cards than `max_cards_per_day` still
 pays one index update per insert, then one point read that refuses the
 day. Neighbor board queries do not share that fold. Indexes in this
-schema lead with `account_id`.
+schema lead with `account_id`. The session tenant check compares
+`account_id` with `app.account_id`. It does not read
+`agent_accs_session`, a profile, a card, or a board, so it cannot
+become a full scan of a 1M-row board.
 
 ## 16. Auditability and replay
 
@@ -2684,6 +2769,9 @@ digest still matches, including `published_at` and the copied
 | Profile insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Profile update whose old account disagrees with the session, including a key change, an approved_at touch, a created_at touch, or a revoke | `TENANT SCOPE REJECTED` |
 | Draft approval whose new account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Session insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Session update whose old or new account disagrees with the session, including a budget rewrite, a status change, a created_at touch, or a key change | `TENANT SCOPE REJECTED` |
+| Session delete whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
@@ -2859,6 +2947,17 @@ lookup.
   `approved_at` touch, a same-tenant `created_at` touch, and a
   same-tenant revoke still commit. Delete of that neighbor's approved
   profile stays `APPROVED PROFILE IMMUTABLE`.
+- A session insert, update, or delete for another account is
+  `TENANT SCOPE REJECTED` before the profile foreign key. The
+  neighbor's own read still returns the budget, status, and
+  `opened_by` that account opened. A planted session is not a
+  session id on that account. A same-tenant budget reset or widen
+  still commits. A same-tenant status change still commits. A
+  same-tenant `created_at` touch still commits. A same-tenant
+  `opened_by` edit still commits. A same-tenant `session_id` rekey
+  still commits. A same-tenant insert still commits. A same-tenant
+  delete still removes the row. Projection still adds one consumed
+  unit on the session account.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
 - An evidence insert for another account is `TENANT SCOPE REJECTED`
@@ -3028,6 +3127,17 @@ profile stays `APPROVED PROFILE IMMUTABLE`. A same-tenant
 `approved_at` touch, a same-tenant `created_at` touch, and a
 same-tenant revoke still commit. Delete of another account's
 approved profile stays `APPROVED PROFILE IMMUTABLE`.
+Reviewed 2026-11-27: a session insert, update, or delete whose
+account disagrees with `app.account_id` is `TENANT SCOPE REJECTED`
+before the profile foreign key. On update the old account and the
+new account are both compared. The neighbor's own read still returns
+the budget, status, and `opened_by` that account opened. A planted
+session is not a session id. A same-tenant budget reset or widen
+still commits. A same-tenant status change still commits. A
+same-tenant `created_at` touch still commits. A same-tenant
+`opened_by` edit still commits. A same-tenant `session_id` rekey
+still commits. A same-tenant delete still removes the row. Projection
+still adds one consumed unit on the session account.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
