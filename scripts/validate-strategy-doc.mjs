@@ -4142,6 +4142,7 @@ try {
     "OLD.account_id IS DISTINCT FROM",
   );
   const sessionDeleteAt = sessionProtectBody.indexOf("TG_OP = 'DELETE'");
+  const sessionTruncateAt = sessionProtectBody.indexOf("TG_OP = 'TRUNCATE'");
   const sessionTrigger = await database.query(`
     SELECT pg_get_triggerdef(oid) AS def
     FROM pg_trigger
@@ -4149,11 +4150,20 @@ try {
       AND NOT tgisinternal
   `);
   const sessionTriggerDef = sessionTrigger.rows[0]?.def ?? "";
+  const sessionStatement = await database.query(`
+    SELECT pg_get_triggerdef(oid) AS def
+    FROM pg_trigger
+    WHERE tgname = 'protect_agent_accs_session_statement'
+      AND NOT tgisinternal
+  `);
+  const sessionStatementDef = sessionStatement.rows[0]?.def ?? "";
   assert(
     sessionInsertScopeAt !== -1 &&
       sessionUpdateAt !== -1 &&
       sessionOldScopeAt !== -1 &&
       sessionDeleteAt !== -1 &&
+      sessionTruncateAt !== -1 &&
+      sessionTruncateAt < sessionInsertScopeAt &&
       sessionInsertScopeAt < sessionUpdateAt &&
       sessionUpdateAt < sessionOldScopeAt &&
       sessionOldScopeAt < sessionDeleteAt &&
@@ -4161,7 +4171,9 @@ try {
       !sessionProtectBody.includes("opened_by") &&
       sessionTriggerDef.includes("INSERT") &&
       sessionTriggerDef.includes("UPDATE") &&
-      sessionTriggerDef.includes("DELETE"),
+      sessionTriggerDef.includes("DELETE") &&
+      sessionStatementDef.includes("TRUNCATE") &&
+      sessionStatementDef.includes("EACH STATEMENT"),
     "session trigger must reject a foreign account before the profile foreign key",
   );
   const neighborSessionBefore = await database.query(`
@@ -4403,6 +4415,73 @@ try {
       read: neighborSessionRead.rows[0],
       planted: plantedSession.rows[0],
       session: sessionRow.rows,
+    })}`,
+  );
+
+  const sessionsBeforeTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_session",
+  );
+  await expectRejection(
+    "TRUNCATE agent_accs_session",
+    "TENANT SCOPE REJECTED",
+  );
+  await database.exec(`
+    GRANT TRUNCATE ON agent_accs_session TO accs_session_scope;
+  `);
+  await database.exec("SET ROLE accs_session_scope");
+  try {
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+    await expectRejection(
+      "TRUNCATE agent_accs_session",
+      "TENANT SCOPE REJECTED",
+    );
+  } finally {
+    await database.exec("RESET ROLE");
+    await database.exec("SELECT set_config('app.account_id', '101', false);");
+  }
+  await database.exec(
+    sessionInsert(
+      101,
+      "20000000-0000-0000-0000-000000000130",
+      "10000000-0000-0000-0000-000000000001",
+      "principal:operator",
+    ),
+  );
+  await database.exec(`
+    DELETE FROM agent_accs_session
+    WHERE account_id = 101
+      AND session_id = '20000000-0000-0000-0000-000000000130'
+  `);
+  const sessionsAfterTruncate = await database.query(
+    "SELECT count(*)::int AS n FROM agent_accs_session",
+  );
+  const truncatedNeighbor = await database.query(`
+    SELECT status::text AS status, budget_project_units, consumed_project_units,
+           opened_by
+    FROM agent_accs_session
+    WHERE account_id = 202
+      AND session_id = '20000000-0000-0000-0000-000000000220'
+  `);
+  const sameTenantAfterTruncate = await database.query(`
+    SELECT count(*)::int AS n
+    FROM agent_accs_session
+    WHERE session_id = '20000000-0000-0000-0000-000000000130'
+  `);
+  assert(
+    Number(sessionsBeforeTruncate.rows[0]?.n) > 0 &&
+      Number(sessionsAfterTruncate.rows[0]?.n) ===
+        Number(sessionsBeforeTruncate.rows[0]?.n) &&
+      truncatedNeighbor.rows.length === 1 &&
+      truncatedNeighbor.rows[0]?.status === "OPEN" &&
+      Number(truncatedNeighbor.rows[0]?.budget_project_units) === 10 &&
+      Number(truncatedNeighbor.rows[0]?.consumed_project_units) === 1 &&
+      truncatedNeighbor.rows[0]?.opened_by === "principal:operator-202" &&
+      Number(sameTenantAfterTruncate.rows[0]?.n) === 0,
+    `session truncate removed a neighbor budget: ${JSON.stringify({
+      before: sessionsBeforeTruncate.rows[0],
+      after: sessionsAfterTruncate.rows[0],
+      neighbor: truncatedNeighbor.rows[0],
+      sameTenant: sameTenantAfterTruncate.rows[0],
     })}`,
   );
 
