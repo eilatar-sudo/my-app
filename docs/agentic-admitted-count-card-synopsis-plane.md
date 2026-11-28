@@ -197,6 +197,15 @@ commits. A same-tenant `created_at` touch still commits. A same-tenant
 commits. A same-tenant insert still commits. A same-tenant delete
 still removes the row. Projection still adds one consumed unit on the
 session account. `opened_by` is not read by project or publish.
+Reviewed 2026-11-28 without a version bump. `TRUNCATE` on
+`agent_accs_session` is `TENANT SCOPE REJECTED` before any row is
+removed. The statement names no account. The trigger does not read a
+session, a profile, a card, or a board. A same-tenant delete still
+removes that row. A same-tenant budget reset or widen, a same-tenant
+status change, a same-tenant `created_at` touch, a same-tenant
+`opened_by` edit, a same-tenant `session_id` rekey, and a same-tenant
+insert still commit. Projection still adds one consumed unit on the
+session account. `opened_by` is not read by project or publish.
 
 ## 1. Why this plane, before how
 
@@ -413,7 +422,16 @@ A same-tenant `opened_by` edit still commits. A same-tenant
 `session_id` rekey still commits. A same-tenant insert still commits.
 A same-tenant delete still removes the row. Projection still adds one
 consumed unit on the session account. `opened_by` is not read by
-project or publish. The ledger is insert-only. A `COMPLETE`
+project or publish. Reviewed 2026-11-28 without a version bump.
+`TRUNCATE` on `agent_accs_session` is `TENANT SCOPE REJECTED` before
+any row is removed. The statement names no account. The trigger does
+not read a session, a profile, a card, or a board. A same-tenant
+delete still removes that row. A same-tenant budget reset or widen, a
+same-tenant status change, a same-tenant `created_at` touch, a
+same-tenant `opened_by` edit, a same-tenant `session_id` rekey, and a
+same-tenant insert still commit. Projection still adds one consumed
+unit on the session account. `opened_by` is not read by project or
+publish. The ledger is insert-only. A `COMPLETE`
 synopsis rejects later cards for that tenant-day with
 `SYNOPSIS ALREADY SEALED`. The next day is a new key.
 
@@ -1614,6 +1632,9 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  IF TG_OP = 'TRUNCATE' THEN
+    RAISE EXCEPTION 'TENANT SCOPE REJECTED';
+  END IF;
   IF TG_OP = 'INSERT'
      AND NEW.account_id IS DISTINCT FROM NULLIF(current_setting('app.account_id', true), '')::BIGINT THEN
     RAISE EXCEPTION 'TENANT SCOPE REJECTED';
@@ -1639,6 +1660,10 @@ $$;
 CREATE TRIGGER protect_agent_accs_session_row
   BEFORE INSERT OR UPDATE OR DELETE ON agent_accs_session
   FOR EACH ROW EXECUTE FUNCTION protect_agent_accs_session();
+
+CREATE TRIGGER protect_agent_accs_session_statement
+  BEFORE TRUNCATE ON agent_accs_session
+  FOR EACH STATEMENT EXECUTE FUNCTION protect_agent_accs_session();
 
 CREATE FUNCTION open_agent_accs_session(
   p_account_id BIGINT,
@@ -2477,8 +2502,10 @@ plant is not a profile id the agent can read. The insert check is the
 session setting. It does not read a card or a board. The session
 budget behind a projection is the budget that account opened. A
 budget another account rewrote, a status it sealed, and a session it
-planted are not that budget or that session id. That check is the
-same session setting. It does not read a profile, a card, or a board.
+planted are not that budget or that session id. A truncate another
+account issued is not a missing budget. That check is the
+same session setting. It does not read a session, a profile, a card,
+or a board.
 
 ## 13. ACID and consistency
 
@@ -2615,10 +2642,11 @@ neighbor's board query.
   still commits. A same-tenant `created_at` touch still commits. A
   same-tenant `opened_by` edit still commits. A same-tenant
   `session_id` rekey still commits. A same-tenant insert still
-  commits. A same-tenant delete still removes the row. Projection
-  still adds one consumed unit on the session account. The check is
-  the session setting. It does not read a profile, a card, or a
-  board.
+  commits. A same-tenant delete still removes the row. `TRUNCATE`
+  returns `TENANT SCOPE REJECTED` before any row is removed. The
+  statement names no account. Projection still adds one consumed unit
+  on the session account. The check is the session setting. It does
+  not read a session, a profile, a card, or a board.
 - Session projection budget: one unit per new card. The unit cap is
   below 1,000,000.
 - Day card budget: a day over the cap is `DAY OVER CARD BUDGET` on
@@ -2674,7 +2702,8 @@ maintained on insert. A tenant that seals more cards than `max_cards_per_day` st
 pays one index update per insert, then one point read that refuses the
 day. Neighbor board queries do not share that fold. Indexes in this
 schema lead with `account_id`. The session tenant check compares
-`account_id` with `app.account_id`. It does not read
+`account_id` with `app.account_id`. `TRUNCATE` is refused before any
+row is removed. It does not read
 `agent_accs_session`, a profile, a card, or a board, so it cannot
 become a full scan of a 1M-row board.
 
@@ -2772,6 +2801,7 @@ digest still matches, including `published_at` and the copied
 | Session insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Session update whose old or new account disagrees with the session, including a budget rewrite, a status change, a created_at touch, or a key change | `TENANT SCOPE REJECTED` |
 | Session delete whose account disagrees with the session | `TENANT SCOPE REJECTED` |
+| Session truncate | `TENANT SCOPE REJECTED` |
 | Evidence principal rewritten | `EVIDENCE IMMUTABLE` |
 | Evidence insert whose account disagrees with the session | `TENANT SCOPE REJECTED` |
 | Evidence update whose old or new account disagrees with the session | `TENANT SCOPE REJECTED` |
@@ -2956,8 +2986,9 @@ lookup.
   same-tenant `created_at` touch still commits. A same-tenant
   `opened_by` edit still commits. A same-tenant `session_id` rekey
   still commits. A same-tenant insert still commits. A same-tenant
-  delete still removes the row. Projection still adds one consumed
-  unit on the session account.
+  delete still removes the row. `TRUNCATE` is `TENANT SCOPE REJECTED`
+  before any row is removed. The statement names no account. Projection
+  still adds one consumed unit on the session account.
 - An evidence principal cannot be rewritten. Editing the evidence
   digest does not move that principal.
 - An evidence insert for another account is `TENANT SCOPE REJECTED`
@@ -3138,6 +3169,15 @@ same-tenant `created_at` touch still commits. A same-tenant
 `opened_by` edit still commits. A same-tenant `session_id` rekey
 still commits. A same-tenant delete still removes the row. Projection
 still adds one consumed unit on the session account.
+Reviewed 2026-11-28: `TRUNCATE` on `agent_accs_session` is `TENANT
+SCOPE REJECTED` before any row is removed. The statement names no
+account. The neighbor's own read still returns the budget, status,
+and `opened_by` that account opened. A same-tenant delete still
+removes the row. A same-tenant budget reset or widen, a same-tenant
+status change, a same-tenant `created_at` touch, a same-tenant
+`opened_by` edit, a same-tenant `session_id` rekey, and a same-tenant
+insert still commit. Projection still adds one consumed unit on the
+session account.
 This contract does
 not add a table, a GraphQL field, or a plane to answer it. The engine
 remains deterministic, tenant scoped, and unwilling to scan a 1M-row
